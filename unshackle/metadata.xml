@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<Tags>
+  <Tag>
+    <Targets>
+      <TargetTypeValue>50</TargetTypeValue>
+    </Targets>
+    <Simple>
+      <Name>ENCODED_BY</Name>
+      <String>Crash | NSBC</String>
+    </Simple>
+    <Simple>
+      <Name>DISCORD</Name>
+      <String>@nsbc_crash</String>
+    </Simple>
+    <Simple>
+      <Name>COMMENT</Name>
+      <String>Crash | NSBC</String>
+    </Simple>
+    <Simple>
+      <Name>Support US</Name>
+      <String>paypal.me/NOSoba</String>
+    </Simple>
+    <Simple>
+      <Name>JOIN OUR DISCORD</Name>
+      <String>ko-fi.com/nosobacrew</String>
+    </Simple>
+  </Tag>
+</Tags>
