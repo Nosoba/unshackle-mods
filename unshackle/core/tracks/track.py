@@ -1,6 +1,7 @@
 import base64
 import html
 import logging
+import math
 import re
 import shutil
 import subprocess
@@ -280,6 +281,7 @@ class Track:
         data: Optional[Union[dict, defaultdict]] = None,
         id_: Optional[str] = None,
         extra: Optional[Any] = None,
+        duration: Optional[float] = None,
     ) -> None:
         if not isinstance(url, (str, list)):
             raise TypeError(f"Expected url to be a {str}, or list of {str}, not {type(url)}")
@@ -305,6 +307,10 @@ class Track:
             raise TypeError(f"Expected from_file to be a {Path}, not {type(from_file)}")
         if not isinstance(data, (dict, defaultdict, type(None))):
             raise TypeError(f"Expected data to be a {dict} or {defaultdict}, not {type(data)}")
+        if isinstance(duration, bool) or not isinstance(duration, (int, float, type(None))):
+            raise TypeError(f"Expected duration to be an {int}, {float}, or None, not {type(duration)}")
+        if duration is not None and (duration < 0 or not math.isfinite(duration)):
+            raise ValueError(f"Expected duration to be a finite, non-negative number, not {duration!r}")
 
         invalid_urls = ", ".join(set(type(x) for x in url if not isinstance(x, str)))
         if invalid_urls:
@@ -336,6 +342,7 @@ class Track:
         self._data: defaultdict[Any, Any] = defaultdict(dict)
         self.data = data or {}
         self.extra: Any = extra or {}  # allow anything for extra, but default to a dict
+        self.duration = float(duration) if duration is not None else None
 
         if self.name is None:
             lang = Language.get(self.language)
@@ -372,6 +379,38 @@ class Track:
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, Track) and self.id == other.id
+
+    @property
+    def formatted_duration(self) -> Optional[str]:
+        """Return the known track duration as ``HH:MM:SS``."""
+        if self.duration is None:
+            return None
+        total_seconds = int(self.duration)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    @property
+    def estimated_size_bytes(self) -> Optional[int]:
+        """Estimate the encoded track size from its duration and bitrate in bits/s."""
+        bitrate = getattr(self, "bitrate", None)
+        if self.duration is None or not isinstance(bitrate, (int, float)) or bitrate <= 0:
+            return None
+        return round(self.duration * bitrate / 8)
+
+    @property
+    def estimated_size(self) -> Optional[str]:
+        """Return ``estimated_size_bytes`` in a readable binary unit."""
+        size = self.estimated_size_bytes
+        if size is None:
+            return None
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        value = float(size)
+        for unit in units[:-1]:
+            if value < 1024:
+                return f"{value:.2f}{unit}"
+            value /= 1024
+        return f"{value:.2f}{units[-1]}"
 
     @property
     def data(self) -> defaultdict[Any, Any]:
@@ -696,6 +735,7 @@ class Track:
             "needs_repack": self.needs_repack,
             "name": self.name,
             "edition": self.edition,
+            "duration": self.duration,
         }
         return data
 
@@ -715,6 +755,7 @@ class Track:
             "name": data.get("name"),
             "edition": data.get("edition") or None,
             "id_": data.get("id"),
+            "duration": data.get("duration"),
         }
 
     @classmethod

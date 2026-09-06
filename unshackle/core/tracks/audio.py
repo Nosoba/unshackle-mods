@@ -163,6 +163,11 @@ class Audio(Track):
         return False
 
     def __str__(self) -> str:
+        bitrate_str = None
+        if self.bitrate:
+            bitrate_str = f"{self.bitrate // 1000} kb/s"
+            if self.estimated_size:
+                bitrate_str += f", {self.estimated_size}"
         return " | ".join(
             filter(
                 bool,
@@ -180,7 +185,8 @@ class Audio(Track):
                             ],
                         )
                     ),
-                    f"{self.bitrate // 1000} kb/s" if self.bitrate else None,
+                    bitrate_str,
+                    self.formatted_duration,
                     self.get_track_name(),
                     ", ".join(self.edition) if self.edition else None,
                 ],

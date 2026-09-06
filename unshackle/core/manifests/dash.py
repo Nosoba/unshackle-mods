@@ -9,6 +9,7 @@ import shutil
 import sys
 from copy import deepcopy
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Any, Callable, Optional, Union
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
@@ -124,6 +125,9 @@ class DASH:
                 if period_id := period.get("id"):
                     filtered_period_ids.append(period_id)
                 continue
+                
+            period_duration_pt = period.get("duration") or self.manifest.get("mediaPresentationDuration")
+            period_duration_sec = self.pt_to_sec(period_duration_pt) if period_duration_pt else None
 
             for adaptation_set in period.findall("AdaptationSet"):
                 if self.is_trick_mode(adaptation_set):
@@ -179,6 +183,7 @@ class DASH:
                             height=get("height") or 0,
                             fps=track_fps or None,
                             scan_type=scan_type,
+                            duration=period_duration_sec,
                         )
                     elif content_type == "audio":
                         track_type = Audio
@@ -194,6 +199,7 @@ class DASH:
                             ),
                             joc=self.get_ddp_complexity_index(adaptation_set, rep),
                             descriptive=self.is_descriptive(adaptation_set),
+                            duration=period_duration_sec,
                         )
                     elif content_type == "text":
                         track_type = Subtitle

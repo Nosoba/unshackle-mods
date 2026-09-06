@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+from functools import partial
 import time
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -212,6 +213,10 @@ class HLS:
             # restore DV signaling post-download. Services that know their encoder embeds HDR10+
             # SEI must override `range` themselves.
             dv_compatible_bitstream = primary_track_type is Video and not primary_has_dv and supp_dv_codec is not None
+            
+            track_duration = None
+            if hasattr(playlist, 'media') and hasattr(playlist.media, 'segments') and playlist.media.segments:
+                track_duration = sum(s.duration for s in playlist.media.segments)
 
             tracks.add(
                 primary_track_type(
@@ -228,6 +233,7 @@ class HLS:
                     descriptor=Video.Descriptor.HLS,
                     drm=session_drm,
                     data={"hls": {"playlist": playlist}},
+                    duration=track_duration,
                     **(
                         dict(
                             range_=video_range,
@@ -293,6 +299,7 @@ class HLS:
                             channels=media.channels,
                             joc=joc,
                             descriptive="public.accessibility.describes-video" in (media.characteristics or ""),
+                            duration=None,
                         )
                         if track_type is Audio
                         else dict(

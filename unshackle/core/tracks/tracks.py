@@ -16,7 +16,7 @@ from rich.tree import Tree
 
 from unshackle.core import binaries
 from unshackle.core.config import config
-from unshackle.core.console import GradientPulseBarColumn, console
+from unshackle.core.console import GradientPulseBarColumn, console, gradient_text
 from unshackle.core.constants import AnyTrack, TrackT
 from unshackle.core.events import events
 from unshackle.core.tracks.attachment import Attachment
@@ -111,7 +111,7 @@ class Tracks:
             if tracks:
                 num_tracks = len(tracks)
                 track_type_plural = track_type.__name__ + ("s" if track_type != Audio and num_tracks != 1 else "")
-                tracks_tree = tree.add(f"[repr.number]{num_tracks}[/] {track_type_plural}")
+                tracks_tree = tree.add(gradient_text(f"{num_tracks} {track_type_plural}", style="bold"))
                 for track in tracks:
                     if add_progress and track_type not in (Chapter, Attachment):
                         progress = Progress(
@@ -157,11 +157,11 @@ class Tracks:
 
                         progress_callables.append(update_track_progress)
                         track_table = Table.grid()
-                        track_table.add_row(str(track)[6:], style="text2")
+                        track_table.add_row(gradient_text(str(track)[6:]))
                         track_table.add_row(progress)
                         tracks_tree.add(track_table)
                     else:
-                        tracks_tree.add(str(track)[6:], style="text2")
+                        tracks_tree.add(gradient_text(str(track)[6:]))
 
             # Show Closed Captions right after Subtitles (even if no subtitle tracks exist)
             if track_type is Subtitle:
@@ -184,10 +184,13 @@ class Tracks:
                         unique_cc.append(" | ".join(parts))
                 if unique_cc:
                     cc_tree = tree.add(
-                        f"[repr.number]{len(unique_cc)}[/] Closed Caption{'s' if len(unique_cc) != 1 else ''}"
+                        gradient_text(
+                            f"{len(unique_cc)} Closed Caption{'s' if len(unique_cc) != 1 else ''}",
+                            style="bold",
+                        )
                     )
                     for cc_str in unique_cc:
-                        cc_tree.add(cc_str, style="text2")
+                        cc_tree.add(gradient_text(cc_str))
 
         return tree, progress_callables
 

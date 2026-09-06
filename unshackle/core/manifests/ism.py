@@ -310,6 +310,8 @@ class ISM:
                         "segments": track_urls,
                     }
                 }
+                timescale = int(stream_index.get("TimeScale") or self.manifest.get("TimeScale") or 10000000)
+                duration_seconds = duration / timescale if duration and timescale else None
 
                 if content_type == "video":
                     try:
@@ -335,6 +337,7 @@ class ISM:
                             descriptor=Video.Descriptor.ISM,
                             drm=drm,
                             data=data,
+                            duration=duration_seconds,
                         )
                     )
                 elif content_type == "audio":
@@ -351,10 +354,10 @@ class ISM:
                             is_original_lang=bool(language and track_lang and str(track_lang) == str(language)),
                             bitrate=ql.get("Bitrate"),
                             channels=ql.get("Channels"),
-                            extra={"atmos": True} if (ql.get("HasAtmos") or "").lower() == "true" else None,
                             descriptor=Track.Descriptor.ISM,
                             drm=drm,
                             data=data,
+                            duration=duration_seconds,
                         )
                     )
                 else:
@@ -367,11 +370,10 @@ class ISM:
                             id_=track_id,
                             url=self.url,
                             codec=scodec,
-                            language=track_lang or language,
-                            is_original_lang=bool(language and track_lang and str(track_lang) == str(language)),
                             descriptor=Track.Descriptor.ISM,
                             drm=drm,
                             data=data,
+                            duration=duration_seconds,
                         )
                     )
         tracks.manifest_url = self.url

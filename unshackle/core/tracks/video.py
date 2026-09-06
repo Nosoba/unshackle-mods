@@ -331,6 +331,11 @@ class Video(Track):
         )
 
     def __str__(self) -> str:
+        bitrate_str = None
+        if self.bitrate:
+            bitrate_str = f"{self.bitrate // 1000} kb/s"
+            if self.estimated_size:
+                bitrate_str += f", {self.estimated_size}"
         return " | ".join(
             filter(
                 bool,
@@ -347,10 +352,11 @@ class Video(Track):
                                         bool,
                                         [
                                             f"{self.width}x{self.height}" if self.width and self.height else None,
-                                            f"{self.bitrate // 1000} kb/s" if self.bitrate else None,
+                                            bitrate_str,
                                         ],
                                     )
                                 ),
+                                self.formatted_duration,
                                 f"{self.fps:.3f} FPS" if self.fps else None,
                             ],
                         )
