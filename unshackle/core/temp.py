@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import shutil
 import time
 import uuid
@@ -15,6 +16,10 @@ from unshackle.core.config import config
 TASK_PREFIX = "task_"
 LOCK_NAME = ".lock"
 STALE_GRACE = 60.0
+REMOVE_ATTEMPTS = 3
+REMOVE_BACKOFF = 0.5
+
+log = logging.getLogger("temp")
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -48,6 +53,28 @@ def sweep_task_dirs(root: Path) -> None:
             shutil.rmtree(entry, ignore_errors=True)
 
 
+def remove_task_dir(task_dir: Path) -> bool:
+    """Remove a task dir, retrying briefly while a tool still holds one of its files.
+
+    On Windows a handle that outlives the run makes a single rmtree a silent no-op, which is how
+    temp files survive a finished download. Retry, then say so instead of leaving it unexplained.
+    """
+    for attempt in range(REMOVE_ATTEMPTS):
+        shutil.rmtree(task_dir, ignore_errors=True)
+        if not task_dir.exists():
+            return True
+        if attempt < REMOVE_ATTEMPTS - 1:
+            time.sleep(REMOVE_BACKOFF)
+
+    leftovers = sorted(p.name for p in task_dir.rglob("*") if p.is_file() and p.name != LOCK_NAME)
+    if leftovers:
+        log.warning(
+            f"Could not clear temp dir {task_dir} ({len(leftovers)} file(s) still in use): "
+            f"{', '.join(leftovers[:5])}{' ...' if len(leftovers) > 5 else ''}"
+        )
+    return False
+
+
 @contextmanager
 def task_temp_dir(task_id: Optional[str] = None) -> Iterator[Path]:
     """Point config.directories.temp at a private dir for this task. Remove it on any exit."""
@@ -65,7 +92,7 @@ def task_temp_dir(task_id: Optional[str] = None) -> Iterator[Path]:
     finally:
         config.directories.temp = root
         lock.release()
-        shutil.rmtree(task_dir, ignore_errors=True)
+        remove_task_dir(task_dir)
 
 
 def with_task_temp(fn: Callable[P, R]) -> Callable[P, R]:
