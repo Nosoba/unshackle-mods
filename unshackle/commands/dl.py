@@ -405,6 +405,25 @@ class dl:
             for package_cmd, fonts in suggestions.items():
                 self.log.info(f"  $ sudo apt install {package_cmd}")
                 self.log.info(f"    → Provides: {', '.join(fonts)}")
+                
+    def apply_romaji(self, titles: Any) -> None:
+        if not config.romaji_map:
+            return
+
+        def _rename(title_obj):
+            if hasattr(title_obj, "name") and title_obj.name in config.romaji_map:
+                original = title_obj.name
+                title_obj.name = config.romaji_map[original]
+            
+            if hasattr(title_obj, "title") and title_obj.title in config.romaji_map:
+                original = title_obj.title
+                title_obj.title = config.romaji_map[original]
+
+        if hasattr(titles, "__iter__"):
+            for t in titles:
+                _rename(t)
+        else:
+            _rename(titles)
 
     def generate_sidecar_subtitle_path(
         self,
@@ -1447,6 +1466,26 @@ class dl:
         # needs to be added this way instead of @cli.result_callback to be
         # able to keep `self` as the first positional
         self.cli._result_callback = self.result
+        
+    def apply_romaji(self, titles: Any) -> None:
+        """Force rename titles based on config_romaji.txt map."""
+        if not config.romaji_map:
+            return
+
+        def _rename(title_obj):
+            if hasattr(title_obj, "name") and title_obj.name in config.romaji_map:
+                original = title_obj.name
+                title_obj.name = config.romaji_map[original]
+            
+            if hasattr(title_obj, "title") and title_obj.title in config.romaji_map:
+                original = title_obj.title
+                title_obj.title = config.romaji_map[original]
+
+        if hasattr(titles, "__iter__"):
+            for t in titles:
+                _rename(t)
+        else:
+            _rename(titles)
 
     @with_task_temp
     def result(
@@ -1804,6 +1843,8 @@ class dl:
 
         if self.tvdb_order and isinstance(titles, Series):
             titles = self.apply_tvdb_order(titles, title_cacher, cache_title_id, cache_region, cache_account_hash)
+
+        self.apply_romaji(titles)
 
         console.print(Padding(Rule(f"[rule.text]{titles.__class__.__name__}: {titles}"), (1, 2)))
         console.print(Padding(titles.tree(verbose=list_titles), (0, 5)))

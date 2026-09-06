@@ -166,6 +166,25 @@ class Config:
         self.debug: bool = kwargs.get("debug", False)
         self.debug_keys: bool = kwargs.get("debug_keys", False)
         self.debug_requests: bool = kwargs.get("debug_requests", False)
+        self.romaji_map: dict[str, str] = {}
+        self._load_romaji_map()
+
+    def _load_romaji_map(self) -> None:
+        """Load title replacements from the optional config_romaji.txt file."""
+        romaji_file = self.directories.user_configs / "config_romaji.txt"
+        if not romaji_file.exists():
+            return
+
+        try:
+            for raw_line in romaji_file.read_text(encoding="utf-8-sig").splitlines():
+                line = raw_line.strip()
+                if not line or "|" not in line:
+                    continue
+                source, replacement = (part.strip() for part in line.split("|", 1))
+                if source and replacement:
+                    self.romaji_map[source] = replacement
+        except OSError as error:
+            warnings.warn(f"Failed to load config_romaji.txt: {error}", stacklevel=2)
 
     def validate_output_templates(self) -> None:
         """Validate output template configurations and warn about potential issues."""
