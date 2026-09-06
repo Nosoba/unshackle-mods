@@ -945,6 +945,25 @@ class dl:
         help="Wanted episodes, e.g. `S01-S05,S07`, `S01E01-S02E03`, `S02-S02E03`, etc. Music uses track numbers, e.g. `1-5`, `1,3,7`, or `2x3` for disc 2 track 3. Defaults to all.",
     )
     @click.option(
+        "--season-override",
+        type=int,
+        default=None,
+        help="Force override the season number (e.g. use 1 for Season 1).",
+    )
+    @click.option(
+        "--episode-override",
+        type=int,
+        default=None,
+        help="Force override the episode number (e.g. use 5 for Episode 5).",
+    )
+    @click.option(
+        "-sy",
+        "--set-year",
+        type=int,
+        default=None,
+        help="Force override the year of the title.",
+    )
+    @click.option(
         "-l",
         "--lang",
         type=LANGUAGE_RANGE,
@@ -1826,6 +1845,9 @@ class dl:
         select_titles: bool,
         wanted: list[str],
         latest_episode: bool,
+        season_override: Optional[int],
+        episode_override: Optional[int],
+        set_year: Optional[int],
         lang: list[str],
         v_lang: list[str],
         a_lang: list[str],
@@ -2349,6 +2371,15 @@ class dl:
                     continue
             elif not title_wanted(title, wanted):
                 continue
+                
+            if isinstance(title, Episode):
+                if season_override is not None:
+                    self.log.info(f"Overriding Season: {title.season} -> {season_override}")
+                    title.season = season_override
+                
+                if episode_override is not None:
+                    self.log.info(f"Overriding Episode: {title.number} -> {episode_override}")
+                    title.number = episode_override
 
             if progress_sink:
                 if isinstance(title, Episode):
