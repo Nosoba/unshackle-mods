@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import sys
 import time
+import requests
+import uuid
 from collections import Counter
 from collections.abc import Iterable
 from concurrent import futures
@@ -24,6 +26,7 @@ from itertools import product
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Collection, Optional, Sequence, TypedDict, Union
+from urllib.parse import urlparse
 from uuid import UUID
 
 import click
@@ -53,6 +56,7 @@ from unshackle.core.events import events
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.providers.tvdb import SEASON_TYPES, parse_int
 from unshackle.core.proxies import Basic, ExpressVPN, Gluetun, Hola, NordVPN, ProtonVPN, SurfsharkVPN, WindscribeVPN
+from unshackle.core.proxies.resolve import resolve_proxy
 from unshackle.core.service import Service, grow_session_pool
 from unshackle.core.services import Services
 from unshackle.core.temp import with_task_temp
@@ -115,6 +119,29 @@ class SkippedSubtitle(TypedDict):
 
 # Config keys accepted as natural names for params whose Python name dodges a builtin.
 DL_OPTION_ALIASES = {"range": "range_", "list": "list_"}
+
+# Hosts that only serve their content inside one country, mapped to the region code unshackle
+# asks a proxy provider for. Used when fetching an external subtitle (-dls) without an explicit
+# --proxy, so e.g. a TVer link works from outside Japan the same way `--proxy jp` would.
+REGION_LOCKED_HOSTS = {"tver.jp": "jp"}
+
+
+def region_lock_for(url: str) -> Optional[str]:
+    """The region a URL's host is locked to, or None if its host isn't a known locked one.
+
+    Matches on the parsed hostname, not a substring of the whole URL, so an unrelated URL that
+    merely mentions a locked host (in its path or query) is not routed through a proxy.
+    """
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    for locked_host, region in REGION_LOCKED_HOSTS.items():
+        if host == locked_host or host.endswith(f".{locked_host}"):
+            return region
+    return None
 
 
 def parse_language(tag: Optional[str]) -> Optional[Language]:
@@ -513,6 +540,294 @@ class dl:
             created_paths.append(sidecar_path)
 
         return created_paths
+        
+    def cleanup_temp_files(self, temp_files: Optional[list] = None) -> None:
+        """Delete temp files staged for a title, e.g. the -dls external subtitle copies.
+
+        The task temp dir is normally removed wholesale on exit, but a file still held open
+        makes that removal a silent no-op on Windows, so drop them as soon as they are spent.
+        """
+        if not temp_files:
+            return
+        for temp_path in temp_files:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except PermissionError:
+                self.log.warning(f"Failed to delete temp file (in use?): {temp_path}")
+            except OSError as e:
+                self.log.warning(f"Failed to delete temp file {temp_path}: {e}")
+        temp_files.clear()
+
+    def external_subtitle_proxy(self, source: str, service: Service) -> Optional[str]:
+        """The proxy URI to fetch an external subtitle (-dls) URL through, or None to go direct.
+
+        Precedence:
+          1. The proxy this run is already using (``--proxy``), so an explicit choice wins and
+             no second request is made to the proxy provider.
+          2. For a region-locked host (see ``REGION_LOCKED_HOSTS``), a freshly resolved proxy in
+             that region, matching what ``--proxy <region>`` would have given.
+          3. Otherwise no proxy.
+
+        Never raises: a provider that cannot serve the region is logged and the fetch is attempted
+        directly, rather than failing the whole download.
+        """
+        session_proxies = getattr(getattr(service, "session", None), "proxies", None) or {}
+        active = session_proxies.get("all") or session_proxies.get("https") or session_proxies.get("http")
+        if active:
+            self.log.debug(f" - Fetching external subtitle via the run's proxy: {mask_proxy(active)}")
+            return active
+
+        region = region_lock_for(source)
+        if not region:
+            return None
+
+        if not self.proxy_providers:
+            self.log.warning(
+                f" - {urlparse(source).hostname} is region locked to {region.upper()} but no proxy provider is "
+                f"available; the subtitle fetch will likely fail."
+            )
+            return None
+
+        self.log.info(f" - External subtitle host is region locked; getting a {region.upper()} proxy.")
+        try:
+            proxy = resolve_proxy(region, self.proxy_providers)
+        except ValueError as e:
+            self.log.error(f" - Could not get a {region.upper()} proxy for the external subtitle: {e}")
+            return None
+        except Exception as e:
+            self.log.error(f" - Failed to resolve a {region.upper()} proxy for the external subtitle: {e}")
+            return None
+
+        if proxy:
+            self.log.debug(f" - Using {region.upper()} proxy for the external subtitle: {mask_proxy(proxy)}")
+        return proxy
+
+    def process_external_subtitle(self, title: Title_T, source: str, service: Service, temp_files_list: list = None) -> None:
+        """
+        Processes external subtitle request (-dls).
+        Handles local files and URLs.
+        Uses yt-dlp for TVer URLs.
+        """
+        def get_codec_from_path(path_obj: Path):
+            suffix = path_obj.suffix.lower()
+            if suffix == ".vtt": return Subtitle.Codec.WebVTT
+            if suffix == ".srt": return Subtitle.Codec.SubRip
+            if suffix in [".ass", ".ssa"]: return Subtitle.Codec.SubStationAlphav4
+            return Subtitle.Codec.SubRip
+            
+        def downloader_local(urls, output_dir, filename, **kwargs):
+            source_file = Path(urls) if isinstance(urls, str) else Path(urls[0])
+            dest_file = Path(output_dir) / filename
+            if source_file.exists() and source_file.resolve() != dest_file.resolve():
+                shutil.copy2(source_file, dest_file)
+            yield {"file_downloaded": True, "downloaded": "External (Local)", "total": 100, "completed": 100}
+            
+        def downloader_temp(urls, output_dir, filename, **kwargs):
+            source_file = Path(urls) if isinstance(urls, str) else Path(urls[0])
+            dest_file = Path(output_dir) / filename
+            if source_file.exists():
+                if source_file.resolve() != dest_file.resolve():
+                    shutil.copy2(source_file, dest_file)
+                try:
+                    source_file.unlink()
+                except:
+                    pass
+            yield {"file_downloaded": True, "downloaded": "External (Fetched)", "total": 100, "completed": 100}
+            
+        def get_language_from_filename(filename_str: str):
+            # Bersihkan nama file dan split berdasarkan separator umum
+            clean_name = Path(filename_str).stem.lower()
+            parts = re.split(r'[ ._-]', clean_name)
+            
+            # Mapping manual untuk keyword umum
+            custom_map = {
+                "jp": "ja", "japan": "ja", "japanese": "ja",
+                "en": "en", "eng": "en", "english": "en",
+                "id": "id", "indo": "id", "indonesia": "id",
+                "kor": "ko", "korea": "ko", "cn": "zh", "ch": "zh"
+            }
+
+            detected_lang = Language.get("und")
+            
+            # Cek dari belakang (biasanya kode bahasa ada di akhir nama file)
+            for part in reversed(parts):
+                if not part: continue
+                
+                # 1. Cek mapping manual
+                if part in custom_map:
+                    detected_lang = Language.get(custom_map[part])
+                    break
+                
+                # 2. Cek library Language standar (jika 2-3 huruf)
+                if len(part) in [2, 3]:
+                    try:
+                        possible = Language.get(part)
+                        # Validasi sederhana agar tidak menangkap angka/part yang aneh
+                        if possible.is_valid(): 
+                            detected_lang = possible
+                            break
+                    except:
+                        pass
+            
+            return detected_lang
+
+        # 1. LOCAL FILE PROCESSING
+        if Path(source).exists():
+            local_path = Path(source)
+            # Copy to temp to ensure consistency
+            temp_path = config.directories.temp / f"external_sub_{local_path.name}"
+            shutil.copy2(local_path, temp_path)
+            
+            if temp_files_list is not None:
+                temp_files_list.append(temp_path)
+                
+            codec = get_codec_from_path(local_path)
+            
+            # Deteksi bahasa dari nama file asli
+            lang_obj = get_language_from_filename(local_path.name)
+            
+            # Create Track
+            sub = Subtitle(
+                id_="ext_local",
+                url=str(temp_path),
+                language=lang_obj, # Gunakan hasil deteksi
+                is_original_lang=(str(lang_obj) == 'ja'), # Asumsi jika detect JP maka original (bisa disesuaikan)
+                descriptor=Subtitle.Descriptor.URL,
+                from_file=temp_path,
+                codec=codec
+            )
+            sub.path = temp_path
+            sub.downloader = downloader_local
+            title.tracks.add(sub)
+            return
+
+        # 2. URL PROCESSING
+        if source.startswith("http"):
+            sub_proxy = self.external_subtitle_proxy(source, service)
+
+            # A. TVer Episode URL Logic -> Use yt-dlp
+            if (urlparse(source).hostname or "").lower().endswith("tver.jp"):
+                
+                # 1. Cari yt-dlp executable
+                yt_dlp_exe = None
+                
+                # Coba cari di folder binaries (sebelah FFmpeg/MKVToolNix)
+                if binaries.FFMPEG:
+                    possible = binaries.FFMPEG.parent / "yt-dlp.exe"
+                    if possible.exists():
+                        yt_dlp_exe = possible
+                
+                # Coba cari di PATH sistem
+                if not yt_dlp_exe:
+                    yt_dlp_exe = shutil.which("yt-dlp")
+                
+                if not yt_dlp_exe:
+                    self.log.error(" - yt-dlp.exe not found in binaries folder or PATH. Cannot fetch TVer subs.")
+                    return
+
+                # 2. Setup Output path di folder Temp
+                run_id = str(uuid.uuid4())[:8]
+                # Template output yt-dlp
+                out_tmpl = config.directories.temp / f"tver_sub_{run_id}"
+                
+                # 3. Susun Command yt-dlp
+                cmd = [
+                    str(yt_dlp_exe),
+                    "--skip-download",      # Cuma ambil metadata/subs
+                    "--write-subs",         # Download subtitle
+                    "--write-auto-subs",    # Download auto-generated subs (kadang TVer pake ini)
+                    "--sub-lang", "all",    # Ambil semua bahasa (biasanya ja)
+                    "--output", str(out_tmpl),
+                ]
+                if sub_proxy:
+                    cmd += ["--proxy", sub_proxy]
+                cmd.append(source)
+
+                try:
+                    self.log.debug(f"Running yt-dlp: {[mask_proxy(x) for x in cmd]}")
+                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    
+                    found_subs = list(config.directories.temp.glob(f"tver_sub_{run_id}*"))
+                    # every file yt-dlp wrote is temporary, not just the ones we turn into tracks
+                    if temp_files_list is not None:
+                        temp_files_list.extend(found_subs)
+                    valid_subs = [f for f in found_subs if f.suffix in ['.vtt', '.srt', '.ass']]
+                    
+                    if not valid_subs:
+                        self.log.warning(" - yt-dlp finished but no subtitle files were found.")
+                        return
+
+                    for sub_file in valid_subs:
+                        parts = sub_file.suffixes
+                        lang_code = "ja"
+                        if len(parts) >= 2:
+                            candidate = parts[-2].replace(".", "")
+                            if len(candidate) in [2, 3]:
+                                lang_code = candidate
+                        
+                        try:
+                            lang_obj = Language.get(lang_code)
+                        except:
+                            lang_obj = Language.get("und")
+                            
+                        codec = get_codec_from_path(sub_file)
+
+                        sub = Subtitle(
+                            id_=f"ext_tver_{lang_code}_{run_id}",
+                            url=str(sub_file),
+                            language=lang_obj,
+                            is_original_lang=(lang_code == 'ja'),
+                            descriptor=Subtitle.Descriptor.URL,
+                            from_file=sub_file,
+                            codec=codec
+                        )
+                        sub.path = sub_file
+                        sub.downloader = downloader_temp
+                        title.tracks.add(sub)
+
+                except subprocess.CalledProcessError as e:
+                    err_msg = e.stderr.decode('utf-8', errors='ignore')
+                    self.log.error(f" - yt-dlp failed: {err_msg}")
+                except Exception as e:
+                    self.log.error(f" - Error processing TVer subs: {e}")
+                
+                return
+
+            else:
+                try:
+                    req_proxies = {"http": sub_proxy, "https": sub_proxy} if sub_proxy else None
+
+                    res = requests.get(source, proxies=req_proxies, timeout=15)
+                    res.raise_for_status()
+                    
+                    filename = source.split("/")[-1].split("?")[0]
+                    if "." not in filename: filename = "external.srt"
+                    
+                    temp_path = config.directories.temp / f"external_dl_{filename}"
+                    temp_path.write_bytes(res.content)
+                    
+                    if temp_files_list is not None:
+                        temp_files_list.append(temp_path)
+                    
+                    codec = get_codec_from_path(temp_path)
+                    
+                    # Deteksi bahasa dari nama file URL
+                    lang_obj = get_language_from_filename(filename)
+                    
+                    sub = Subtitle(
+                        id_="ext_url",
+                        url=source,
+                        language=lang_obj, # Gunakan hasil deteksi
+                        is_original_lang=(str(lang_obj) == 'ja'),
+                        descriptor=Subtitle.Descriptor.URL,
+                        codec=codec
+                    )
+                    sub.path = temp_path
+                    sub.downloader = downloader_temp
+                    title.tracks.add(sub)
+                    
+                except Exception as e:
+                    self.log.error(f" - Failed to download external subtitle: {e}")
 
     def post_script_ids(self) -> dict[str, Any]:
         """Tagging IDs as they stand right now.
@@ -951,6 +1266,13 @@ class dl:
         is_flag=True,
         default=False,
         help="Warn instead of failing when a requested resolution, range, or language is missing, and continue with what is available.",
+    )
+    @click.option(
+        "-dls",
+        "--dl-sub",
+        type=str,
+        default=None,
+        help="Path to local subtitle file OR URL (Direct/TVer) to include in download."
     )
     @click.option(
         "--remote",
@@ -2186,6 +2508,11 @@ class dl:
                         level="INFO", operation="get_tracks", service=self.service, context=tracks_info
                     )
 
+            temp_external_subs = []
+
+            if dl_sub:
+                self.process_external_subtitle(title, dl_sub, service, temp_files_list=temp_external_subs)
+
             # strip SDH subs to non-SDH if no equivalent same-lang non-SDH is available
             # uses a loose check, e.g, wont strip en-US SDH sub if a non-SDH en-GB is available
             # Check if automatic SDH stripping is enabled in config
@@ -2248,6 +2575,7 @@ class dl:
             if list_:
                 available_tracks, _ = title.tracks.tree()
                 console.print(Padding(listing_panel(available_tracks, "Available Tracks"), (0, 5)))
+                self.cleanup_temp_files(temp_external_subs)
                 continue
 
             keep_videos = True
@@ -3006,6 +3334,7 @@ class dl:
                     context={"title": str(title)},
                 )
                 self.wait_vault_writes()
+                self.cleanup_temp_files(temp_external_subs)
                 return
             except Exception as e:  # noqa
                 # Reported and swallowed (no re-raise) so the CLI exits cleanly; flag it so the
@@ -3048,6 +3377,7 @@ class dl:
                     postscript,
                 )
                 self.wait_vault_writes()
+                self.cleanup_temp_files(temp_external_subs)
                 return
 
             self.wait_vault_writes()
@@ -3690,6 +4020,8 @@ class dl:
                 cookie_file = self.get_cookie_path(self.service, self.profile)
                 if cookie_file:
                     self.save_cookies(cookie_file, service.session.cookies)
+
+            self.cleanup_temp_files(temp_external_subs)
 
         if hasattr(service, "close"):
             service.close()
