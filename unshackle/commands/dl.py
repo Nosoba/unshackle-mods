@@ -1200,7 +1200,7 @@ class dl:
         default=False,
         help="Bypass proxy for all downloads. Manifest, license, and auth still use proxy.",
     )
-    @click.option("--no-folder", is_flag=True, default=False, help="Disable folder creation for TV Shows.")
+    @click.option("--folder", "-F", is_flag=True, default=False, help="Enable folder creation for TV Shows.")
     @click.option(
         "--no-source", is_flag=True, default=False, help="Disable the source tag from the output file name and path."
     )
@@ -1878,7 +1878,7 @@ class dl:
         cdm_only: Optional[bool],
         no_proxy: bool,
         no_proxy_download: bool,
-        no_folder: bool,
+        folder: bool,
         no_source: bool,
         no_mux: bool,
         workers: Optional[int],
@@ -3830,7 +3830,7 @@ class dl:
 
                                     sidecar_dir = self.output_dir or config.directories.downloads
                                     if (
-                                        not no_folder
+                                        folder
                                         and media_info
                                         and (
                                             isinstance(title, (Episode, Song))
@@ -3909,7 +3909,7 @@ class dl:
 
                 if no_mux:
                     final_dir = self.output_dir or config.directories.downloads
-                    if not no_folder and (
+                    if folder and (
                         isinstance(title, (Episode, Song))
                         or (isinstance(title, Movie) and config.get_folder_template("movies"))
                     ):
@@ -3964,7 +3964,7 @@ class dl:
                         final_filename = title.get_filename(media_info, show_service=not no_source)
                         audio_codec_suffix = muxed_audio_codecs.get(muxed_path)
 
-                        if not no_folder and (
+                        if not folder and (
                             isinstance(title, (Episode, Song))
                             or (isinstance(title, Movie) and config.get_folder_template("movies"))
                         ):
