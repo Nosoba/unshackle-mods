@@ -3646,6 +3646,11 @@ class dl:
                                 session=service.session,
                             )
 
+                        try:
+                            tags.apply_container_metadata(final_path, title_name=final_path.stem)
+                        except Exception as e:
+                            self.log.warning(f"Could not apply container metadata to {final_path.name}: {e}")
+
                         post_script_context = build_context(
                             title,
                             media_info,

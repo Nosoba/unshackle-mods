@@ -6,6 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional, Union
+from xml.etree import ElementTree
 from xml.sax.saxutils import escape
 
 from unshackle.core import binaries
@@ -24,6 +25,83 @@ from unshackle.core.titles.title import Title
 from unshackle.core.utils.subprocess import log_tool_run
 
 log = logging.getLogger("TAGS")
+
+MUXER_BRANDING = "NSBC Muxer v16.78 ( 「CRASH」 )"
+
+
+def load_metadata_xml_tags() -> dict[str, str]:
+    """Read the optional metadata.xml release tags shipped next to the config.
+
+    Returns an empty mapping when the file is absent or unparseable, so a broken
+    override never aborts a download.
+    """
+    xml_path = config.directories.user_configs / "metadata.xml"
+    if not xml_path.exists():
+        log.debug("No metadata.xml found at %s", xml_path)
+        return {}
+
+    try:
+        root = ElementTree.fromstring(xml_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ElementTree.ParseError) as e:
+        log.warning("Could not read metadata.xml (%s); skipping release tags", e)
+        return {}
+
+    tags: dict[str, str] = {}
+    for simple in root.iter("Simple"):
+        name = (simple.findtext("Name") or "").strip()
+        value = (simple.findtext("String") or "").strip()
+        if name and value:
+            tags[name] = value
+    return tags
+
+
+def apply_container_metadata(path: Path, title_name: Optional[str] = None) -> None:
+    """Stamp the muxer branding onto a Matroska container's info header.
+
+    mkvmerge writes its own name into muxing-application/writing-application, so this
+    overwrites those fields after muxing and refreshes the track statistics tags.
+    """
+    if path.suffix.lower() != ".mkv":
+        return
+    if not binaries.Mkvpropedit:
+        log.debug("mkvpropedit not found on PATH; skipping container metadata")
+        return
+
+    cl = [str(binaries.Mkvpropedit), str(path), "--edit", "info"]
+
+    if title_name and config.muxing.get("set_title", True):
+        cl.extend(["--set", f"title={title_name}"])
+
+    cl.extend(
+        [
+            "--set",
+            f"muxing-application={MUXER_BRANDING}",
+            "--set",
+            f"writing-application={MUXER_BRANDING}",
+            "--add-track-statistics-tags",
+        ]
+    )
+
+    edit_start = time.monotonic()
+    result = subprocess.run(
+        cl,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    log_tool_run(
+        "mkvpropedit info",
+        "mkvpropedit",
+        result.returncode,
+        duration_ms=round((time.monotonic() - edit_start) * 1000, 1),
+        file=path.name,
+    )
+    if result.returncode != 0:
+        log.warning("mkvpropedit failed (exit %d): %s", result.returncode, (result.stderr or "").strip())
+    else:
+        log.debug("Container metadata applied via mkvpropedit")
 
 
 def apply_tags(path: Path, tags: dict[str, str]) -> None:
@@ -103,7 +181,7 @@ def tag_file(
             log.warning("Music metadata skipped for %s: %s", path.name, music_result.reason)
         return
 
-    custom_tags: dict[str, str] = {}
+    custom_tags: dict[str, str] = load_metadata_xml_tags()
 
     if config.tag and config.tag_group_name:
         custom_tags["Group"] = config.tag
@@ -151,7 +229,10 @@ def tag_file(
 
 
 __all__ = [
+    "MUXER_BRANDING",
+    "apply_container_metadata",
     "apply_tags",
     "fuzzy_match",
+    "load_metadata_xml_tags",
     "tag_file",
 ]
