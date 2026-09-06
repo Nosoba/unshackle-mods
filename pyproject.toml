@@ -70,6 +70,9 @@ dependencies = [
     "mutagen>=1.47.0,<2",
     "defusedxml>=0.7.1",
     "rich-click>=1.9.8",
+    "tldextract>=5.3.2",
+    "xmltodict>=1.0.4",
+    "base58>=2.1.1",
 ]
 
 [project.urls]
