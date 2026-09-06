@@ -66,7 +66,7 @@ class ComfyLogRenderer(LogRender):
         if self.show_level:
             row.append(level)
 
-        row.append(Renderables(renderables))
+        row.append(Renderables(tuple(_gradient_log_message(r) for r in renderables)))
         if self.show_path and path:
             path_text = Text()
             path_text.append(path, style=f"link file://{link_path}" if link_path else "")
@@ -430,6 +430,70 @@ console = ComfyConsole(
 )
 
 
+def gradient_text(
+    text: str,
+    *,
+    colors: Optional[Iterable[str]] = None,
+    style: Optional[StyleType] = None,
+) -> Text:
+    """Create truecolor gradient text using the active CLI palette.
+
+    Newlines and whitespace do not advance the colour stops, keeping multiline
+    banners visually aligned. Rich automatically down-samples the colours for
+    terminals without truecolor support.
+    """
+    palette = (
+        (primary_scheme["pink"], primary_scheme["cyan"], primary_scheme["blue"])
+        if colors is None
+        else tuple(colors)
+    )
+    if not palette:
+        raise ValueError("At least one gradient color is required")
+    base_style = Style.parse(style) if isinstance(style, str) else (style or Style())
+    if len(palette) == 1:
+        return Text(text, style=base_style + Style(color=palette[0]))
+
+    stops = []
+    for color in palette:
+        triplet = Color.parse(color).triplet
+        if triplet is None:
+            raise ValueError(f"Gradient color has no RGB value: {color!r}")
+        stops.append(triplet)
+
+    visible = sum(not char.isspace() for char in text)
+    result = Text()
+    position = 0
+    for char in text:
+        if char.isspace():
+            result.append(char, base_style)
+            continue
+        progress = position / max(visible - 1, 1)
+        scaled = progress * (len(stops) - 1)
+        index = min(int(scaled), len(stops) - 2)
+        color = Color.from_triplet(blend_rgb(stops[index], stops[index + 1], scaled - index))
+        result.append(char, base_style + Style(color=color))
+        position += 1
+    return result
+
+
+def _gradient_log_message(renderable: ConsoleRenderable) -> ConsoleRenderable:
+    """Apply the text gradient to a plain log message, preserving styled spans.
+
+    Plain strings become fully gradient. ``Text`` messages re-render their content
+    over the same gradient while re-styling their existing spans, so semantic accents
+    such as success markers or highlighted values stay readable on top.
+    """
+    if isinstance(renderable, str):
+        return gradient_text(renderable)
+    if isinstance(renderable, Text):
+        gradient = gradient_text(renderable.plain, style=renderable.style)
+        for span in renderable.spans:
+            if span.style is not None:
+                gradient.stylize(span.style, span.start, span.end)
+        return gradient
+    return renderable
+
+
 def listing_panel(renderable: RenderableType, title: str) -> Panel:
     """Box a listing in the shared panel style, so every listing restyles from one place."""
     return Panel(renderable, title=title, box=box.SQUARE, border_style="bright_black")
@@ -474,6 +538,7 @@ __all__ = (
     "GradientPulseBarColumn",
     "SyncLive",
     "console",
+    "gradient_text",
     "listing_panel",
     "listing_table",
     "print_wide",
