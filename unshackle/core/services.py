@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import inspect
 import logging
+import platform
 import re
 import sys
 import threading
 import time
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -67,6 +69,22 @@ def discover_services() -> tuple[list[Path], list[str]]:
 SERVICES, SHADOWED = discover_services()
 
 
+def compiled_import_hint(missing: str, path: Path) -> str:
+    """Say why a compiled service submodule did not import.
+
+    Python loads a compiled service only from a file named for the exact interpreter
+    and platform that runs it, so name the build the service does not ship.
+    """
+    stem = missing.rsplit(".", 1)[-1]
+    present = [f.name for f in path.parent.glob(f"{stem}.*") if f.suffix in (".so", ".pyd")]
+    if not present or any(f"{stem}{suffix}" in present for suffix in EXTENSION_SUFFIXES):
+        return ""
+    return (
+        f" - this service ships no build for Python {platform.python_version()}"
+        f" on {platform.system()}, which needs {stem}{EXTENSION_SUFFIXES[0]}"
+    )
+
+
 def load_service(path: Path) -> object:
     """Load one Service module, returning its tag-named class.
 
@@ -77,7 +95,8 @@ def load_service(path: Path) -> object:
     try:
         module = import_module_by_path(path)
     except Exception as e:
-        raise RuntimeError(f"{tag}: failed to import - {type(e).__name__}: {e} ({path})") from e
+        hint = compiled_import_hint(e.name, path) if isinstance(e, ModuleNotFoundError) and e.name else ""
+        raise RuntimeError(f"{tag}: failed to import - {type(e).__name__}: {e}{hint} ({path})") from e
     try:
         return getattr(module, tag)
     except AttributeError as e:
@@ -465,8 +484,12 @@ class Services(click.Group):
             help_text = Services.docstring_help(help_text)
         cli_params = svc_info.get("cli_params") if svc_info else None
 
+        title_arg = next(
+            (p for p in cli_params or [] if p.get("kind") == "argument" and p.get("name") == "title"), None
+        )
+
         @click.command(name=tag, short_help=short_help, help=help_text)
-        @click.argument("title", type=str)
+        @click.argument("title", type=str, required=bool(title_arg.get("required", True)) if title_arg else True)
         @click.pass_context
         def remote_cli(ctx: click.Context, title: str, **kwargs: object) -> object:
             from unshackle.core.remote_service import RemoteService, resolve_server
@@ -487,7 +510,10 @@ class Services(click.Group):
                         kwargs["default"] = param.get("default", False)
                     else:
                         kwargs["default"] = param.get("default")
-                        kwargs["type"] = str
+                        choices = param.get("choices")
+                        kwargs["type"] = click.Choice(choices, case_sensitive=False) if choices else str
+                        if param.get("multiple"):
+                            kwargs["multiple"] = True
                     if param.get("help"):
                         kwargs["help"] = param["help"]
                     remote_cli = click.option(*opts, **kwargs)(remote_cli)
