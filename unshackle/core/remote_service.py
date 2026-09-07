@@ -31,6 +31,7 @@ from unshackle.core.config import config
 from unshackle.core.console import console, prompt_user
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
+from unshackle.core.proxies.resolve import is_loopback
 from unshackle.core.titles import Title_T, Titles_T, remap_titles
 from unshackle.core.titles.episode import Episode, Series
 from unshackle.core.titles.movie import Movie, Movies
@@ -866,6 +867,10 @@ class RemoteService:
                 country = re.match(r"^(?:[a-z]+:)?([a-z]{2})\d*$", query, re.IGNORECASE)
                 if country:
                     create_data["proxy_region"] = country.group(1).lower()
+        if create_data.get("proxy") and is_loopback(create_data["proxy"]) and not is_loopback(self.client.server_url):
+            # the local CLI resolves the proxy, so a local-only URI is useless to a server elsewhere
+            raise click.ClickException("That proxy is on your machine, so --remote cannot use it.")
+
         if not no_proxy and not proxy and client_region:
             create_data["client_region"] = client_region
         elif not no_proxy and not proxy and self._server_accounts and not self._server_accounts.get("global"):
@@ -1112,6 +1117,8 @@ class RemoteService:
             for track in title.tracks:
                 track_keys = keys_by_track.get(str(track.id), {})
                 if not track_keys:
+                    if str(track.id) in track_ids:
+                        self.log.warning(f"Server CDM returned no content keys for track {track.id}")
                     continue
 
                 kid_list = list(track_keys.keys())
@@ -1256,6 +1263,8 @@ class RemoteService:
                         return challenge
                 except Exception as e:
                     self.log.warning("server_cdm license failed: %s", e)
+            else:
+                self.log.warning(f"Track {track.id} has no {drm_type} PSSH to send to the server CDM")
             return challenge
 
         payload = {

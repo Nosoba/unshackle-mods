@@ -56,7 +56,7 @@ from unshackle.core.events import events
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.providers.tvdb import SEASON_TYPES, parse_int
 from unshackle.core.proxies import Basic, ExpressVPN, Gluetun, Hola, NordVPN, ProtonVPN, SurfsharkVPN, WindscribeVPN
-from unshackle.core.proxies.resolve import resolve_proxy
+from unshackle.core.proxies.resolve import is_loopback, resolve_proxy
 from unshackle.core.service import Service, grow_session_pool
 from unshackle.core.services import Services
 from unshackle.core.temp import with_task_temp
@@ -70,6 +70,7 @@ from unshackle.core.tracks.hybrid import Hybrid
 from unshackle.core.tracks.track import assert_fragments_decrypted, has_encrypted_sample_entry
 from unshackle.core.utilities import (
     as_requested,
+    declared_kwargs,
     embedded_audio_langs,
     excluded_language_tags,
     find_font_with_fallbacks,
@@ -228,6 +229,16 @@ def title_wanted(candidate: Any, wanted: Collection[str]) -> bool:
     if not wanted or not isinstance(candidate, (Episode, Song)):
         return True
     return bool(candidate.matches_wanted(wanted))
+
+
+def server_url(server_name: Optional[str]) -> str:
+    """The configured URL of a remote server, or an empty string when the config cannot be read."""
+    from unshackle.core.remote_service import resolve_server
+
+    try:
+        return resolve_server(server_name)[0]
+    except Exception:
+        return ""
 
 
 def post_script_group(candidate: Any) -> Any:
@@ -1572,6 +1583,7 @@ class dl:
 
         self.cdm_override = ctx.params.get("cdm_name")
         cdm_only = ctx.params.get("cdm_only")
+        self.vault_cache_tally: Optional[tuple[int, int]] = None
 
         if cdm_only:
             self.vaults = Vaults(self.vault_service)
@@ -1672,10 +1684,15 @@ class dl:
                 if cdm_info:
                     log_event("load_cdm", level="INFO", service=self.service, context={"cdm": cdm_info})
 
+        # A server on this machine can reach a local proxy, so only a server elsewhere is guarded
+        self.remote_needs_public_proxy = self.is_remote and not is_loopback(server_url(ctx.params.get("server")))
+
         self.proxy_providers = []
         if no_proxy:
             ctx.params["proxy"] = None
         else:
+            if self.remote_needs_public_proxy and proxy and proxy.lower().startswith("gluetun:"):
+                raise click.UsageError("Gluetun runs on your machine, so --remote cannot use it.")
             if proxy_providers is not None:
                 self.proxy_providers = list(proxy_providers)
             else:
@@ -1793,6 +1810,9 @@ class dl:
                     # For explicit proxies, store None for query/provider
                     ctx.params["proxy_query"] = None
                     ctx.params["proxy_provider"] = None
+
+            if self.remote_needs_public_proxy and ctx.params.get("proxy") and is_loopback(ctx.params["proxy"]):
+                raise click.UsageError("That proxy is on your machine, so --remote cannot use it.")
 
         ctx.obj = ContextData(
             config=self.service_config, cdm=self.cdm, proxy_providers=self.proxy_providers, profile=self.profile
@@ -3061,7 +3081,7 @@ class dl:
                                         )
                                     )
                             else:
-                                self.log.error(missing_str + " not found in tracks")
+                                self.log.error(missing_str + " not found in subtitle tracks")
                                 sys.exit(1)
 
                         if s_lang and title.tracks.subtitles:
@@ -3108,7 +3128,9 @@ class dl:
                             sys.exit(1)
                     if channels:
                         title.tracks.select_audio(
-                            lambda x: bool(x.channels and math.ceil(x.channels) == math.ceil(channels))
+                            lambda x: bool(
+                                x.channels and math.ceil(Audio.channel_total(x.channels)) == math.ceil(channels)
+                            )
                         )
                         if not title.tracks.audio:
                             self.log.error(f"There's no {channels} Audio Track...")
@@ -4370,15 +4392,19 @@ class dl:
             self.log.error(f"Vault write failed: {exc!r}")
 
     def wait_vault_writes(self) -> None:
-        """Block until every queued vault write has run."""
+        """Block until every queued vault write has run, then log the total once."""
         self.VAULT_WRITER.submit(lambda: None).result()
+        if not (self.vault_cache_tally and self.vault_cache_tally[0]):
+            self.vault_cache_tally = None
+            return
+        keys, successful_caches = self.vault_cache_tally
+        self.vault_cache_tally = None
+        self.log.info(f"Cached {keys} Key{'' if keys == 1 else 's'} to {successful_caches}/{len(self.vaults)} Vaults")
 
     def cache_keys_to_vaults(self, content_keys: dict[UUID, str]) -> None:
         successful_caches = self.vaults.add_keys(content_keys)
-        self.log.info(
-            f"Cached {len(content_keys)} Key{'' if len(content_keys) == 1 else 's'} to "
-            f"{successful_caches}/{len(self.vaults)} Vaults"
-        )
+        keys, caches = self.vault_cache_tally or (0, successful_caches)
+        self.vault_cache_tally = (keys + len(content_keys), min(caches, successful_caches))
 
     @classmethod
     def drm_lock(cls, drm: DRM_T) -> Lock:
@@ -4396,14 +4422,16 @@ class dl:
     def service_licence(self, service: Service, drm_system: Optional[str] = None, **kwargs: Any) -> Any:
         """Call the service's licence function for the track's DRM system.
 
+        Arguments go through declared_kwargs, so a service receives only the ones its own
+        licence function declares.
+
         prepare_drm passes drm_system so the choice follows the track, not the loaded CDM:
         a track downloading at the same time can swap self.cdm.
         """
         if drm_system is None:
             drm_system = "playready" if is_playready_cdm(self.cdm) else "widevine"
-        if drm_system == "playready":
-            return service.get_playready_license(**kwargs)
-        return service.get_widevine_license(**kwargs)
+        fn = service.get_playready_license if drm_system == "playready" else service.get_widevine_license
+        return fn(**declared_kwargs(fn, kwargs))
 
     def prepare_drm(
         self,
@@ -4443,9 +4471,26 @@ class dl:
                         drm.content_keys[kid] = content_key
                         self.LICENSE_KEY_CACHE[kid] = content_key
 
+            def missing_track_key() -> bool:
+                return not drm.content_keys or bool(track_kid and track_kid not in drm.content_keys)
+
+            if missing_track_key():
+                try:
+                    licence(
+                        drm_system="playready" if drm.__class__.__name__ == "PlayReady" else "widevine",
+                        challenge=b"",
+                    )
+                except Exception as e:
+                    self.log.debug(f"Server CDM licence with an empty challenge failed: {e!r}")
+
             if not drm.content_keys:
                 self.log.warning("Server CDM did not resolve any keys for this track")
                 return
+            if track_kid and track_kid not in drm.content_keys:
+                msg = f"No Content Key for KID {track_kid.hex} was returned by the server CDM"
+                if isinstance(drm, PlayReady):
+                    raise PlayReady.Exceptions.CEKNotFound(msg)
+                raise Widevine.Exceptions.CEKNotFound(msg)
             svc = getattr(self, "_remote_service", None)
             server_drm_type = getattr(svc, "_server_cdm_type", None) if svc else None
             drm_name = {"widevine": "Widevine", "playready": "PlayReady"}.get(
@@ -4653,10 +4698,7 @@ class dl:
                     )
 
                     try:
-                        if self.service == "NF":
-                            drm.get_NF_content_keys(cdm=track_cdm, licence=licence, certificate=certificate)
-                        else:
-                            drm.get_content_keys(cdm=track_cdm, licence=licence, certificate=certificate)
+                        drm.get_content_keys(cdm=track_cdm, licence=licence, certificate=certificate)
                     except Exception as e:
                         if drm.content_keys:
                             self.log.debug(f"License call failed but keys already in content_keys: {e}")
