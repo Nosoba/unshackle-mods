@@ -1888,6 +1888,7 @@ class dl:
         downloads: int,
         worst: bool,
         best_available: bool,
+        dl_sub: Optional[str],
         speed_limit: Optional[str] = None,
         split_audio: Optional[bool] = None,
         merge_video: Optional[bool] = None,
