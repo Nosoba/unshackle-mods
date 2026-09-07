@@ -3965,7 +3965,7 @@ class dl:
                         final_filename = title.get_filename(media_info, show_service=not no_source)
                         audio_codec_suffix = muxed_audio_codecs.get(muxed_path)
 
-                        if not folder and (
+                        if folder and (
                             isinstance(title, (Episode, Song))
                             or (isinstance(title, Movie) and config.get_folder_template("movies"))
                         ):
