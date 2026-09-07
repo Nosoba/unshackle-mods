@@ -967,7 +967,7 @@ class dl:
         "-l",
         "--lang",
         type=LANGUAGE_RANGE,
-        default="orig",
+        default="best",
         help="Language(s) wanted for Video and Audio (comma-separated). Use 'orig' to select the original language, e.g. 'orig,en' for both original and English. Prefix a value with '-' to exclude it, e.g. 'all,-es'.",
     )
     @click.option(
@@ -987,7 +987,7 @@ class dl:
         "-al",
         "--a-lang",
         type=LANGUAGE_RANGE,
-        default=[],
+        default="best",
         help="Language wanted for Audio, overrides -l/--lang for audio tracks. Prefix a value with '-' to exclude it, e.g. 'all,-es'.",
     )
     @click.option(
@@ -1164,7 +1164,7 @@ class dl:
         help="Skip downloading, only list available titles that would have been downloaded.",
     )
     @click.option(
-        "--skip-dl", is_flag=True, default=False, help="Skip downloading while still retrieving the decryption keys."
+        "--skip-dl", "--keys", is_flag=True, default=False, help="Skip downloading while still retrieving the decryption keys."
     )
     @click.option(
         "--export",
@@ -1195,6 +1195,7 @@ class dl:
     )
     @click.option("--no-proxy", is_flag=True, default=False, help="Force disable all proxy use.")
     @click.option(
+        "-npd",
         "--no-proxy-download",
         is_flag=True,
         default=False,
