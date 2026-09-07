@@ -2377,10 +2377,14 @@ class dl:
                 if season_override is not None:
                     self.log.info(f"Overriding Season: {title.season} -> {season_override}")
                     title.season = season_override
-                
+
                 if episode_override is not None:
                     self.log.info(f"Overriding Episode: {title.number} -> {episode_override}")
                     title.number = episode_override
+
+            if set_year is not None and isinstance(title, (Episode, Movie)):
+                self.log.info(f"Overriding Year: {title.year} -> {set_year}")
+                title.year = set_year
 
             if progress_sink:
                 if isinstance(title, Episode):
