@@ -118,6 +118,22 @@ def import_module_by_path(path: Path) -> ModuleType:
     return module
 
 
+# Windows rejects these in a path; the fullwidth twins look the same but are legal,
+# which keeps CJK titles readable instead of stripping punctuation out of them
+FULLWIDTH_REPLACEMENTS = {
+    "<": "＜",
+    ">": "＞",
+    ":": "：",
+    '"': "＂",
+    "/": "／",
+    "\\": "＼",
+    "|": "｜",
+    "?": "？",
+    "*": "＊",
+    "!": "！",
+}
+
+
 def sanitize_filename(filename: str, spacer: str = ".") -> str:
     """
     Sanitise a string to be filename safe.
@@ -127,18 +143,33 @@ def sanitize_filename(filename: str, spacer: str = ".") -> str:
 
     Set `unicode_filenames: true` in config to preserve the characters of the
     original language (for example Korean, Japanese, or Chinese) instead of
-    transliterating them to ASCII equivalents.
+    transliterating them to ASCII equivalents. Characters Windows forbids in a
+    path are then swapped for their fullwidth twins so the title stays readable.
     """
+    if filename is None:
+        return ""
+
+    filename = str(filename)
+
     if not config.unicode_filenames:
         filename = unidecode(filename)
         filename = re.sub(r"\[\(+", "[", filename)
         filename = re.sub(r"\)+\]", "]", filename)
     filename = "".join(c for c in filename if unicodedata.category(c) not in ("Mn", "Cc"))
-    filename = filename.replace("/", " & ").replace(";", " & ")  # e.g. multi-episode filenames
+
+    if config.unicode_filenames:
+        # the title is kept as-is, so the characters Windows rejects are remapped to
+        # their fullwidth twins instead of being stripped out of the title
+        for char, replacement in {**FULLWIDTH_REPLACEMENTS, **config.filename_replacements}.items():
+            filename = filename.replace(char, replacement)
+    else:
+        filename = filename.replace("/", " & ").replace(";", " & ")  # e.g. multi-episode filenames
+
     if spacer == ".":
         filename = re.sub(r" - ", spacer, filename)  # title separators to spacer (avoids .-. pattern)
     filename = re.sub(r"[:; ]", spacer, filename)
-    filename = re.sub(r"[\\*!?¿,'\"" "<>|$#~]", "", filename)
+    if not config.unicode_filenames:
+        filename = re.sub(r"[\\*!?¿,'\"" "<>|$#~]", "", filename)
     filename = re.sub(rf"[{spacer}]{{2,}}", spacer, filename)  # remove extra neighbouring (spacer)s
     filename = filename.strip(" .")  # strip leading and trailing spaces and dots for OS path safety
 

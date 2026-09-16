@@ -158,6 +158,10 @@ class Config:
             self.validate_output_templates()
 
         self.unicode_filenames: bool = kwargs.get("unicode_filenames", False)
+        # extra character swaps applied when unicode_filenames is on, e.g. {"~": "～"}
+        self.filename_replacements: dict[str, str] = {
+            str(k): str(v) for k, v in (kwargs.get("filename_replacements") or {}).items()
+        }
 
         self.title_cache_time: int = kwargs.get("title_cache_time", 1800)  # 30 minutes default
         self.title_cache_max_retention: int = kwargs.get("title_cache_max_retention", 86400)  # 24 hours default
