@@ -34,13 +34,19 @@ class SessionEntry:
     service_instance: Any
     titles: Any = None  # Titles_T from get_titles()
     title_map: Dict[str, Any] = field(default_factory=dict)
+    current_title_id: Optional[str] = None  # title the client last asked tracks for
     tracks: Dict[str, Track] = field(default_factory=dict)
+    served_keys: Dict[str, tuple[str, str]] = field(
+        default_factory=dict
+    )  # KID -> (KEY, serving vault name or "cdm") from server_cdm
     tracks_by_title: Dict[str, Dict[str, Track]] = field(default_factory=dict)
     chapters_by_title: Dict[str, List[Any]] = field(default_factory=dict)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     creator_ip: Optional[str] = None
     owner_key: Optional[str] = None  # X-Secret-Key that owns this session
     cache_tag: Optional[str] = None
     server_account: Optional[str] = None  # profile name when the server lent its own account
+    client_auth: bool = False  # the client sent its own cookies or credentials
     input_bridge: Optional[InputBridge] = None
     log_buffer: Optional[Any] = None  # SessionLogBuffer mirroring the service's self.log
     auth_status: AuthStatus = AuthStatus.AUTHENTICATED
@@ -59,13 +65,17 @@ class SessionEntry:
         from unshackle.core.api.stats import mask_key
 
         now = datetime.now(timezone.utc)
+        title_id = (
+            self.current_title_id if self.current_title_id in self.title_map else next(iter(self.title_map), None)
+        )
+        title = self.title_map.get(title_id) if title_id else None
         return {
             "id": self.session_id,
             "owner": mask_key(self.owner_key),
             "creator_ip": self.creator_ip,
             "service": self.service_tag,
-            "title_id": next(iter(self.title_map), None),
-            "title": str(next(iter(self.title_map.values()), "")) or None,
+            "title_id": title_id,
+            "title": str(title) if title else None,
             "titles": len(self.title_map),
             "tracks": len(self.tracks),
             "auth_status": self.auth_status.value,
@@ -128,7 +138,11 @@ class SessionStore:
             if max_sessions is not None and len(self._sessions) >= max_sessions:
                 oldest_id = min(self._sessions, key=lambda k: self._sessions[k].last_accessed)
                 log.warning(f"Max sessions reached ({max_sessions}), evicting oldest: {oldest_id}")
-                _publish("delete", self._sessions.pop(oldest_id), "evicted")
+                evicted = self._sessions.pop(oldest_id)
+                if evicted.input_bridge:
+                    evicted.input_bridge.cancel()
+                self.cleanup_cache_dir(evicted.cache_tag)
+                _publish("delete", evicted, "evicted")
 
             session_id = session_id or str(uuid.uuid4())
             entry = SessionEntry(
@@ -162,10 +176,10 @@ class SessionStore:
             return entry
 
     def peek(self, session_id: str) -> Optional[SessionEntry]:
-        """A session entry without touching it, for read-only observers.
+        """A remote session entry without touching it, for read-only observers.
 
         ``get`` refreshes ``last_accessed`` and expires stale entries, so an observer polling
-        through it would keep an idle session alive and always report it as active.
+        through it would keep an idle remote session alive and always report it as active.
         """
         return self._sessions.get(session_id)
 

@@ -69,6 +69,28 @@ def test_ring_since_and_level() -> None:
     assert ring.seq == 5
     assert [r["msg"] for r in ring.since(3)] == ["m3", "m4"]
     assert [r["msg"] for r in ring.since(0, "warning")] == ["m3"]
+
+
+def test_ring_masks_host_paths_and_secrets_in_records() -> None:
+    """The ring feeds both /api/logs and the SSE stream, so it must mask on the way in."""
+    from pathlib import Path
+
+    import unshackle.core.utils.redact as redact_mod
+
+    root = str(Path(redact_mod.__file__).resolve().parents[3])
+    ring = RingLogHandler(maxlen=3)
+    ring.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("test.ring.redact")
+    logger.setLevel(logging.INFO)
+    logger.addHandler(ring)
+    logger.error(f'File "{root}/unshackle/services/HMAX/__init__.py" 404: https://api.x/y?token=abc')
+    logger.removeHandler(ring)
+
+    msg = ring.records[-1]["msg"]
+    assert root not in msg
+    assert "<unshackle>/unshackle/services/HMAX" in msg
+    assert "token=abc" not in msg
+    assert "https://api.x/y" in msg
     assert ring.since(0, logger="test") and not ring.since(0, logger="other")
 
 
@@ -327,6 +349,19 @@ async def test_health_vault_probe_tolerates_api_vault_rejecting_the_probe(aiohtt
     monkeypatch.setattr(config, "proxy_providers", {})
     checks = {c["id"]: c for c in await asyncio.to_thread(run_health_checks)}
     assert checks["vault:t"]["status"] == "ok", checks["vault:t"]
+
+
+def test_health_warns_without_a_sqlite_vault_to_store_flags(monkeypatch) -> None:
+    from unshackle.core.api.handlers import run_health_checks
+
+    monkeypatch.setattr(config, "proxy_providers", {})
+    monkeypatch.setattr(
+        config, "key_vaults", [{"type": "API", "name": "shared", "uri": "http://127.0.0.1:9", "token": "t"}]
+    )
+    assert {c["id"]: c for c in run_health_checks()}["bad_keys"]["status"] == "warn"
+
+    monkeypatch.setattr(config, "key_vaults", [])
+    assert {c["id"]: c for c in run_health_checks()}["bad_keys"]["status"] == "ok"
 
 
 def test_health_proxy_probe_reports_a_provider_that_fails_to_build(monkeypatch) -> None:

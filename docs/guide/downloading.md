@@ -698,6 +698,13 @@ that run writes no muxed output. A `failure` post-script still operates if the d
 unshackle dl --postscript "python /opt/upload.py {filepath} --service={service}" EXAMPLE 81234567
 ```
 
+`--no-postscript` operates the run with no post-script at all. It silences the `post_scripts`
+config and `--postscript` together, for every event and mode.
+
+```shell title="Skip the uploader for one run"
+unshackle dl --no-postscript EXAMPLE 81234567
+```
+
 For post-scripts that continue across runs, for the `season` and `run` modes, for `failure`
 post-scripts and for the full variable list, see
 [Post-scripts](../reference/configuration/post-scripts.md).
@@ -722,20 +729,23 @@ unshackle dl --proxy nordvpn:ca EXAMPLE 81234567
 unshackle dl --proxy 'http://user:pass@host:8080' EXAMPLE 81234567
 ```
 
-Two related flags:
+Three related flags:
 
 - `--no-proxy`: force-disable all proxy use for this run.
 - `--no-proxy-download`: bypass the proxy for **all downloads**. The manifest,
   license, and authentication requests still go through the proxy. This is useful when you
   need the proxy only to satisfy geo-checks, not to move the bulk of the data.
+- `--proxy-download`: use a different proxy for **all downloads**. The manifest,
+  license, and authentication requests still go through `--proxy`. Takes the same forms
+  as `--proxy`.
 
 ## Performance and caching
 
 | Flag | Purpose |
 | --- | --- |
 | `--workers N` | Threads used per track for segment downloads. Default depends on the downloader. |
-| `--adaptive-workers` | Opt-in: start with a moderate per-track worker count and ramp it up or back off based on measured CDN throughput and errors, capped at `--workers`. Off by default (fixed worker count). |
-| `--download-processes N` | Opt-in: split a large segment batch across `N` download processes, each with its own worker pool. A single process tops out around 1.3 Gb/s (Python interpreter limit); `2` reaches 2.5GbE line rate on fast CDNs. Only engages for batches of 24+ segments. Ignored while `--speed-limit` (or serve's `global_speed_limit`) is set: the cap is one shared budget, which extra processes cannot share, so the download stays in a single process. Default `1`. |
+| `--adaptive-workers` | Opt-in: start the per-track worker count at `--workers`, reduce it when the CDN returns errors, then raise it again while the extra workers add measured throughput. The count never goes above `--workers`. Off by default (fixed worker count). |
+| `--download-processes N` | Opt-in: split a large segment batch across `N` download processes, each with its own worker pool. A single process tops out around 1.3 Gb/s (Python interpreter limit); `2` reaches 2.5GbE line rate on fast CDNs. Only engages for batches of 24+ segments. Ignored while `--speed-limit` (or serve's `global_speed_limit`) is set: the cap is one shared budget, which extra processes cannot share, so the download stays in a single process. Also ignored when the service HTTP session carries state a child process cannot rebuild, such as a custom TLS adapter. The download stays in a single process instead of running with the wrong settings. Default `1`. |
 | `--continue-downloads` | Opt-in: keep completed segment files when a download fails so the next run resumes instead of restarting from zero. One-off enable of the [`continue_downloads`](../reference/configuration/download.md#continue_downloads) config option, which documents what can and cannot resume. |
 | `--downloads N` | Number of tracks downloaded concurrently. Default `1`. |
 | `--slow [MIN-MAX]` | Add a delay between titles to look more like a real device. `--slow` alone means 60-120s; `--slow 20-40` sets a custom range. Minimum 20s. |
@@ -755,7 +765,7 @@ unshackle dl -w S01 --slow 30-60 EXAMPLE 81234567
 By default, unshackle checks your **key vaults** first and only asks a **CDM** to license
 a content key when the vault misses. You can force one side or the other:
 
-- `--cdm-only`: only use the CDM (skip vaults).
+- `--cdm-only`: only use the CDM (skip vaults). Over a `server_cdm` remote session the flag does not reach the server, whose vault shortcut still runs; it only skips the client's decode check on a server key.
 - `--cdm <name>`: use the named CDM device for this run, ignoring the `cdm` config mapping (including its quality and Widevine/PlayReady sub-entries).
 - `--vaults-only`: only use key vaults and never license through the CDM. A missing
   content key fails.
@@ -946,8 +956,8 @@ authoritative list.
 | `--best-available` | | Degrade gracefully instead of failing. |
 | `--output` | `-o` | Output directory for this run. |
 | `--split-audio` / `--merge-video` / `--no-mux` | | Muxing behaviour. |
-| `--postscript` | | Run a command after each output file. Repeatable. |
-| `--proxy` / `--no-proxy` / `--no-proxy-download` | | Proxy control. |
+| `--postscript` / `--no-postscript` | | Run a command after each output file, or run none. |
+| `--proxy` / `--no-proxy` / `--no-proxy-download` / `--proxy-download` | | Proxy control. |
 | `--workers` / `--downloads` / `--slow` | | Concurrency and pacing. |
 | `--list` / `--list-titles` / `--skip-dl` | | Dry runs. |
 | `--cdm-only` / `--vaults-only` | | Content key source control. |

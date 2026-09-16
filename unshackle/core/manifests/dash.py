@@ -23,10 +23,12 @@ from pywidevine.cdm import Cdm as WidevineCdm
 from pywidevine.pssh import PSSH
 from requests import Session
 
+from unshackle.core import binaries
 from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
 from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
 from unshackle.core.drm.segment_decrypt import SegmentDecrypter, can_use
+from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
 from unshackle.core.session import RnetSession
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
@@ -396,6 +398,7 @@ class DASH:
                 track=track,
                 track_url=track.url,
                 session=session,
+                probe_kid=period_idx == 0,
             )
 
             if period_idx == 0:
@@ -403,9 +406,6 @@ class DASH:
                 init_data = p_init
                 track_kid = p_kid
                 segment_timescale = p_timescale
-            else:
-                if p_kid and track_kid and p_kid != track_kid:
-                    log.debug(f"Period {content_period.get('id', period_idx)} has different KID: {p_kid}")
 
             for seg in p_segments:
                 if seg not in seen_segments:
@@ -422,7 +422,9 @@ class DASH:
         track.data["dash"]["timescale"] = int(segment_timescale)
         track.data["dash"]["segment_durations"] = segment_durations
 
-        if not track.drm and init_data and isinstance(track, (Video, Audio)):
+        if not track.drm and init_data and isinstance(track, (Video, Audio)) and not binaries.FFProbe:
+            log.warning("FFprobe was not found, so the init segment was not probed for a PSSH.")
+        elif not track.drm and init_data and isinstance(track, (Video, Audio)):
             prefers_playready = track.prefers_playready(cdm)
             if prefers_playready:
                 try:
@@ -648,8 +650,7 @@ class DASH:
 
         if drm:
             progress(downloaded="Decrypting", completed=0, total=None)
-            if not decrypter:
-                drm.decrypt(save_path)
+            decrypt_track(drm, save_path, license_widevine, decrypt=not decrypter)
             assert_fragments_decrypted(save_path)
             track.drm = None
             events.emit(events.Types.TRACK_DECRYPTED, track=track, drm=drm, segment=None)
@@ -755,6 +756,7 @@ class DASH:
         track: AnyTrack,
         track_url: str,
         session: Union[Session, RnetSession],
+        probe_kid: bool = True,
     ) -> tuple[
         Optional[bytes],
         list[tuple[str, Optional[str]]],
@@ -764,6 +766,12 @@ class DASH:
     ]:
         """
         Extract segments from a single period's representation.
+
+        Parameters:
+            probe_kid: Probe the initialization segment for the Key ID. Set it to False when
+                the caller needs neither the init data nor the Key ID of this period. False
+                drops the FFprobe call, and also the init request where the rest of the parse
+                does not need those bytes.
 
         Returns:
             A tuple of (init_data, segments, segment_timescale, segment_durations, track_kid).
@@ -816,7 +824,7 @@ class DASH:
                 segment_template.set(item, value)
 
             init_url = segment_template.get("initialization")
-            if init_url:
+            if init_url and probe_kid:
                 res = session.get(
                     DASH.replace_fields(
                         init_url, Bandwidth=representation.get("bandwidth"), RepresentationID=representation.get("id")
@@ -881,7 +889,7 @@ class DASH:
 
             init_data = None
             initialization = segment_list.find("Initialization")
-            if initialization is not None:
+            if initialization is not None and probe_kid:
                 source_url = initialization.get("sourceURL")
                 if not source_url:
                     source_url = rep_base_url
@@ -921,7 +929,8 @@ class DASH:
                 res = session.get(url=rep_base_url, headers=init_range_header)
                 res.raise_for_status()
                 init_data = res.content
-                track_kid = track.get_key_id(init_data)
+                if probe_kid:
+                    track_kid = track.get_key_id(init_data)
                 total_size = res.headers.get("Content-Range", "").split("/")[-1]
                 if total_size:
                     media_range = f"{len(init_data)}-{total_size}"
@@ -1108,7 +1117,11 @@ class DASH:
         """Whether the Adaptation Set is Descriptive."""
         return any(
             (x.get("schemeIdUri"), x.get("value"))
-            in (("urn:mpeg:dash:role:2011", "descriptive"), ("urn:tva:metadata:cs:AudioPurposeCS:2007", "1"))
+            in (
+                ("urn:mpeg:dash:role:2011", "description"),
+                ("urn:mpeg:dash:role:2011", "descriptive"),
+                ("urn:tva:metadata:cs:AudioPurposeCS:2007", "1"),
+            )
             for x in adaptation_set.findall("Accessibility")
         )
 

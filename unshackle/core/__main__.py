@@ -70,7 +70,7 @@ def main(version: bool, debug: bool) -> None:
                 ),
                 gradient_text(
                     f"v {__version__}{f' ({__code_hash__})' if __code_hash__ else ''}"
-                    f" - © 2025-{datetime.now().year} - github.com/unshackle-dl/unshackle",
+                    f" - © 2025-{datetime.now().year} github.com/unshackle-dl/unshackle",
                     style="bold",
                 ),
             ),

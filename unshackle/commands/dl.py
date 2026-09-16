@@ -51,7 +51,7 @@ from unshackle.core.console import GradientPulseBarColumn, SyncLive, console, li
 from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack, context_settings
 from unshackle.core.credential import Credential
 from unshackle.core.downloaders import default_max_workers, format_speed, parse_speed_limit, set_speed_limit
-from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine
+from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine, verify
 from unshackle.core.events import events
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.providers.tvdb import SEASON_TYPES, parse_int
@@ -102,10 +102,11 @@ from unshackle.core.utils.click_types import (
     SubtitleCodecChoice,
 )
 from unshackle.core.utils.collections import ci_get, merge_dict
-from unshackle.core.utils.post_scripts import build_context, dispatch, season_context
+from unshackle.core.utils.post_scripts import NO_POST_SCRIPTS, build_context, dispatch, season_context
 from unshackle.core.utils.redact import mask_proxy
 from unshackle.core.utils.selector import select_multiple
-from unshackle.core.utils.subprocess import ffprobe
+from unshackle.core.utils.subprocess import ffmpeg_decodes, ffprobe
+from unshackle.core.vault import Vault
 from unshackle.core.vaults import Vaults
 
 
@@ -1212,6 +1213,12 @@ class dl:
         default=False,
         help="Bypass proxy for all downloads. Manifest, license, and auth still use proxy.",
     )
+    @click.option(
+        "--proxy-download",
+        type=str,
+        default=None,
+        help="Proxy for the downloads only, in the same form as --proxy. Manifest, license, and auth use --proxy.",
+    )
     @click.option("--folder", "-F", is_flag=True, default=False, help="Enable folder creation for TV Shows.")
     @click.option(
         "--no-source", is_flag=True, default=False, help="Disable the source tag from the output file name and path."
@@ -1227,6 +1234,12 @@ class dl:
             "Run COMMAND after each downloaded file, with {filepath}, {title}, {season} and other "
             "variables substituted. Repeatable. Replaces the post_scripts config for this run."
         ),
+    )
+    @click.option(
+        "--no-postscript",
+        is_flag=True,
+        default=False,
+        help="Do not run any post-script for this run, configured or --postscript.",
     )
     @click.option(
         "--workers",
@@ -1587,6 +1600,7 @@ class dl:
 
         if cdm_only:
             self.vaults = Vaults(self.vault_service)
+            verify.DECRYPT_HOOK = self.decrypt_verified
             self.log.info("CDM-only mode: Skipping vault loading")
             log_event(
                 "vault_loading_skipped",
@@ -1597,6 +1611,7 @@ class dl:
         else:
             with console.status("Loading Key Vaults...", spinner="dots"):
                 self.vaults = Vaults(self.vault_service)
+                verify.DECRYPT_HOOK = self.decrypt_verified
                 total_vaults = len(config.key_vaults)
                 failed_vaults = []
 
@@ -1899,6 +1914,7 @@ class dl:
         cdm_only: Optional[bool],
         no_proxy: bool,
         no_proxy_download: bool,
+        proxy_download: Optional[str],
         folder: bool,
         no_source: bool,
         no_mux: bool,
@@ -1917,9 +1933,12 @@ class dl:
         real_audio_bitrate: bool = False,
         progress_sink: Optional[Callable[[dict[str, Any]], None]] = None,
         postscript: Sequence[str] = (),
+        no_postscript: bool = False,
         *_: Any,
         **__: Any,
     ) -> None:
+        if no_postscript:
+            postscript = NO_POST_SCRIPTS
         if continue_downloads:
             config.continue_downloads = True
         self.tmdb_searched = False
@@ -1999,6 +2018,16 @@ class dl:
         set_speed_limit(speed_limit_bps)
         if speed_limit_bps:
             self.log.info(f"Speed limit: {format_speed(speed_limit_bps)}")
+
+        if no_proxy or no_proxy_download:
+            proxy_download = None
+        elif proxy_download and re.match(r"^(?:[a-z]+:){0,2}[a-z]{2}(?:[-:][a-z0-9]+)*(?:\d+)?$", proxy_download, re.I):
+            # same shapes --proxy resolves against providers (two prefixes for gluetun:nordvpn:ca); else an explicit URI
+            try:
+                proxy_download = resolve_proxy(proxy_download.lower(), self.proxy_providers)
+            except ValueError as e:
+                self.log.error(f"--proxy-download: {e}")
+                sys.exit(1)
 
         if export:
             config.directories.exports.mkdir(parents=True, exist_ok=True)
@@ -2674,6 +2703,8 @@ class dl:
 
             if no_proxy_download and any(service.session.proxies.values()):
                 console.log("Bypassing proxy for downloads as --no-proxy-download was used...")
+            elif proxy_download:
+                console.log(f"Using a separate proxy for downloads: {mask_proxy(proxy_download)}")
 
             for kind, required, available in (
                 (
@@ -3270,6 +3301,20 @@ class dl:
             download_table = Table.grid()
             download_table.add_row(selected_tracks)
 
+            def prepare_drm_for(track: AnyTrack) -> Callable:
+                return partial(
+                    partial(self.prepare_drm, table=download_table),
+                    track=track,
+                    title=title,
+                    certificate=partial(service.get_widevine_service_certificate, title=title, track=track),
+                    licence=partial(self.service_licence, service, title=title, track=track),
+                    clearkey_licence=partial(service.get_clearkey_license, title=title, track=track),
+                    cdm_only=cdm_only,
+                    vaults_only=vaults_only,
+                    export=export_path,
+                    service_session=service.session,
+                )
+
             if getattr(self._remote_service, "_server_cdm", False) and self.cdm is None:
                 cdm_type = getattr(self._remote_service, "_server_cdm_type", "widevine")
                 self.cdm = cdm_type_stub(cdm_type)
@@ -3300,6 +3345,9 @@ class dl:
 
             if hasattr(service, "resolve_server_keys"):
                 service.resolve_server_keys(title)
+                if not cdm_only:
+                    self.prefer_vault_keys(title)
+                self.cache_resolved_keys(title)
 
             dl_start_time = time.time()
 
@@ -3310,31 +3358,8 @@ class dl:
                         track.download(
                             session=track.session or service.session,
                             no_proxy_download=no_proxy_download,
-                            prepare_drm=partial(
-                                partial(self.prepare_drm, table=download_table),
-                                track=track,
-                                title=title,
-                                certificate=partial(
-                                    service.get_widevine_service_certificate,
-                                    title=title,
-                                    track=track,
-                                ),
-                                licence=partial(
-                                    self.service_licence,
-                                    service,
-                                    title=title,
-                                    track=track,
-                                ),
-                                clearkey_licence=partial(
-                                    service.get_clearkey_license,
-                                    title=title,
-                                    track=track,
-                                ),
-                                cdm_only=cdm_only,
-                                vaults_only=vaults_only,
-                                export=export_path,
-                                service_session=service.session,
-                            ),
+                            proxy_download=proxy_download,
+                            prepare_drm=prepare_drm_for(track),
                             cdm=self.cdm,
                             max_workers=workers,
                             adaptive_workers=adaptive_workers,
@@ -3370,6 +3395,7 @@ class dl:
                         attachment.download(
                             attachment.session or service.session,
                             no_proxy_download=no_proxy_download,
+                            proxy_download=proxy_download,
                         )
 
                     if (
@@ -3516,7 +3542,7 @@ class dl:
                         for track in drm_tracks:
                             drm = track.get_drm_for_cdm(self.cdm)
                             if drm and hasattr(drm, "decrypt"):
-                                drm.decrypt(track.path)
+                                self.decrypt_verified(drm, track.path, prepare_drm_for(track))
                                 if not isinstance(drm, MonaLisa):
                                     # MonaLisa decrypts per segment; its decrypt() here is a no-op
                                     assert_fragments_decrypted(track.path)
@@ -4381,6 +4407,114 @@ class dl:
 
             export.write_text(json.dumps(doc, indent=4, ensure_ascii=False), encoding="utf8")
 
+    def decrypt_verified(
+        self,
+        drm: DRM_T,
+        path: Path,
+        licence: Optional[Callable] = None,
+        track_kid: Optional[UUID] = None,
+        decrypt: bool = True,
+    ) -> None:
+        """Decrypt the file, and when a vault supplied a content key, prove the output decodes.
+
+        A poisoned vault returns the right KID with a wrong content key, and the decrypters
+        accept it without complaint. A content key from a vault is therefore trusted, and only
+        then copied to the other vaults, once FFmpeg can decode the result. Without FFmpeg
+        neither happens. On failure the pair is flagged in the local vaults and reported
+        to the vault that served it, the ciphertext is restored, and the licence runs again. Every vault skips a
+        flagged pair, so each pass burns at most one vault; when the vaults run out the CDM
+        answers, and a CDM key is not checked. A CDM that returns the flagged key clears the
+        flag and stores the content key again, because then the decode check was wrong.
+
+        With ``decrypt=False`` the downloader already decrypted the segments in place, so a
+        failure can only flag and raise; the next run skips the flagged pair.
+        """
+        keys = getattr(drm, "content_keys", None)
+        if keys is None:
+            if decrypt:
+                drm.decrypt(path)
+            return
+
+        def flagged_kids() -> list[UUID]:
+            """The KIDs on this track whose content key another track already proved wrong."""
+            return [kid for kid, key in keys.items() if (kid, key) in self.vaults.flagged]
+
+        def drop(kid: UUID) -> str:
+            key = keys.pop(kid)
+            if self.LICENSE_KEY_CACHE.get(kid) == key:
+                self.LICENSE_KEY_CACHE.pop(kid)
+            return key
+
+        known_bad = flagged_kids()
+        if known_bad and licence:
+            for kid in known_bad:
+                drop(kid)
+            licence(drm, track_kid=track_kid)
+
+        def vault_kids() -> dict[UUID, Vault]:
+            """The KIDs whose key on the track came from a vault, with that vault."""
+            found = {kid: self.vaults.sources.get(kid) for kid in keys}
+            return {kid: src[1] for kid, src in found.items() if src and src[0] == keys[kid]}
+
+        backup = path.with_name(path.name + ".enc")
+        backup.unlink(missing_ok=True)  # a killed run leaves one behind; its bytes may not match
+        if vault_kids() and decrypt and binaries.FFMPEG:
+            try:
+                os.link(path, backup)
+            except OSError as e:
+                self.log.debug(f"Cannot keep the ciphertext for a decrypt retry: {e!r}")
+
+        def passes_left(done: int) -> bool:
+            """One pass per source that can still answer: every loaded vault, the server's vaults as
+            one source that walks them itself over --remote, and one for the CDM."""
+            remote = 1 if getattr(getattr(self, "_remote_service", None), "_server_cdm", False) else 0
+            return done < len(self.vaults) + remote + 1
+
+        try:
+            done = 0
+            while passes_left(done):
+                done += 1
+                if decrypt:
+                    drm.decrypt(path)
+                kids = vault_kids()
+                stale = flagged_kids()
+                if not stale:
+                    if not kids or not binaries.FFMPEG or not path.exists():
+                        return
+                    if ffmpeg_decodes(path):
+                        self.flush_vault_writes(
+                            [
+                                partial(self.vaults.add_key, kid, keys[kid], excluding=vault)
+                                for kid, vault in kids.items()
+                            ]
+                        )
+                        return
+                bad = {kid: drop(kid) for kid in {*kids, *stale}}
+                for kid, key in bad.items():
+                    if kid not in kids:
+                        continue
+                    self.log.warning(f"{key} from {kids[kid].name} was bad, trying other vaults")
+                    self.vaults.flag_bad_key(kid, key)
+                    if report := getattr(kids[kid], "report_bad", None):
+                        report(kid, key)
+                if not backup.exists() or not licence:
+                    raise ValueError("The content key from the vault did not decrypt the track; run again")
+                path.unlink()
+                os.link(backup, path)
+                licence(drm, track_kid=track_kid)
+                for kid, key in bad.items():
+                    if keys.get(kid) != key:
+                        continue
+                    source = self.vaults.sources.get(kid)
+                    if source is None:
+                        self.vaults.unflag_bad_key(kid, key)
+                        self.flush_vault_writes([partial(self.vaults.add_key, kid, key)])
+                    elif kid in kids and source[1] is kids[kid]:
+                        raise ValueError(f"{key} from {kids[kid].name} was bad and no other source has the key")
+            raise ValueError("No vault or CDM produced a content key that decrypts the track")
+        finally:
+            backup.unlink(missing_ok=True)
+
     def flush_vault_writes(self, pending: list[Callable[[], Any]]) -> None:
         """Hand the queued vault writes to the background writer so the track does not wait on them."""
         for write in pending:
@@ -4401,6 +4535,54 @@ class dl:
         self.vault_cache_tally = None
         self.log.info(f"Cached {keys} Key{'' if keys == 1 else 's'} to {successful_caches}/{len(self.vaults)} Vaults")
 
+    def prefer_vault_keys(self, title: Title_T) -> None:
+        """Let the client vaults answer before a content key the server batch licence returned.
+
+        The client only learns the KIDs from the batch response, so the server has already
+        answered. A vault key still goes first, so ``decrypt_verified`` proves it and flags a
+        poisoned row; the server key waits as the next candidate. A server CDM key is trusted
+        like a local CDM key: it goes to the run cache and the vaults, and a retry after a
+        flagged vault key takes it before any vault. A server vault key is unproven, so it
+        waits in ``Vaults.candidates`` and gets the same check when its turn comes.
+        """
+        server_vault_keys = getattr(self._remote_service, "server_vault_keys", {})
+        for track in title.tracks:
+            for drm in getattr(track, "drm", None) or []:
+                for kid, server_key in list(getattr(drm, "content_keys", {}).items()):
+                    vault_key, vault = self.vaults.get_key(kid)
+                    if not vault_key or vault_key == server_key:
+                        continue
+                    drm.content_keys[kid] = vault_key
+                    if server_vault_keys.get(kid) == server_key:
+                        source = self._remote_service.server_vault
+                        self.vaults.candidates.setdefault(kid, []).append((server_key, source))
+                    elif kid not in self.LICENSE_KEY_CACHE:
+                        self.LICENSE_KEY_CACHE[kid] = server_key
+                        self.flush_vault_writes([partial(self.cache_keys_to_vaults, {kid: server_key})])
+                    self.log.debug(
+                        f"{vault.name} holds a different key for {kid.hex} than the server, testing it first"
+                    )
+
+    def cache_resolved_keys(self, title: Title_T) -> None:
+        """Cache the keys a batch licence or an import put on the tracks.
+
+        Both fill track.drm before any prepare_drm call, so this is the only point where those
+        keys can still reach the local vaults.
+        """
+        server_vault_keys = getattr(getattr(self, "_remote_service", None), "server_vault_keys", {})
+        keys = {
+            kid: key
+            for track in title.tracks
+            for drm in (getattr(track, "drm", None) or [])
+            for kid, key in getattr(drm, "content_keys", {}).items()
+            if kid not in self.LICENSE_KEY_CACHE
+            and server_vault_keys.get(kid) != key
+            and self.vaults.sources.get(kid, (None,))[0] != key
+        }
+        if keys:
+            self.LICENSE_KEY_CACHE.update(keys)
+            self.flush_vault_writes([partial(self.cache_keys_to_vaults, keys)])
+
     def cache_keys_to_vaults(self, content_keys: dict[UUID, str]) -> None:
         successful_caches = self.vaults.add_keys(content_keys)
         keys, caches = self.vault_cache_tally or (0, successful_caches)
@@ -4413,6 +4595,13 @@ class dl:
         Tracks that share KIDs still take turns, so the second one finds the content keys in
         LICENSE_KEY_CACHE and skips the challenge. Tracks with different KIDs send a challenge
         and query the key vaults at the same time.
+
+        Callers take the lock after get_drm_for_cdm(), which folds a track's sibling PlayReady
+        objects into the returned one, so the KID set is complete for that track's DRM list
+        before the lock is chosen. This holds because every manifest parser gives the tracks
+        that share a PlayReady object the same DRM list (ISM attaches one list to all tracks;
+        DASH and HLS build a list per track). Two tracks that share one object but list
+        different siblings would get different locks.
         """
         kids = getattr(drm, "kids", None) or []
         key = ",".join(sorted(getattr(k, "hex", str(k)) for k in kids)) or getattr(drm, "content_id", None)
@@ -4459,29 +4648,48 @@ class dl:
         server_cdm = getattr(svc_for_cdm, "_server_cdm", getattr(self, "server_cdm", False))
 
         if server_cdm:
-            if not cdm_only:
+            with self.drm_lock(drm):
+                pending_vault_writes: list[Callable[[], Any]] = []
                 vault_kids = list(getattr(drm, "kids", None) or [])
                 if track_kid and track_kid not in vault_kids:
                     vault_kids.append(track_kid)
                 for kid in vault_kids:
                     if kid in drm.content_keys:
                         continue
-                    content_key = self.LICENSE_KEY_CACHE.get(kid) or self.vaults.get_key(kid)[0]
+                    content_key = self.LICENSE_KEY_CACHE.get(kid)
+                    if not content_key and not cdm_only:
+                        content_key, vault_used = self.vaults.get_key(kid)
                     if content_key:
                         drm.content_keys[kid] = content_key
                         self.LICENSE_KEY_CACHE[kid] = content_key
 
-            def missing_track_key() -> bool:
-                return not drm.content_keys or bool(track_kid and track_kid not in drm.content_keys)
+                known_keys = set(drm.content_keys)
 
-            if missing_track_key():
-                try:
-                    licence(
-                        drm_system="playready" if drm.__class__.__name__ == "PlayReady" else "widevine",
-                        challenge=b"",
-                    )
-                except Exception as e:
-                    self.log.debug(f"Server CDM licence with an empty challenge failed: {e!r}")
+                def missing_track_key() -> bool:
+                    return not drm.content_keys or bool(track_kid and track_kid not in drm.content_keys)
+
+                if missing_track_key():
+                    try:
+                        licence(
+                            drm_system="playready" if drm.__class__.__name__ == "PlayReady" else "widevine",
+                            challenge=b"",
+                        )
+                    except Exception as e:
+                        self.log.debug(f"Server CDM licence with an empty challenge failed: {e!r}")
+
+                server_vault_keys = {} if cdm_only else getattr(svc_for_cdm, "server_vault_keys", {})
+                for kid, key in drm.content_keys.items():
+                    if server_vault_keys.get(kid) == key:
+                        self.vaults.sources[kid] = (key, svc_for_cdm.server_vault)
+                new_keys = {
+                    kid: key
+                    for kid, key in drm.content_keys.items()
+                    if kid not in known_keys and server_vault_keys.get(kid) != key
+                }
+                if new_keys:
+                    self.LICENSE_KEY_CACHE.update(new_keys)
+                    pending_vault_writes.append(partial(self.cache_keys_to_vaults, new_keys))
+                self.flush_vault_writes(pending_vault_writes)
 
             if not drm.content_keys:
                 self.log.warning("Server CDM did not resolve any keys for this track")
@@ -4643,9 +4851,6 @@ class dl:
                             label = f"[text2]{kid.hex}:{content_key}{is_track_kid} from {vault_used}"
                             if not any(f"{kid.hex}:{content_key}" in x.label for x in cek_tree.children):
                                 cek_tree.add(label)
-                            pending_vault_writes.append(
-                                partial(self.vaults.add_key, kid, content_key, excluding=vault_used)
-                            )
                             self.LICENSE_KEY_CACHE[kid] = content_key
 
                             if self.debug_logger:
@@ -4749,7 +4954,12 @@ class dl:
 
                     self.LICENSE_KEY_CACHE.update(drm.content_keys)
 
-                    pending_vault_writes.append(partial(self.cache_keys_to_vaults, dict(drm.content_keys)))
+                    pending_vault_writes.append(
+                        partial(
+                            self.cache_keys_to_vaults,
+                            {k: v for k, v in drm.content_keys.items() if k not in from_vaults},
+                        )
+                    )
 
                 if track_kid and track_kid not in drm.content_keys:
                     msg = f"No Content Key for KID {track_kid.hex} was returned in the License"
@@ -4840,9 +5050,6 @@ class dl:
                             label = f"[text2]{kid.hex}:{content_key}{is_track_kid} from {vault_used}"
                             if not any(f"{kid.hex}:{content_key}" in x.label for x in cek_tree.children):
                                 cek_tree.add(label)
-                            pending_vault_writes.append(
-                                partial(self.vaults.add_key, kid, content_key, excluding=vault_used)
-                            )
                             self.LICENSE_KEY_CACHE[kid] = content_key
 
                             if self.debug_logger:
@@ -4921,7 +5128,12 @@ class dl:
 
                     self.LICENSE_KEY_CACHE.update(drm.content_keys)
 
-                    pending_vault_writes.append(partial(self.cache_keys_to_vaults, dict(drm.content_keys)))
+                    pending_vault_writes.append(
+                        partial(
+                            self.cache_keys_to_vaults,
+                            {k: v for k, v in drm.content_keys.items() if k not in from_vaults},
+                        )
+                    )
 
                 if track_kid and track_kid not in drm.content_keys:
                     msg = f"No Content Key for KID {track_kid.hex} was returned in the License"
@@ -4991,9 +5203,6 @@ class dl:
                             label = f"[text2]{kid.hex}:{content_key}{is_track_kid} from {vault_used}"
                             if not any(f"{kid.hex}:{content_key}" in x.label for x in cek_tree.children):
                                 cek_tree.add(label)
-                            pending_vault_writes.append(
-                                partial(self.vaults.add_key, kid, content_key, excluding=vault_used)
-                            )
                             self.LICENSE_KEY_CACHE[kid] = content_key
                         elif vaults_only:
                             msg = f"No Vault has a Key for {kid.hex} and --vaults-only was used"
@@ -5060,7 +5269,12 @@ class dl:
 
                     self.LICENSE_KEY_CACHE.update(drm.content_keys)
 
-                    pending_vault_writes.append(partial(self.cache_keys_to_vaults, dict(drm.content_keys)))
+                    pending_vault_writes.append(
+                        partial(
+                            self.cache_keys_to_vaults,
+                            {k: v for k, v in drm.content_keys.items() if k not in from_vaults},
+                        )
+                    )
 
                 if track_kid and track_kid not in drm.content_keys:
                     msg = f"No Content Key for KID {track_kid.hex} was returned in the License"
@@ -5293,4 +5507,13 @@ class dl:
 
         from unshackle.core.cdm import load_cdm
 
-        return load_cdm(cdm_name, service_name=service, vaults=self.vaults)
+        if not isinstance(cdm_name, str):
+            return load_cdm(cdm_name, service_name=service, vaults=self.vaults)
+
+        cdm_cache: dict[tuple[str, Optional[str], str], Any] = getattr(self, "_cdm_cache", {})
+        self._cdm_cache = cdm_cache
+
+        cache_key = (service, profile, cdm_name)
+        if cache_key not in cdm_cache:
+            cdm_cache[cache_key] = load_cdm(cdm_name, service_name=service, vaults=self.vaults)
+        return cdm_cache[cache_key]

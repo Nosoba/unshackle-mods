@@ -33,6 +33,7 @@ from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
 from unshackle.core.drm import DRM_T, ClearKey, MonaLisa, PlayReady, Widevine
 from unshackle.core.drm.segment_decrypt import SegmentDecrypter, can_use
+from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
 from unshackle.core.session import RnetResponse, RnetSession
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
@@ -972,8 +973,7 @@ class HLS:
                             decrypted_init = segment_decrypter.finish()
                         map_data = (map_data[0], decrypted_init)
                     merge(to=merged_path, via=files, delete=True, include_map_data=True)
-                    if not segment_decrypter:
-                        drm.decrypt(merged_path)
+                    decrypt_track(drm, merged_path, license_widevine, decrypt=not segment_decrypter)
                     assert_fragments_decrypted(merged_path)
                     merged_path.rename(decrypted_path)
                 else:
@@ -1029,7 +1029,8 @@ class HLS:
                 if isinstance(track, Subtitle):
                     segment_file_ext = get_extension(segment.uri) or ""
                     segment_file_path = segment_save_dir / f"{str(i).zfill(name_len)}{segment_file_ext}"
-                    segment_data = try_ensure_utf8(segment_file_path.read_bytes())
+                    original_data = segment_file_path.read_bytes()
+                    segment_data = try_ensure_utf8(original_data)
                     if track.codec not in (Subtitle.Codec.fVTT, Subtitle.Codec.fTTML):
                         segment_data = (
                             segment_data.decode("utf8")
@@ -1037,7 +1038,8 @@ class HLS:
                             .replace("&rlm;", html.unescape("&rlm;"))
                             .encode("utf8")
                         )
-                    segment_file_path.write_bytes(segment_data)
+                    if segment_data != original_data:
+                        segment_file_path.write_bytes(segment_data)
 
                 if segment.discontinuity and i != 0:
                     if encryption_data:
@@ -1217,7 +1219,11 @@ class HLS:
         if binaries.FFMPEG:
             try:
                 demuxer_file = save_path.parent / f"ffmpeg_concat_demuxer_{save_path.stem}.txt"
-                demuxer_file.write_text("\n".join([f"file '{segment.absolute()}'" for segment in segments]))
+                demuxer_file.write_text(
+                    "\n".join([f"file '{segment.absolute()}'" for segment in segments]),
+                    encoding="utf-8",
+                    newline="",
+                )
 
                 concat_start = time.monotonic()
                 subprocess.run(

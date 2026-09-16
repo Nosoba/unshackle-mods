@@ -47,6 +47,7 @@ from unshackle.core.api.handlers import (
     server_account_regions,
     server_accounts_allowed,
     server_config_handler,
+    session_bad_key_handler,
     session_create_handler,
     session_delete_handler,
     session_info_handler,
@@ -61,6 +62,7 @@ from unshackle.core.api.handlers import (
 )
 from unshackle.core.services import Services
 from unshackle.core.update_checker import UpdateChecker
+from unshackle.core.utils.redact import redact_path
 
 
 @web.middleware
@@ -360,7 +362,8 @@ async def services(request: web.Request) -> web.Response:
 
             services_info.append(service_data)
 
-        return web.json_response({"services": services_info, "load_errors": list(services_module.LOAD_ERRORS)})
+        load_errors = [redact_path(re.sub(r" \([^()]*\)$", "", err)) for err in services_module.LOAD_ERRORS]
+        return web.json_response({"services": services_info, "load_errors": load_errors})
     except Exception as e:
         log.exception("Error listing services")
         debug_mode = request.app.get("debug_api", False)
@@ -807,6 +810,9 @@ async def download(request: web.Request) -> web.Response:
               no_proxy_download:
                 type: boolean
                 description: Bypass proxy for all downloads. Manifest, license, and auth still use proxy (default - false)
+              proxy_download:
+                type: string
+                description: Proxy for the downloads only, in the same form as proxy. Manifest, license, and auth use proxy (default - None)
               tag:
                 type: string
                 description: Set the group tag (default - None)
@@ -824,9 +830,9 @@ async def download(request: web.Request) -> web.Response:
               daily:
                 type: boolean
                 description: Treat the title as daily content and fill missing air dates from TVDB. Needs enrich (default - false)
-              no_folder:
+              folder:
                 type: boolean
-                description: Disable folder creation for TV shows (default - false)
+                description: Enable folder creation for TV shows (default - false)
               no_source:
                 type: boolean
                 description: Disable source tag from output file name (default - false)
@@ -869,7 +875,9 @@ async def download(request: web.Request) -> web.Response:
                 description: Renumber episodes to a TVDB season order (default - the tvdb_order config option)
               output_dir:
                 type: string
-                description: Override the output directory for this download (default - None)
+                description: >
+                  Output directory for this download, relative to the server's downloads
+                  directory. A path resolving outside it is rejected (default - None).
               no_cache:
                 type: boolean
                 description: Bypass title cache for this download (default - false)
@@ -1557,6 +1565,13 @@ async def session_create(request: web.Request) -> web.Response:
               proxy_region:
                 type: string
                 description: Two-letter country the client resolved its proxy for; picks a server account
+              client:
+                type: object
+                additionalProperties: true
+                description: |
+                  Freeform client identity, shown to dashboard viewers as sent. The CLI sends
+                  `version`, `code_hash`, `platform` and a redacted `argv`. Ignored above 4096
+                  bytes of JSON.
     responses:
       '200':
         description: Remote session created; authentication continues in the background
@@ -1808,7 +1823,11 @@ async def session_license(request: web.Request) -> web.Response:
                 description: DRM type (default widevine)
     responses:
       '200':
-        description: License response
+        description: >-
+          License response. In server_cdm mode `keys` maps KID to content key and `vault_keys`,
+          an array of KID hex strings that may be absent and may repeat a KID shared by several
+          tracks, lists the content keys a server vault supplied, which the client has to prove
+          before it trusts them.
       '404':
         description: Remote session or track not found
     """
@@ -1827,6 +1846,58 @@ async def session_license(request: web.Request) -> web.Response:
         return handle_api_exception(
             e, context={"operation": "session_license"}, debug_mode=request.app.get("debug_api", False)
         )
+
+
+@api_handler
+async def session_bad_key(request: web.Request) -> web.Response:
+    """
+    Flag a server-vault content key the client proved wrong.
+    ---
+    summary: Report a bad content key
+    description: >-
+      The client decrypted with a content key the server took from its vault and the output did
+      not decode. The server flags the pair in its local vaults and reports it to the vault that
+      served it, so the next licence for that KID reaches the CDM. The server accepts only a pair
+      it served to this remote session.
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - kid
+              - key
+            properties:
+              kid:
+                type: string
+                description: KID as hex
+              key:
+                type: string
+                description: Content key as hex
+    responses:
+      '200':
+        description: The pair is flagged
+      '400':
+        description: The remote session was not served that pair
+      '404':
+        description: Remote session not found
+    """
+    session_id = request.match_info["session_id"]
+    try:
+        data = await request.json()
+    except Exception as e:
+        return build_error_response(
+            APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}),
+            request.app.get("debug_api", False),
+        )
+    return await session_bad_key_handler(data, session_id, request)
 
 
 @api_handler
@@ -2068,6 +2139,107 @@ async def dashboard_sessions(request: web.Request) -> web.Response:
     responses:
       '200':
         description: Session list
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    description: 'Remote session id'
+                  owner:
+                    type: string
+                    description: 'Username, else the masked API key'
+                  creator_ip:
+                    type: string
+                    nullable: true
+                  service:
+                    type: string
+                    description: 'Service tag'
+                  title_id:
+                    type: string
+                    nullable: true
+                    description: 'The title the client last asked tracks for, else the first resolved title'
+                  title:
+                    type: string
+                    nullable: true
+                    description: 'Display name of that title'
+                  titles:
+                    type: integer
+                    description: 'How many titles the remote session resolved'
+                  tracks:
+                    type: integer
+                  auth_status:
+                    type: string
+                    enum: [authenticated, authenticating, pending_input, failed]
+                  auth_error:
+                    type: string
+                    nullable: true
+                  server_account:
+                    type: string
+                    nullable: true
+                    description: 'Server profile lent to the remote session'
+                  log_seq:
+                    type: integer
+                    description: 'Last sequence number in the remote session service log'
+                  client:
+                    type: object
+                    description: |
+                      What the client reported when it opened the remote session. The CLI sends `version`,
+                      `code_hash`, `platform` and `argv`. `argv` is the command line the user
+                      ran, redacted by the client: proxy and URL userinfo, secret query
+                      parameters and credential values become `***`, home and install paths
+                      shorten as in the logs, and the line is cut at 3000 characters. Empty
+                      for a client too old to report anything.
+                    properties:
+                      version:
+                        type: string
+                      code_hash:
+                        type: string
+                        nullable: true
+                        description: 'Commit the client runs, null when its source cannot be read'
+                      platform:
+                        type: string
+                      argv:
+                        type: string
+                        description: 'Redacted command line the user ran'
+                  actions:
+                    type: array
+                    description: 'Request log for the remote session, newest last, capped at 500'
+                    items:
+                      type: object
+                      properties:
+                        ts:
+                          type: number
+                        method:
+                          type: string
+                        action:
+                          type: string
+                        query:
+                          type: string
+                        status:
+                          type: integer
+                        ms:
+                          type: number
+                        bytes_in:
+                          type: integer
+                        bytes_out:
+                          type: integer
+                  created_at:
+                    type: string
+                  last_accessed:
+                    type: string
+                  created_ts:
+                    type: number
+                    description: 'Unix epoch, the same clock as log ts'
+                  last_accessed_ts:
+                    type: number
+                  age_seconds:
+                    type: integer
+                  idle_seconds:
+                    type: integer
       '401':
         description: Dashboard key missing or invalid
     """
@@ -2136,10 +2308,10 @@ async def dashboard_session_logs(request: web.Request) -> web.Response:
     description: >
       The service's own log output for a remote session, mirrored at INFO regardless of the
       server's log level. This is where the real reason for a failed authentication sits, in
-      full, while the session summary carries only a truncated `auth_error`.
-      Reading this does not refresh the session's idle timer and does not take records from
-      the client draining the same buffer through `/api/session/{session_id}/logs`.
-      Poll when the session summary's `log_seq` changes.
+      full, while the remote session summary carries only a truncated `auth_error`.
+      Reading this does not refresh the remote session's idle timer and does not take records
+      from the client draining the same buffer through `/api/session/{session_id}/logs`.
+      Poll when the remote session summary's `log_seq` changes.
     tags: [Dashboard]
     parameters:
       - name: session_id
@@ -2193,14 +2365,14 @@ async def dashboard_keys(request: web.Request) -> web.Response:
     ---
     summary: Dashboard API keys
     description: >
-      Every key in `serve.users`, plus `serve.api_secret` and the dashboard key when they are
-      configured, with the grants that decide what it may do and the counters for what it has
-      done. A key listed in more than one of those places still gets exactly one row.
-      `id` is a hash prefix, stable across restarts and carrying no key material, so two
-      unnamed keys never merge the way they do in the `requests_by_key` labels.
-      Every key the server counts has a row here, so a `requests_by_key` bucket other than
+      Every API key in `serve.users`, plus `serve.api_secret` and the dashboard API key when
+      they are configured, with the grants that decide what it may do and the counters for what
+      it has done. An API key listed in more than one of those places still gets exactly one row.
+      `id` is a hash prefix, stable across restarts and carrying no API key material, so two
+      unnamed API keys never merge the way they do in the `requests_by_key` labels.
+      Every API key the server counts has a row here, so a `requests_by_key` bucket other than
       `anonymous` always matches one.
-      `bytes_out` counts response bodies only: an SSE stream reports no content length and
+      `bytes_out` counts response bodies only: an SSE stream reports no `Content-Length` and
       contributes nothing.
     tags: [Dashboard]
     responses:
@@ -2229,9 +2401,9 @@ async def dashboard_keys(request: web.Request) -> web.Response:
                     items:
                       type: string
                     description: >
-                      Effective allowlist; null when nothing restricts the key, and an empty
-                      list when the key reaches no service route at all, as a dashboard key
-                      with no `serve.users` entry does
+                      Effective allowlist; null when nothing restricts the API key, and an
+                      empty list when the API key reaches no service route at all, as a
+                      dashboard API key with no `serve.users` entry does
                   server_cdm:
                     description: false, true, or the list of service tags it covers
                   server_accounts:
@@ -2329,10 +2501,10 @@ async def dashboard_health(request: web.Request) -> web.Response:
     ---
     summary: Dashboard health preflight
     description: >
-      Whether this instance could actually finish a download: the binaries on PATH, the CDM
-      device files, each configured key vault and the proxy providers.
+      Whether this instance could finish a download: the binaries on PATH, the CDM device
+      files, each configured key vault and the proxy providers.
       A panel, not a liveness probe. The result is cached for 30 seconds and every probe is
-      shallow, so reading it never spends a proxy session or a licence. A provider that only
+      shallow, so reading it never spends a proxy session or a licence. A dependency that only
       fails on first use is therefore not caught here.
     tags: [Dashboard]
     responses:
@@ -2436,6 +2608,7 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("POST", "/api/session/{session_id}/segments", session_segments, True),
     ("POST", "/api/session/{session_id}/segment_filter", session_segment_filter, True),
     ("POST", "/api/session/{session_id}/license", session_license, True),
+    ("POST", "/api/session/{session_id}/keys/bad", session_bad_key, True),
     ("GET", "/api/session/{session_id}/logs", session_logs, True),
     ("GET", "/api/session/{session_id}/prompt", session_prompt_get, True),
     ("POST", "/api/session/{session_id}/prompt", session_prompt_submit, True),

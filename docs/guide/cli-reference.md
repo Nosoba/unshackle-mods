@@ -141,7 +141,7 @@ Keep only certain track types, or skip certain track types.
 | Flag | Description |
 |---|---|
 | `--split-audio` | Write a separate output file per audio codec instead of merging. Defaults to config `muxing.merge_audio`. |
-| `--merge-video` | Mux all selected video tracks into one file. Defaults to config `muxing.merge_video`. |
+| `--merge-video` | Mux video tracks that share a height, range, and codec into one file, so only language varies inside a file. Defaults to config `muxing.merge_video`. |
 | `-o`, `--output` | Override the output directory for this run. |
 | `--no-folder` | Disable folder creation for TV shows. |
 | `--no-source` | Remove the source tag from the filename/path. |
@@ -149,6 +149,7 @@ Keep only certain track types, or skip certain track types.
 | `--tag` | Group tag override. |
 | `--repack` | Add a `REPACK` tag to the filename. |
 | `--postscript` | Run a command after each output file, with `{variable}` placeholders substituted. Repeatable. Replaces the `post_scripts` config for this run. See [Post-scripts](../reference/configuration/post-scripts.md). |
+| `--no-postscript` | Run no post-script for this run, neither the configured ones nor `--postscript`. |
 
 ### Metadata & tagging
 
@@ -197,6 +198,7 @@ order the service used, then renumbers the episodes into the order you asked for
 | `--proxy` | Proxy URI, a 2-letter country code resolved from configured providers, or `provider:region` (e.g. `nordvpn:ca`, `gluetun:us`, `protonvpn:de:berlin`). |
 | `--no-proxy` | Force-disable all proxy use. |
 | `--no-proxy-download` | Bypass the proxy for **all downloads** (manifest, licence, and auth stay proxied). |
+| `--proxy-download` | Use a different proxy for **all downloads**, in the same forms as `--proxy` (manifest, licence, and auth stay on `--proxy`). |
 | `--remote` | Use a remote unshackle server. |
 | `--server` | Name a remote server from the `remote_services` config. |
 
@@ -206,7 +208,7 @@ order the service used, then renumbers the episodes into the order you asked for
 |---|---|---|
 | `--workers` | downloader default | Per-track download threads. |
 | `--adaptive-workers` | off | Scale per-track segment workers dynamically (up to the `--workers` cap) based on measured CDN throughput and errors. |
-| `--download-processes` | `1` | Split large segment batches (24+) across this many download processes to exceed the single-process throughput cap on multi-gigabit connections. Ignored while a speed limit is set: the cap is one shared budget, which extra processes cannot share, so the download stays in a single process. |
+| `--download-processes` | `1` | Split large segment batches (24+) across this many download processes to exceed the single-process throughput cap on multi-gigabit connections. Ignored while a speed limit is set: the cap is one shared budget, which extra processes cannot share, so the download stays in a single process. Also ignored when the service HTTP session carries state a child process cannot rebuild, such as a custom TLS adapter. |
 | `--continue-downloads` | off | Keep completed segment files across runs and resume a previously failed download. One-off enable of the [`continue_downloads`](../reference/configuration/download.md#continue_downloads) config option. |
 | `--downloads` | `1` | Number of tracks downloaded concurrently. |
 | `--speed-limit` | unlimited | Cap total download speed across all threads and tracks, e.g. `500k`, `5M`, `1.5G` or plain bytes/sec. Values are bytes, not bits (`5M` = 5.0 MB/s). `off` disables a configured limit. |

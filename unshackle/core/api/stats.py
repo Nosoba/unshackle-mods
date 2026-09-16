@@ -14,6 +14,7 @@ from aiohttp import web
 from unshackle.core import __code_hash__, __version__
 from unshackle.core.api.events import bus
 from unshackle.core.config import config
+from unshackle.core.utils.redact import redact_secrets
 
 RATE_LIMIT_WINDOW = 3600.0
 
@@ -29,7 +30,7 @@ def _user_config(key: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def configured_key(key: Optional[str]) -> Optional[str]:
-    """*key* when the config knows it (a user key, the master secret or the dashboard key), else None.
+    """``key`` when the config knows it (a user API key, the master secret or the dashboard API key), else None.
 
     Open routes answer 200 to any header value, so attributing by the raw header would let an
     unauthenticated caller grow ``stats.keys`` without bound.
@@ -63,7 +64,7 @@ def key_id(key: Optional[str]) -> str:
 
 
 def key_tier(key: Optional[str]) -> Optional[str]:
-    """The tier name a key references, when it names one that exists."""
+    """The tier name an API key references, when it names one that exists."""
     user = _user_config(key)
     tier = user.get("tier") if user else None
     return str(tier) if tier else None
@@ -141,7 +142,7 @@ class ServerStats:
         return counter
 
     def check_rate_limit(self, key: str) -> Optional[int]:
-        """Seconds to wait when *key* is over its hourly limit, else None after counting the request.
+        """Seconds to wait when ``key`` is over its hourly limit, else None after counting the request.
 
         A fixed window, not a sliding one: cheap, and an operator cap does not need the precision.
         """
@@ -227,7 +228,7 @@ class RingLogHandler(logging.Handler):
             "ts": record.created,
             "level": record.levelname,
             "logger": record.name,
-            "msg": self.format(record),
+            "msg": redact_secrets(self.format(record)),
         }
         self.records.append(item)
         bus.publish("log", item)

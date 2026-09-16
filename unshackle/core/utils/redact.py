@@ -14,8 +14,11 @@ REDACTED = "***"
 # user:pass@ userinfo embedded in any URL (proxy URLs, remote server URLs)
 URL_USERINFO_RE = re.compile(r"(?<=://)[^/@]+@")
 
-# secret-bearing query parameters in URLs that end up in free text
-SENSITIVE_QUERY_PARAM_RE = re.compile(r"(?i)\b(password|passwd|pwd|token|api_key|apikey|secret|auth)=([^&#\s\"']+)")
+# secret-bearing query parameters in URLs that end up in free text; the affixes catch
+# access_token=, client_secret=, api-key= - "_" is a word character, so \b alone misses them
+SENSITIVE_QUERY_PARAM_RE = re.compile(
+    r"(?i)(?<![\w-])([\w-]*(?:password|passwd|pwd|token|api[_-]?key|secret)[\w-]*|auth)=([^&#\s\"']+)"
+)
 
 
 def redact_text(text: Optional[str], secrets: Iterable[str] = ()) -> Optional[str]:
@@ -159,3 +162,13 @@ def redact_url(text: Optional[str]) -> Optional[str]:
 def redact_all(text: Optional[str]) -> Optional[str]:
     """Full redaction for logged strings: secrets, then URLs, then local path prefixes."""
     return redact_path(redact_url(redact_text(text)))
+
+
+def redact_secrets(text: Optional[str]) -> Optional[str]:
+    """Redact text that goes back to the caller: secrets and local path prefixes only.
+
+    URLs stay readable. The caller supplied the URL that failed, or already holds it, so a
+    collapsed URL hides nothing from them. It only removes the useful part of a message like
+    ``404 Not Found: <url>``. Use ``redact_all`` for a debug log file that other people read.
+    """
+    return redact_path(redact_text(text))

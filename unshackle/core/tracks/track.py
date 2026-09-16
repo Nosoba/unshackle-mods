@@ -25,6 +25,7 @@ from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, DownloadCancelled
 from unshackle.core.downloaders import requests
 from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
+from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
 from unshackle.core.session import RnetSession
 from unshackle.core.tracks import resume
@@ -39,9 +40,13 @@ DRM_PREFERENCE_TYPES: dict[str, Union[type[Widevine], type[PlayReady]]] = {
 }
 
 
-def direct_session(session: Union[Session, "RnetSession"]) -> Session:
-    """requests.Session with copied headers/cookies and no proxy."""
+def direct_session(session: Union[Session, "RnetSession"], proxy: Optional[str] = None) -> Session:
+    """requests.Session with copied headers/cookies and no proxy, or only ``proxy`` when given."""
     new = Session()
+    if proxy:
+        # requests lets HTTP(S)_PROXY override session proxies, so the env must be ignored for a chosen proxy
+        new.trust_env = False
+        new.proxies = {"http": proxy, "https": proxy}
     headers = getattr(session, "headers", None)
     if headers is not None:
         try:
@@ -55,6 +60,17 @@ def direct_session(session: Union[Session, "RnetSession"]) -> Session:
             new.cookies.update(jar if jar is not None else cookies)
         except Exception:
             pass
+        # RnetCookieAdapter.jar holds only cookies that arrived as a CookieJar; the ones set by name or
+        # received from a server live in its domain map, so copy those across too
+        by_domain = getattr(cookies, "get_dict_by_domain", None)
+        if by_domain is not None:
+            try:
+                for domain, named in by_domain().items():
+                    for name, value in named.items():
+                        if name not in new.cookies:
+                            new.cookies.set(name, value, **({"domain": domain} if domain else {}))
+            except Exception:
+                pass
     new.mount(
         "https://",
         HTTPAdapter(
@@ -601,6 +617,7 @@ class Track:
         *,
         cdm: Optional[object] = None,
         no_proxy_download: bool = False,
+        proxy_download: Optional[str] = None,
         adaptive_workers: bool = False,
         download_processes: int = 1,
     ):
@@ -623,9 +640,13 @@ class Track:
         proxy = next(iter(session.proxies.values()), None)
 
         dl_session = session
-        if no_proxy_download and proxy:
-            dl_session = direct_session(session)
-            proxy = None
+        if no_proxy_download:
+            if proxy:
+                dl_session = direct_session(session)
+                proxy = None
+        elif proxy_download:
+            dl_session = direct_session(session, proxy_download)
+            proxy = proxy_download
 
         track_type = self.__class__.__name__
         save_path = config.directories.temp / f"{track_type}_{self.id}.mp4"
@@ -756,7 +777,7 @@ class Track:
 
                         if drm:
                             progress(downloaded="Decrypting", completed=0, total=None)
-                            drm.decrypt(save_path)
+                            decrypt_track(drm, save_path, prepare_drm, track_kid)
                             assert_fragments_decrypted(save_path)
                             self.drm = None
                             events.emit(events.Types.TRACK_DECRYPTED, track=self, drm=drm, segment=None)
@@ -918,9 +939,10 @@ class Track:
                 if isinstance(drm, Widevine):
                     return drm
         elif is_playready_cdm(cdm):
-            for drm in self.drm:
-                if isinstance(drm, PlayReady):
-                    return drm
+            playready = [drm for drm in self.drm if isinstance(drm, PlayReady)]
+            if playready:
+                playready[0].absorb(*playready[1:])
+                return playready[0]
 
         return self.drm[0]
 

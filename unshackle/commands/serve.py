@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import logging
+import re
 import subprocess
 import sys
 from contextlib import suppress
@@ -30,6 +31,15 @@ from unshackle.core.constants import context_settings
 from unshackle.core.downloaders import format_speed, parse_speed_limit, set_speed_limit
 
 
+class _MaskAccessKey(logging.Filter):
+    """Mask the ``secret_key`` query parameter the SSE routes accept before the access line is stored."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str) and "secret_key=" in record.msg:
+            record.msg = re.sub(r"secret_key=[^&\s]*", "secret_key=***", record.msg)
+        return True
+
+
 def _install_service_refresh(app: web.Application) -> None:
     """Report service load issues, then periodically pull the service repos and hot-reload changed services."""
     from unshackle.core import services
@@ -42,22 +52,21 @@ def _install_service_refresh(app: web.Application) -> None:
         return
 
     async def loop() -> None:
-        from unshackle.core.api.download_manager import get_download_manager
+        from unshackle.core.api.download_manager import busy_services
 
-        manager = get_download_manager()
         while True:
             await asyncio.sleep(interval)
             try:
-                applied = await asyncio.to_thread(services.apply_pending, manager.busy_services())
+                applied = await asyncio.to_thread(services.apply_pending, busy_services())
                 if applied:
                     log.info(f"Services reloaded: {', '.join(applied)}")
                     publish_service_event("applied", applied)
-                repos = await asyncio.to_thread(services.refresh_and_reload, manager.busy_services())
+                repos = await asyncio.to_thread(services.refresh_and_reload, busy_services())
                 for r in repos:
                     if r["changes"]:
                         log.info(f"Services refreshed {r['spec']}: {', '.join(r['changes'])}")
                     if r["deferred"]:
-                        log.info(f"Services staged until their jobs finish: {', '.join(r['deferred'])}")
+                        log.info(f"Services staged until their jobs and sessions finish: {', '.join(r['deferred'])}")
                     for err in r["load_errors"]:
                         log.error(f"Service reload failed: {err}")
                 publish_refresh_events(repos)
@@ -191,6 +200,7 @@ def serve(
         logging.getLogger("api.remote").setLevel(logging.WARNING)
     ring.setFormatter(logging.Formatter("%(message)s"))
     logging.getLogger().addHandler(ring)
+    logging.getLogger("aiohttp.access").addFilter(_MaskAccessKey())
 
     if not no_key:
         api_secret = config.serve.get("api_secret")
@@ -256,6 +266,8 @@ def serve(
             regions = server_account_regions(tag) or {}
             covered = list(regions.get("regions") or []) + (["global"] if regions.get("global") else [])
             log.info(f"Server accounts for {tag}: {', '.join(covered)}")
+        if config.key_vaults and not any(v.get("type") == "SQLite" for v in config.key_vaults):
+            log.warning("No SQLite key vault configured: a content key a remote client proves wrong cannot be flagged")
         users = config.serve.get("users", {})
         if isinstance(users, dict):
             # yaml keys can parse as int; hmac.compare_digest and allowlist lookups need str
@@ -349,8 +361,8 @@ def serve(
             wvd_device_names = [d.stem if hasattr(d, "stem") else str(d) for d in wvd_devices]
             prd_device_names = [d.stem if hasattr(d, "stem") else str(d) for d in prd_devices]
 
-            if not serve_config.get("users") or not isinstance(serve_config["users"], dict):
-                serve_config["users"] = {}
+            users_cfg = serve_config.get("users")
+            serve_config["users"] = dict(users_cfg) if isinstance(users_cfg, dict) else {}
 
             if not no_key and api_secret not in serve_config["users"]:
                 serve_config["users"][api_secret] = {

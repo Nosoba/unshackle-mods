@@ -236,6 +236,17 @@ There are two ways DRM keys get resolved, chosen by the client's `server_cdm` fl
     - Enable with `server_cdm: true` in the server entry.
     - The server tells the client which DRM type it used
       (`widevine` or `playready`).
+    - A content key the server took from its own vault is unproven. The response
+      lists its KID in `vault_keys`, the client decrypts and checks that the output
+      decodes, and a wrong pair goes back to `POST /api/session/{id}/keys/bad`. The
+      server flags the pair in every local vault it holds, reports it to the vault
+      that served it, and the next licence for that KID skips the pair and reaches
+      the CDM. A server with no local SQLite vault cannot store the flag. The
+      server accepts a report only for a pair it served to that remote session. The
+      client never learns the server vault names.
+    - A content key in the client's own vaults goes first, even when the server
+      already answered. The client proves it, and a server key waits as the next
+      candidate.
 
 ---
 
@@ -313,6 +324,7 @@ The server mounts all these routes, even in `--remote-only` mode. Paths use the
 | `POST` | `/api/session/{id}/segments` | Resolve per-segment/track download descriptors |
 | `POST` | `/api/session/{id}/segment_filter` | Unwanted HLS segment URIs for one track (ads, bumpers) |
 | `POST` | `/api/session/{id}/license` | DRM licensing (proxy or server CDM) |
+| `POST` | `/api/session/{id}/keys/bad` | Report a server-vault content key that did not decrypt |
 | `GET` | `/api/session/{id}/logs` | Drain the service's server-side log output |
 | `GET` | `/api/session/{id}/prompt` | Poll interactive auth status / pending prompt |
 | `POST` | `/api/session/{id}/prompt` | Submit an answer to a pending prompt |
@@ -324,7 +336,8 @@ The server mounts all these routes, even in `--remote-only` mode. Paths use the
 `POST /api/session/create` requires `service` and `title_id`. It also accepts
 `credentials`, `cookies` (base64 of zlib-compressed Netscape cookie file), `proxy`,
 `no_proxy`, `profile`, `cache` (a map of `filename → base64(zlib(bytes))`),
-`client_region`, `cdm_type`, and the track-selection hints `range_`, `vcodec`,
+`client_region`, `cdm_type`, `client` (a freeform identity object the dashboard
+shows as sent), and the track-selection hints `range_`, `vcodec`,
 `quality`, `best_available`, plus arbitrary service CLI options
 (`additionalProperties: true`).
 
