@@ -33,6 +33,12 @@ Two command-line flags change this layout for a single run:
 | `--no-folder` | Skip the per-title subfolder; write the file directly into the output directory. |
 | `--no-source` | Omit the service source tag from both the filename and folder (the `{source}` variable resolves to empty). |
 
+!!! info "Which tag `{source}` uses"
+    `{source}` is the Service's **first `ALIASES` entry**, falling back to the class name when a
+    Service declares none. A class name has to match its directory, so it spells the brand out
+    (`NHKOne`, `TELASA`), while the first alias is the short scene tag you want in a file name
+    (`NHKO`, `TLSA`). To change the tag, reorder that Service's `ALIASES`.
+
 ## Output templates
 
 Filename templates live under the `output_template` config key, keyed by title kind. Each value is a format string built from `{variable}` placeholders.
@@ -104,7 +110,7 @@ Every variable below is valid in both output and folder templates. unshackle tak
 | `title` | Title name (movie/show/song name; `$` is rendered as `S`) | `The Show` |
 | `title_type` | Media kind of the title | `movie`, `series`, `music` |
 | `year` | Release year | `2024` |
-| `source` | Service tag / class name (empty with `--no-source`) | `EXAMPLE` |
+| `source` | Service tag: its first `ALIASES` entry, else the class name (empty with `--no-source`) | `EXAMPLE` |
 | `quality` | Resolution with scan suffix | `1080p`, `2160p`, `576i` |
 | `resolution` | Resolution number only | `1080` |
 | `video` | Video codec | `H.264`, `H.265` |

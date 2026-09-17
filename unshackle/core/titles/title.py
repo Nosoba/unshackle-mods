@@ -16,6 +16,20 @@ from unshackle.core.constants import (
 from unshackle.core.tracks import Tracks
 
 
+def source_tag(service: type) -> str:
+    """Return the scene-style tag a Service is known by in file names.
+
+    A Service's first alias is its short, conventional tag (`NHKO`, `TLSA`), while the class
+    name has to match its directory and so reads as the full brand (`NHKOne`, `TELASA`).
+    File names want the tag, falling back to the class name when a Service declares no alias.
+    """
+    aliases = getattr(service, "ALIASES", None) or ()
+    for alias in aliases:
+        if alias and str(alias).strip():
+            return str(alias).strip()
+    return service.__name__
+
+
 class Title:
     def __init__(
         self, id_: Any, service: type, language: Optional[Union[str, Language]] = None, data: Optional[Any] = None
@@ -85,7 +99,7 @@ class Title:
         unique_audio_languages = len(audio_lang_bases)
 
         context: dict[str, Any] = {
-            "source": self.service.__name__ if show_service else "",
+            "source": source_tag(self.service) if show_service else "",
             "tag": config.tag or "",
             "repack": "REPACK" if getattr(config, "repack", False) else "",
             "quality": "",
