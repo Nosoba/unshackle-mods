@@ -300,6 +300,7 @@ You configure muxing (the combination of video, audio, subtitle, chapter and att
 ```yaml title="unshackle.yaml"
 muxing:
   set_title: true
+  original_flag: true
   merge_video: false
   merge_audio: true
   default_language:
@@ -310,11 +311,17 @@ muxing:
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `set_title` | bool | `true` | Write the title name into the MKV container title with `--title`. Set to `false` to omit it. |
+| `original_flag` | bool | `true` | Tag original-language tracks with `--original-flag`. Set to `false` to leave it off every track. |
 | `merge_video` | bool | `false` | Group video tracks that share the same resolution, range, and codec into one file so only language varies inside it. |
 | `merge_audio` | bool | `true` | Merge audio tracks of the same kind so multiple languages sit in one file. |
 | `default_language` | map | *(unset)* | Preferred language per track type (`video` / `audio` / `subtitle`). A track in the preferred language is flagged as the default track. |
 
 When no track has the preferred language, unshackle applies sensible defaults. The video default falls back to the title language, then the original-language track, then the first track. The audio default is the original-language track. The subtitle default is a forced track in the first audio's language.
+
+!!! tip "Hiding `Service kind: original`"
+    MediaInfo renders `--original-flag` as a `Service kind: original` line on the original-language
+    tracks. Set `muxing.original_flag: false` to stop writing the flag. Track names are unaffected,
+    so the `[Original]` suffix in a track's name stays either way.
 
 !!! note "`default_language` only sets the default-track flag"
     `default_language` controls **which track carries the MKV `--default-track` flag**. Nothing else. It does not change track *selection* (that stays with `-l`/`--a-lang` and friends). It also does not touch which track carries the original flag: `--original-flag` still tags the *true* original-audio track. That is the point: you can make your player default to, say, Polish audio on an English-original title without altering the original marker. When the configured language is not present in the manifest, each track type falls back to its normal default rule described above.

@@ -38,6 +38,51 @@ from unshackle.core.utils.collections import as_list, flatten
 MP4BOX_PROGRESS = re.compile(r"\((\d{1,3})/100\)")
 MP4BOX_OPEN_FAILED = re.compile(r"error while opening|Error opening file|Invalid IsoMedia File", re.I)
 
+# The word "Original" written in each language, used to tag the original-language track with a
+# suffix a native speaker actually reads. langcodes has no such table, so it is spelled out here.
+MANUAL_TRANSLATIONS = {
+    "en": "Original",
+    "ja": "\u30aa\u30ea\u30b8\u30ca\u30eb",
+    "zh": "\u539f\u59cb\u7684",
+    "zh-cn": "\u539f\u59cb\u7684",
+    "zh-tw": "\u539f\u59cb\u7684",
+    "ar": "\u0623\u0635\u0644\u064a",
+    "ru": "\u041e\u0440\u0438\u0433\u0438\u043d\u0430\u043b",
+    "ko": "\uc624\ub9ac\uc9c0\ub110",
+    "id": "Original",
+    "ms": "Asal",
+    "tr": "Orijinal",
+    "th": "\u0e15\u0e49\u0e19\u0e09\u0e1a\u0e31\u0e1a",
+    "vi": "Nguy\u00ean b\u1ea3n",
+    "fr": "Original",
+    "de": "Original",
+    "es": "Original",
+    "pt": "Original",
+    "pt-br": "Original",
+    "it": "Originale",
+    "nl": "Origineel",
+    "pl": "Oryginalny",
+    "sv": "Original",
+    "no": "Original",
+    "da": "Original",
+    "fi": "Alkuper\u00e4inen",
+    "cs": "P\u016fvodn\u00ed",
+    "sk": "P\u00f4vodn\u00fd",
+    "hu": "Eredeti",
+    "ro": "Original",
+    "uk": "\u041e\u0440\u0438\u0433\u0456\u043d\u0430\u043b",
+    "el": "\u03a0\u03c1\u03c9\u03c4\u03cc\u03c4\u03c5\u03c0\u03bf",
+    "he": "\u05de\u05e7\u05d5\u05e8\u05d9",
+    "hi": "\u092e\u0942\u0932",
+    "bn": "\u09ae\u09c2\u09b2",
+    "ta": "\u0b85\u0b9a\u0bb2",
+    "te": "\u0c05\u0c38\u0c32\u0c41",
+    "ml": "\u0d05\u0d38\u0d7d",
+    "kn": "\u0cae\u0cc2\u0cb2",
+    "mr": "\u092e\u0942\u0933",
+    "ur": "\u0627\u0635\u0644",
+}
+
 
 class Tracks:
     """
@@ -498,6 +543,33 @@ class Tracks:
                     selected.append(track)
         return selected
 
+    @staticmethod
+    def _generate_auto_name(track: Union[Audio, Subtitle]) -> str:
+        """
+        Build the track name a player shows, e.g. `Nihongo [\u30aa\u30ea\u30b8\u30ca\u30eb]` or `English`.
+
+        The language is written in its own script (autonym) so the name reads naturally to whoever
+        speaks it, and the original-language track carries an `[Original]` suffix translated to the
+        same language.
+        """
+        try:
+            lang_obj = Language.get(track.language)
+            native_name = lang_obj.autonym() or lang_obj.display_name()
+        except Exception:
+            native_name = str(track.language)
+
+        native_name = (native_name or str(track.language)).title()
+
+        if not track.is_original_lang:
+            return native_name
+
+        lang_code = str(track.language).lower()
+        suffix_text = MANUAL_TRANSLATIONS.get(lang_code)
+        if not suffix_text and "-" in lang_code:
+            suffix_text = MANUAL_TRANSLATIONS.get(lang_code.split("-")[0])
+
+        return f"{native_name} [{suffix_text or 'Original'}]"
+
     def _mux_mp4(
         self,
         title: str,
@@ -559,6 +631,9 @@ class Tracks:
                 )
             elif candidate.exists():
                 candidate.unlink()
+
+            if not isinstance(track, Video):
+                track.name = self._generate_auto_name(track)
 
             cl.extend(["-add", f"{source}:lang={track.language}"])
             name = "" if isinstance(track, Video) else (track.get_track_name() or "")
@@ -735,6 +810,10 @@ class Tracks:
         if config.muxing.get("set_title", True):
             cl.extend(["--title", title])
 
+        # mkvmerge's original flag is what MediaInfo renders as "Service kind: original"; some
+        # players and library scanners show it as noise, so it can be turned off wholesale
+        original_flag = bool(config.muxing.get("original_flag", True))
+
         default_language = config.muxing.get("default_language") or {}
         # mux() runs after every track is downloaded, so a typo here must not discard the title
         preferred_video_lang = valid_language(default_language.get("video"))
@@ -782,7 +861,7 @@ class Tracks:
                 "--default-track",
                 f"0:{is_default}",
                 "--original-flag",
-                f"0:{vt.is_original_lang}",
+                f"0:{vt.is_original_lang and original_flag}",
                 "--compression",
                 "0:none",
             ]
@@ -824,6 +903,7 @@ class Tracks:
             if not at.path or not at.path.exists():
                 raise ValueError("Audio Track must be downloaded before muxing...")
             events.emit(events.Types.TRACK_MULTIPLEX, track=at)
+            at.name = self._generate_auto_name(at)
             if preferred_audio_idx is not None:
                 audio_default = i == preferred_audio_idx
             else:
@@ -839,7 +919,7 @@ class Tracks:
                     "--visual-impaired-flag",
                     f"0:{at.descriptive}",
                     "--original-flag",
-                    f"0:{at.is_original_lang}",
+                    f"0:{at.is_original_lang and original_flag}",
                     "--compression",
                     "0:none",
                     "(",
@@ -853,6 +933,7 @@ class Tracks:
                 if not st.path or not st.path.exists():
                     raise ValueError("Text Track must be downloaded before muxing...")
                 events.emit(events.Types.TRACK_MULTIPLEX, track=st)
+                st.name = self._generate_auto_name(st)
                 if preferred_subtitle_idx is not None:
                     default = i == preferred_subtitle_idx
                 else:
@@ -872,7 +953,7 @@ class Tracks:
                         "--hearing-impaired-flag",
                         f"0:{st.sdh}",
                         "--original-flag",
-                        f"0:{st.is_original_lang}",
+                        f"0:{st.is_original_lang and original_flag}",
                         "--compression",
                         "0:none",
                         "(",

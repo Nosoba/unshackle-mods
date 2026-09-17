@@ -236,6 +236,7 @@ Matroska (MKV) muxing options.
 | Sub-key | Type | Default | Description |
 |---------|------|---------|-------------|
 | `set_title` | bool | `true` | Write a human-readable title into the MKV container. |
+| `original_flag` | bool | `true` | Tag the original-language tracks with mkvmerge's `--original-flag`. MediaInfo shows this as `Service kind: original`. Set to `false` to leave the flag off every track. |
 | `default_language` | dict | `{}` | Force which language is flagged *default* per track type, e.g. `{audio: en, subtitle: en}`. |
 | `merge_audio` | bool | `true` | Merge all audio into one file. `--split-audio` on the CLI flips this off. |
 | `merge_video` | bool | `false` | Merge video tracks that share height, range, and codec into one file, so only language varies inside a file. `--merge-video` on the CLI flips this on. |
@@ -244,11 +245,20 @@ Matroska (MKV) muxing options.
 ```yaml
 muxing:
   set_title: true
+  original_flag: true
   concurrency: 4
   default_language:
     audio: en
     subtitle: en
 ```
+
+### Track names
+
+Every audio and subtitle track is named at mux time with its language written in its own script,
+so MediaInfo and players show `日本語` rather than a blank field. The track carrying the original
+language also gets an `[Original]` suffix translated into that same language, e.g.
+`日本語 [オリジナル]` or `Bahasa Indonesia [Original]`. Subtitle and descriptive-audio flags are
+appended after the name, e.g. `English (SDH)`.
 
 ## `language_tags`
 
