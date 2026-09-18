@@ -474,6 +474,8 @@ def perform_download(
         # Track-selection params read by Service.__init__ via ctx.parent.params
         "quality": params.get("quality", []),
         "vcodec": params.get("vcodec", []),
+        # acodec is not read by the base Service, but services like AMZN and DSNP read it here.
+        "acodec": params.get("acodec", []),
         "range_": params.get("range", [Video.Range.SDR]),
         "best_available": params.get("best_available", False),
     }
