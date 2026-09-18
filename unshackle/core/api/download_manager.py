@@ -580,6 +580,9 @@ def perform_download(
                 select_titles=False,
                 wanted=params.get("wanted", []),
                 latest_episode=params.get("latest_episode", False),
+                season_override=params.get("season_override"),
+                episode_override=params.get("episode_override"),
+                set_year=params.get("set_year"),
                 lang=params.get("lang", ["orig"]),
                 v_lang=params.get("v_lang", []),
                 a_lang=params.get("a_lang", []),
@@ -621,6 +624,10 @@ def perform_download(
                 downloads=params.get("downloads", 1),
                 worst=params.get("worst", False),
                 best_available=params.get("best_available", False),
+                # Never from params: dl_sub is handed to shutil.copy2, so honouring a
+                # client's value would copy any path on the server's disk into the
+                # output it downloads. CLI only.
+                dl_sub=None,
                 split_audio=params.get("split_audio"),
                 progress_sink=progress_callback,
             )
