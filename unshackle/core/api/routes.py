@@ -706,7 +706,7 @@ async def download(request: web.Request) -> web.Response:
                 type: array
                 items:
                   type: string
-                description: Language for video and audio (use 'orig' for original; a '-' prefix excludes, e.g. ["all", "-es"]) (default - ["orig"])
+                description: Language for video and audio (use 'orig' for original; a '-' prefix excludes, e.g. ["all", "-es"]) (default - ["best"])
               v_lang:
                 type: array
                 items:

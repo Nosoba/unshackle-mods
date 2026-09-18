@@ -583,7 +583,7 @@ def perform_download(
                 season_override=params.get("season_override"),
                 episode_override=params.get("episode_override"),
                 set_year=params.get("set_year"),
-                lang=params.get("lang", ["orig"]),
+                lang=params.get("lang", ["best"]),
                 v_lang=params.get("v_lang", []),
                 a_lang=params.get("a_lang", []),
                 s_lang=params.get("s_lang", ["all"]),

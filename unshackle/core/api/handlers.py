@@ -53,7 +53,11 @@ DEFAULT_DOWNLOAD_PARAMS = {
     "no_atmos": False,
     "wanted": [],
     "latest_episode": False,
-    "lang": ["orig"],
+    # Must match dl's own --lang default ("best"), not "orig". A title whose service
+    # reports no original language cannot resolve "orig": the request collapses to
+    # nothing and the job dies with "There's no orig Audio Track". "best" does not
+    # filter by language and takes what the title actually has.
+    "lang": ["best"],
     "v_lang": [],
     "a_lang": [],
     "s_lang": ["all"],
