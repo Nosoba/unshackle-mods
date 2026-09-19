@@ -396,7 +396,12 @@ class HLS:
     def probe_ts_info(
         variant_url: str, session: Optional[Union[Session, RnetSession]] = None
     ) -> Optional[tuple[int, int, Video.Codec]]:
-        """Probe the first TS segment of a variant playlist to extract resolution and codec."""
+        """Probe a variant playlist's first segment to extract resolution and codec.
+
+        Prefers the fMP4 init segment (EXT-X-MAP): its moov box states the resolution outright and
+        stays in the clear even when the media segments are CENC-encrypted. Falls back to sniffing
+        an SPS out of the first segment for plain TS variants.
+        """
         if not session:
             session = Session()
 
@@ -407,7 +412,22 @@ class HLS:
         if not variant.segments:
             return None
 
-        seg_uri = urljoin(variant_url, variant.segments[0].uri)
+        segment = variant.segments[0]
+
+        # fMP4: the init segment carries an unencrypted moov, so trust it over SPS sniffing.
+        init_section = getattr(segment, "init_section", None)
+        init_uri = getattr(init_section, "uri", None)
+        if init_uri:
+            try:
+                init_res = session.get(urljoin(variant_url, init_uri))
+                info = HLS.parse_mp4_init_info(init_res.content)
+                if info:
+                    return info
+            # best-effort: a missing or odd init segment just falls through to the TS path
+            except Exception as e:
+                logging.getLogger("HLS").debug(f"init segment probe failed for {init_uri}: {e!r}")
+
+        seg_uri = urljoin(variant_url, segment.uri)
 
         # Download only the first 8KB: SPS is always near the start of the first TS packet
         res = session.get(seg_uri, headers={"Range": "bytes=0-8191"})
@@ -415,9 +435,123 @@ class HLS:
 
         return HLS.parse_ts_video_info(data)
 
+    # Sample entry four-character codes to the codec they represent, for fMP4 init segments.
+    MP4_SAMPLE_ENTRY_CODECS: dict[bytes, Video.Codec] = {
+        b"avc1": Video.Codec.AVC,
+        b"avc3": Video.Codec.AVC,
+        b"hvc1": Video.Codec.HEVC,
+        b"hev1": Video.Codec.HEVC,
+        b"dvh1": Video.Codec.HEVC,
+        b"dvhe": Video.Codec.HEVC,
+        b"vp08": Video.Codec.VP8,
+        b"vp09": Video.Codec.VP9,
+        b"av01": Video.Codec.AV1,
+    }
+
+    @staticmethod
+    def parse_mp4_init_info(data: bytes) -> Optional[tuple[int, int, Video.Codec]]:
+        """Read resolution and codec from an fMP4 init segment's visual sample entry.
+
+        Walks moov > trak > mdia > minf > stbl > stsd and reads the width/height of the first
+        recognised video sample entry. Those fields are plain even for CENC content, where the
+        sample entry is wrapped in `encv` and the real codec is named by the sinf/frma box.
+        """
+        CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+
+        def walk(buf: bytes, start: int, end: int) -> Optional[tuple[int, int, Video.Codec]]:
+            pos = start
+            while pos + 8 <= end:
+                size = int.from_bytes(buf[pos : pos + 4], "big")
+                box_type = buf[pos + 4 : pos + 8]
+                header = 8
+                if size == 1:
+                    if pos + 16 > end:
+                        return None
+                    size = int.from_bytes(buf[pos + 8 : pos + 16], "big")
+                    header = 16
+                elif size == 0:
+                    size = end - pos
+                if size < header or pos + size > end:
+                    return None
+
+                body, body_end = pos + header, pos + size
+                if box_type in CONTAINERS:
+                    found = walk(buf, body, body_end)
+                    if found:
+                        return found
+                elif box_type == b"stsd":
+                    # stsd: 4 bytes version/flags, 4 bytes entry_count, then the sample entries.
+                    found = walk(buf, body + 8, body_end)
+                    if found:
+                        return found
+                elif box_type in HLS.MP4_SAMPLE_ENTRY_CODECS or box_type in (b"encv", b"resv"):
+                    # VisualSampleEntry: 6 reserved + 2 data_ref_idx + 16 pre-defined/reserved,
+                    # then 2-byte width and 2-byte height.
+                    if body + 32 > body_end:
+                        return None
+                    width = int.from_bytes(buf[body + 24 : body + 26], "big")
+                    height = int.from_bytes(buf[body + 26 : body + 28], "big")
+                    if not HLS.is_plausible_resolution(width, height):
+                        return None
+                    codec = HLS.MP4_SAMPLE_ENTRY_CODECS.get(box_type)
+                    if codec is None:
+                        # Protected or restricted entry: the original format is named by frma,
+                        # nested in sinf/rinf which starts after the 78-byte sample entry body.
+                        codec = HLS.find_original_format(buf, body + 78, body_end)
+                    if codec is None:
+                        return None
+                    return (width, height, codec)
+                pos += size
+            return None
+
+        try:
+            return walk(data, 0, len(data))
+        except (IndexError, ValueError):
+            return None
+
+    @staticmethod
+    def find_original_format(buf: bytes, start: int, end: int) -> Optional[Video.Codec]:
+        """Find the codec named by a frma box inside a protected sample entry's sinf/rinf."""
+        pos = start
+        while pos + 8 <= end:
+            size = int.from_bytes(buf[pos : pos + 4], "big")
+            box_type = buf[pos + 4 : pos + 8]
+            if size < 8 or pos + size > end:
+                return None
+            if box_type == b"frma":
+                return HLS.MP4_SAMPLE_ENTRY_CODECS.get(buf[pos + 8 : pos + 12])
+            if box_type in (b"sinf", b"rinf"):
+                found = HLS.find_original_format(buf, pos + 8, pos + size)
+                if found:
+                    return found
+            pos += size
+        return None
+
+    # A start code may appear by chance in encrypted or non-TS payloads, and the bytes that follow
+    # then decode as an SPS full of nonsense (e.g. 16x48). Such a bogus resolution is worse than no
+    # resolution at all: it outranks real tracks in Tracks.sort_videos, which sorts on height first.
+    # Anything outside these bounds is treated as a mis-parse so the scan keeps looking.
+    MIN_PLAUSIBLE_DIMENSION = 128
+    MAX_PLAUSIBLE_DIMENSION = 16384
+    MIN_PLAUSIBLE_ASPECT = 0.25
+    MAX_PLAUSIBLE_ASPECT = 4.0
+
+    @staticmethod
+    def is_plausible_resolution(width: int, height: int) -> bool:
+        """Check whether a parsed SPS resolution is believable for real video content."""
+        if not (HLS.MIN_PLAUSIBLE_DIMENSION <= width <= HLS.MAX_PLAUSIBLE_DIMENSION):
+            return False
+        if not (HLS.MIN_PLAUSIBLE_DIMENSION <= height <= HLS.MAX_PLAUSIBLE_DIMENSION):
+            return False
+        return HLS.MIN_PLAUSIBLE_ASPECT <= (width / height) <= HLS.MAX_PLAUSIBLE_ASPECT
+
     @staticmethod
     def parse_ts_video_info(data: bytes) -> Optional[tuple[int, int, Video.Codec]]:
-        """Parse H.264/H.265 NAL units from TS segment data to extract resolution and codec."""
+        """Parse H.264/H.265 NAL units from TS segment data to extract resolution and codec.
+
+        Returns None when no SPS yields a plausible resolution, leaving the track's width/height
+        unset rather than poisoning them with garbage.
+        """
 
         class _BitReader:
             def __init__(self, buf: bytes) -> None:
@@ -511,6 +645,8 @@ class HLS:
 
                     width = w_mbs * 16 - (cl + cr) * 2
                     height = (2 - frame_mbs_only) * h_map * 16 - (ct + cb) * 2
+                    if not HLS.is_plausible_resolution(width, height):
+                        continue
                     return (width, height, Video.Codec.AVC)
                 except (IndexError, ValueError):
                     continue
@@ -563,6 +699,8 @@ class HLS:
                         width -= (cl + cr) * sub_w
                         height -= (ct + cb) * sub_h
 
+                    if not HLS.is_plausible_resolution(width, height):
+                        continue
                     return (width, height, Video.Codec.HEVC)
                 except (IndexError, ValueError):
                     continue
