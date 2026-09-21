@@ -201,6 +201,10 @@ async def services(request: web.Request) -> web.Response:
                         type: array
                         items:
                           type: string
+                      geoblock:
+                        type: array
+                        items:
+                          type: string
                       title_regex:
                         oneOf:
                           - type: string
@@ -253,6 +257,7 @@ async def services(request: web.Request) -> web.Response:
                 "tag": tag,
                 "aliases": [],
                 "geofence": [],
+                "geoblock": [],
                 "title_regex": None,
                 "url": None,
                 "help": None,
@@ -270,6 +275,7 @@ async def services(request: web.Request) -> web.Response:
 
                 if hasattr(service_module, "GEOFENCE"):
                     service_data["geofence"] = list(service_module.GEOFENCE)
+                service_data["geoblock"] = list(getattr(service_module, "GEOBLOCK", ()) or ())
 
                 if hasattr(service_module, "TITLE_RE"):
                     title_re = service_module.TITLE_RE
@@ -669,14 +675,14 @@ async def download(request: web.Request) -> web.Response:
                   - type: array
                     items:
                       type: string
-                description: Video codec(s) to download (e.g., "H265" or ["H264", "H265"]) - accepts H264, H265, AVC, HEVC, VP8, VP9, AV1, VC1 (default - None)
+                description: Video codec(s) to download (e.g., "HEVC" or ["AVC", "HEVC"]) - accepts AVC, H.264, H264, HEVC, H.265, H265, VC1, VC-1, VP8, VP9, AV1 (default - None)
               acodec:
                 oneOf:
                   - type: string
                   - type: array
                     items:
                       type: string
-                description: Audio codec(s) to download (e.g., "AAC" or ["AAC", "EC3"]) - accepts AAC, AC3, EC3, AC4, OPUS, FLAC, ALAC, DTS, DTSX, DTS-X, OGG (default - None)
+                description: Audio codec(s) to download (e.g., "AAC" or ["AAC", "EC3"]) - accepts AAC, AC3, DD, EC3, DD+, EAC3, DDP, AC4, AC-4, OPUS, OGG, VORB, VORBIS, DTS, DTSX, DTS-X, ALAC, FLAC (default - None)
               vbitrate:
                 type: integer
                 description: Video bitrate in kbps (default - None)
@@ -750,7 +756,7 @@ async def download(request: web.Request) -> web.Response:
                 description: Use exact language matching (no variants) (default - false)
               sub_format:
                 type: string
-                description: Output subtitle format such as SRT or VTT (default - None)
+                description: Output subtitle format such as SRT or VTT, or "original" to keep the source format (default - None)
               video_only:
                 type: boolean
                 description: Only download video tracks (default - false)
@@ -1827,7 +1833,8 @@ async def session_license(request: web.Request) -> web.Response:
           License response. In server_cdm mode `keys` maps KID to content key and `vault_keys`,
           an array of KID hex strings that may be absent and may repeat a KID shared by several
           tracks, lists the content keys a server vault supplied, which the client has to prove
-          before it trusts them.
+          before it trusts them. `clear_tracks`, absent when empty, lists the requested track ids
+          that carry no DRM and so have no keys.
       '404':
         description: Remote session or track not found
     """
@@ -2485,6 +2492,10 @@ async def dashboard_services(request: web.Request) -> web.Response:
                     items:
                       type: string
                   geofence:
+                    type: array
+                    items:
+                      type: string
+                  geoblock:
                     type: array
                     items:
                       type: string
