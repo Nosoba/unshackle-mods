@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from unshackle.core.api.events import bus, publish_service_event
 from unshackle.core.api.sanitize import sanitize_log
-from unshackle.core.utils.click_types import VIDEO_CODEC_LIST
+from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, VIDEO_CODEC_LIST
 from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_path, redact_text
 
 log = logging.getLogger("download_manager")
@@ -392,6 +392,9 @@ def perform_download(
     else:
         params["vcodec"] = []
 
+    if params.get("acodec"):
+        params["acodec"] = AUDIO_CODEC_LIST.convert(params["acodec"])
+
     range_raw = params.get("range")
     if range_raw:
         if isinstance(range_raw, str):
@@ -473,9 +476,15 @@ def perform_download(
         "quality": params.get("quality", []),
         "vcodec": params.get("vcodec", []),
         # acodec is not read by the base Service, but services like AMZN and DSNP read it here.
-        "acodec": params.get("acodec", []),
+        "acodec": params.get("acodec") or [],
         "range_": params.get("range", [Video.Range.SDR]),
         "best_available": params.get("best_available", False),
+        # services read these here, not from dl.result(), to pick the manifests they fetch
+        # mods: --lang defaults to "best" (upstream uses "orig")
+        "lang": params.get("lang", ["best"]),
+        "v_lang": params.get("v_lang", []),
+        "a_lang": params.get("a_lang", []),
+        "forced_subs": params.get("forced_subs", False),
     }
     # Hand-built context: record parameter sources so service dl overrides
     # apply to defaults but never clobber client-sent values.
@@ -569,7 +578,7 @@ def perform_download(
                 service=service_instance,
                 quality=params.get("quality", []),
                 vcodec=params.get("vcodec", []),
-                acodec=params.get("acodec"),
+                acodec=ctx.params["acodec"],
                 vbitrate=params.get("vbitrate"),
                 abitrate=params.get("abitrate"),
                 vbitrate_range=params.get("vbitrate_range"),
@@ -590,7 +599,7 @@ def perform_download(
                 require_audio=params.get("require_audio", []),
                 require_video=params.get("require_video", []),
                 require_subs=params.get("require_subs", []),
-                forced_subs=params.get("forced_subs", False),
+                forced_subs=ctx.params["forced_subs"],
                 forced_s_lang=params.get("forced_s_lang", []),
                 exact_lang=params.get("exact_lang", False),
                 sub_format=params.get("sub_format"),
@@ -756,21 +765,7 @@ class DownloadQueueManager:
 
     def schedule_pending_reload(self) -> None:
         """Swap in staged service updates whose last job has finished, off the event loop."""
-        from unshackle.core import services
-
-        if not services.PENDING:
-            return
-
-        async def run() -> None:
-            try:
-                applied = await asyncio.to_thread(services.apply_pending, busy_services())
-                if applied:
-                    log.info(f"Services reloaded after job completion: {', '.join(applied)}")
-                    publish_service_event("applied", applied)
-            except Exception:
-                log.exception("Applying pending service reloads failed")
-
-        asyncio.get_running_loop().create_task(run())
+        schedule_pending_reload()
 
     @staticmethod
     def put(queue: asyncio.Queue, item: Optional[Dict[str, Any]]) -> None:
@@ -1219,3 +1214,41 @@ def busy_services() -> set[str]:
     if stats.mode != "remote_only":
         busy |= get_download_manager().busy_services()
     return busy
+
+
+_reload_task: Optional[asyncio.Task[None]] = None
+
+
+def schedule_pending_reload(tag: Optional[str] = None) -> None:
+    """Swap in staged service updates whose last job or remote session has ended, off the event loop.
+
+    Runs on every job completion and remote session removal, because a busy service on a popular
+    tag can otherwise stay staged across every periodic refresh tick. With ``tag``, the reload only
+    runs when ``PENDING`` holds that tag.
+    """
+    global _reload_task
+    from unshackle.core import services
+
+    if not services.PENDING or (tag is not None and tag not in services.PENDING):
+        return
+    # apply_pending computes its ready set before it takes RELOAD_LOCK, so concurrent
+    # session ends would each re-import the same tag; one in-flight task covers them all.
+    if _reload_task is not None and not _reload_task.done():
+        return
+
+    async def run() -> None:
+        try:
+            applied = await asyncio.to_thread(services.apply_pending, busy_services())
+            if applied:
+                log.info(f"Services reloaded after their jobs and sessions ended: {', '.join(applied)}")
+                publish_service_event("applied", applied)
+        except Exception:
+            log.exception("Applying pending service reloads failed")
+
+    _reload_task = asyncio.get_running_loop().create_task(run())
+
+    def clear(_: asyncio.Task[None]) -> None:
+        global _reload_task
+        _reload_task = None
+
+    _reload_task.add_done_callback(clear)

@@ -13,7 +13,7 @@ from contextlib import suppress
 from datetime import date as date_
 from http.cookiejar import CookieJar, MozillaCookieJar
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 
 import click
 from aiohttp import web
@@ -128,6 +128,8 @@ LIST_HANDLER_TRANSPORT_KEYS = {
     "no_proxy",
     "query",
     "service_params",
+    "cache",
+    "dl_params",
 }
 
 
@@ -290,12 +292,119 @@ def server_login_material(
     return load_client_cookies(data.get("cookies")), credential
 
 
+def api_key_namespace(request: Optional[web.Request]) -> str:
+    """Name of the caller's cache directories, derived from its API key so no caller can guess another's."""
+    import hashlib
+
+    api_key = request.headers.get("X-Secret-Key", "anonymous") if request else "anonymous"
+    return hashlib.pbkdf2_hmac("sha256", api_key.encode(), b"unshackle-session-ns", 100_000).hex()[:12]
+
+
+def write_client_cache(cache_data: Any, cache_tag: str) -> None:
+    """Write a client-sent ``cache`` map into the cache directory ``cache_tag``.
+
+    Each cache key is a file path relative to that directory, and each value is the file as
+    base64 of zlib-compressed bytes. The function skips an unsafe key or a file it cannot write,
+    and raises INVALID_INPUT for a map that is not an object, has too many entries, or holds a
+    value that is not a string.
+    """
+    if not isinstance(cache_data, dict) or len(cache_data) > MAX_SESSION_CACHE_KEYS:
+        raise APIError(APIErrorCode.INVALID_INPUT, f"cache must hold at most {MAX_SESSION_CACHE_KEYS} entries")
+    cache_dir = config.directories.cache / cache_tag
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for key, content in cache_data.items():
+        safe_name = safe_cache_key(key)
+        if not safe_name:
+            log.warning(f"Rejecting unsafe session cache key: {sanitize_log(key)}")
+            continue
+        if not isinstance(content, str):
+            raise APIError(APIErrorCode.INVALID_INPUT, "cache values must be base64 strings")
+        decompressed = safe_inflate(base64.b64decode(content)).decode("utf-8")
+        target = cache_dir / f"{safe_name}.json"
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(decompressed, encoding="utf-8")
+        except OSError as e:
+            log.warning(f"Skipping session cache key {sanitize_log(key)}: {e}")
+
+
+def collect_cache_files(cache_tag: str) -> Dict[str, str]:
+    """Read the cache directory ``cache_tag`` back as a ``cache`` map for the client.
+
+    The map has the same form that :func:`write_client_cache` reads. It leaves out the
+    ``titles_`` files, because they hold no login state.
+    """
+    cache_data: Dict[str, str] = {}
+    cache_dir = config.directories.cache / cache_tag
+    if cache_dir.is_dir():
+        for f in sorted(cache_dir.rglob("*.json")):
+            key = f.relative_to(cache_dir).as_posix()[: -len(".json")]
+            if f.stem.startswith("titles_") or not safe_cache_key(key):
+                continue
+            try:
+                cache_data[key] = base64.b64encode(zlib.compress(f.read_bytes())).decode("ascii")
+            except OSError:
+                pass
+    return cache_data
+
+
+class RequestCache:
+    """The service cache of one list or search request on a ``--remote-only`` server.
+
+    Such a server keeps nothing that a client sends, so the request runs on a cache directory
+    of its own that the handler removes when the request ends, on success and on error. Before
+    that, a client that logged in with its own cookies, credentials or cache gets the updated
+    files back, the same as when a remote session ends.
+    """
+
+    def __init__(self) -> None:
+        self.tag: Optional[str] = None
+        self.client_auth = False
+
+    def attach(
+        self,
+        service_instance: Any,
+        data: Dict[str, Any],
+        normalized_service: str,
+        request: Optional[web.Request],
+        client_login: bool,
+    ) -> None:
+        """Give the service a new cache directory, seeded from the client's ``cache``.
+
+        Does nothing on a full-mode server, where the operator's own cache stays in use.
+        """
+        import uuid
+
+        from unshackle.core.api.stats import stats
+
+        if stats.mode != "remote_only":
+            return
+        self.tag = f"_requests/{api_key_namespace(request)}/{uuid.uuid4()}/{normalized_service}"
+        service_instance.cache = Cacher(self.tag)
+        cache_data = data.get("cache")
+        if cache_data:
+            write_client_cache(cache_data, self.tag)
+        self.client_auth = client_login or bool(cache_data)
+
+    def json_response(self, payload: Dict[str, Any]) -> web.Response:
+        """Answer with ``payload``, plus the updated ``cache`` for a client that logged in itself."""
+        if self.tag and self.client_auth:
+            cache_data = collect_cache_files(self.tag)
+            if cache_data:
+                payload["cache"] = cache_data
+        return web.json_response(payload)
+
+    def cleanup(self) -> None:
+        SessionStore.cleanup_cache_dir(self.tag)
+
+
 def setup_list_service(
     data: Dict[str, Any],
     normalized_service: str,
     profile: Optional[str],
     title_id: str,
     request: Optional[web.Request] = None,
+    request_cache: Optional[RequestCache] = None,
 ) -> Any:
     """Assemble and authenticate a service instance for list_titles / list_tracks.
 
@@ -322,13 +431,16 @@ def setup_list_service(
         no_proxy,
         proxy_providers,
         service_config,
-        extra_params={"cookies_supplied": cookies is not None},
+        extra_params={"cookies_supplied": cookies is not None, **forwarded_dl_params(data)},
     )
     service_module = Services.load(normalized_service)
     service_instance = instantiate_service(parent_ctx, service_module, title_id, data, LIST_HANDLER_TRANSPORT_KEYS)
 
     if account:
         service_instance.cache = Cacher(f"_accounts/{normalized_service}/{account}")
+    elif request_cache is not None:
+        client_login = cookies is not None or credential is not None
+        request_cache.attach(service_instance, data, normalized_service, request, client_login)
     service_instance.authenticate(cookies, credential)
     return service_instance
 
@@ -338,6 +450,7 @@ def run_service_search(
     normalized_service: str,
     query: str,
     request: Optional[web.Request] = None,
+    request_cache: Optional[RequestCache] = None,
 ) -> List[Dict[str, Any]]:
     """Assemble and authenticate a service instance, then run its search.
 
@@ -385,6 +498,9 @@ def run_service_search(
 
     if account:
         service_instance.cache = Cacher(f"_accounts/{normalized_service}/{account}")
+    elif request_cache is not None:
+        client_login = cookies is not None or credential is not None
+        request_cache.attach(service_instance, data, normalized_service, request, client_login)
     service_instance.authenticate(cookies, credential)
 
     results: List[Dict[str, Any]] = []
@@ -1305,9 +1421,12 @@ async def search_handler(data: Dict[str, Any], request: Optional[web.Request] = 
             details={"service": service_tag},
         )
 
-    results = await asyncio.to_thread(run_service_search, data, normalized_service, query, request)
-
-    return web.json_response({"results": results, "count": len(results)})
+    request_cache = RequestCache()
+    try:
+        results = await asyncio.to_thread(run_service_search, data, normalized_service, query, request, request_cache)
+        return request_cache.json_response({"results": results, "count": len(results)})
+    finally:
+        request_cache.cleanup()
 
 
 async def list_titles_handler(data: Dict[str, Any], request: Optional[web.Request] = None) -> web.Response:
@@ -1325,9 +1444,10 @@ async def list_titles_handler(data: Dict[str, Any], request: Optional[web.Reques
             details={"service": service_tag},
         )
 
+    request_cache = RequestCache()
     try:
         service_instance = await asyncio.to_thread(
-            setup_list_service, data, normalized_service, profile, title_id, request
+            setup_list_service, data, normalized_service, profile, title_id, request, request_cache
         )
         titles = await asyncio.to_thread(service_instance.get_titles)
 
@@ -1336,7 +1456,7 @@ async def list_titles_handler(data: Dict[str, Any], request: Optional[web.Reques
         else:
             title_list = [stamp_service_flags(serialize_title(titles), service_instance)]
 
-        return web.json_response({"titles": title_list})
+        return request_cache.json_response({"titles": title_list})
 
     except APIError:
         raise
@@ -1348,6 +1468,8 @@ async def list_titles_handler(data: Dict[str, Any], request: Optional[web.Reques
             context={"operation": "list_titles", "service": normalized_service, "title_id": title_id},
             debug_mode=debug_mode,
         )
+    finally:
+        request_cache.cleanup()
 
 
 async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Request] = None) -> web.Response:
@@ -1365,9 +1487,10 @@ async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Reques
             details={"service": service_tag},
         )
 
+    request_cache = RequestCache()
     try:
         service_instance = await asyncio.to_thread(
-            setup_list_service, data, normalized_service, profile, title_id, request
+            setup_list_service, data, normalized_service, profile, title_id, request, request_cache
         )
         titles = await asyncio.to_thread(service_instance.get_titles)
 
@@ -1477,7 +1600,7 @@ async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Reques
                         response = {"episodes": episodes_data}
                         if failed_episodes:
                             response["unavailable_episodes"] = failed_episodes
-                        return web.json_response(response)
+                        return request_cache.json_response(response)
                     else:
                         raise APIError(
                             APIErrorCode.NO_CONTENT,
@@ -1508,7 +1631,7 @@ async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Reques
             "subtitles": [serialize_subtitle_track(t) for t in tracks.subtitles],
         }
 
-        return web.json_response(response)
+        return request_cache.json_response(response)
 
     except APIError:
         raise
@@ -1520,6 +1643,8 @@ async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Reques
             context={"operation": "list_tracks", "service": normalized_service, "title_id": title_id},
             debug_mode=debug_mode,
         )
+    finally:
+        request_cache.cleanup()
 
 
 VALID_VCODECS = [choice.upper() for choice in VIDEO_CODEC_LIST.choices]
@@ -2852,7 +2977,45 @@ SESSION_TRANSPORT_KEYS = {
     "vcodec",
     "quality",
     "best_available",
+    "dl_params",
 }
+
+
+def forwarded_dl_params(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the dl track selection that a remote-dl client sends under ``dl_params``.
+
+    Services read these values from ``ctx.parent.params`` to pick the manifests they
+    fetch. They travel in their own object so that they never collide with a service option that
+    has the same name. An absent or malformed value gets the dl default, so an old client that
+    sends no ``dl_params`` gets the same result as a ``dl`` run with no selection flags.
+    ``acodec`` holds codec names or aliases, which become ``Audio.Codec`` members the same way
+    ``dl -a`` converts them; an unknown name is dropped.
+    """
+    raw = data.get("dl_params")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def str_list(key: str) -> Optional[List[str]]:
+        value = raw.get(key)
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return list(value)
+        if value is not None:
+            log.warning(f"Ignoring dl_params.{key}: it must be an array of strings")
+        return None
+
+    params: Dict[str, Any] = {}
+    for key in ("lang", "v_lang", "a_lang"):
+        langs = str_list(key)
+        params[key] = langs if langs is not None else list(cast(List[str], DEFAULT_DOWNLOAD_PARAMS[key]))
+    # the dl CLI default is [], and some services test membership in it
+    params["acodec"] = []
+    for name in str_list("acodec") or []:
+        try:
+            params["acodec"].extend(AUDIO_CODEC_LIST.convert(name))
+        except click.BadParameter:
+            log.warning(f"Ignoring unknown dl_params.acodec value: {sanitize_log(name)}")
+    params["forced_subs"] = raw.get("forced_subs") is True
+    return params
 
 
 def create_service_instance(
@@ -2899,6 +3062,7 @@ def create_service_instance(
         "vcodec": vcodec_values,
         "quality": data.get("quality"),
         "best_available": data.get("best_available", False),
+        **forwarded_dl_params(data),
     }
 
     if server_account:
@@ -2916,6 +3080,9 @@ def create_service_instance(
         cookies = load_client_cookies(data.get("cookies"))
 
     extra_params["cookies_supplied"] = cookies is not None
+    # Services key their token caches on this. Only sessions get it: they run on a cache
+    # directory of their own, where the list and search handlers share the server's cache.
+    extra_params["profile"] = profile
 
     parent_ctx = build_parent_ctx(
         profile,
@@ -2962,15 +3129,11 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
     try:
         proxy_param, proxy_providers = await asyncio.to_thread(resolve_handler_proxy, data, normalized_service, request)
 
-        import hashlib
         import uuid as uuid_mod
-
-        from unshackle.core.config import config as app_config
 
         session_id = str(uuid_mod.uuid4())
         api_key = request.headers.get("X-Secret-Key", "anonymous") if request else "anonymous"
-        api_key_hash = hashlib.pbkdf2_hmac("sha256", api_key.encode(), b"unshackle-session-ns", 100_000).hex()[:12]
-        session_cache_dir = f"_sessions/{api_key_hash}/{session_id}/{normalized_service}"
+        session_cache_dir = f"_sessions/{api_key_namespace(request)}/{session_id}/{normalized_service}"
         session_cache_tag: Optional[str] = session_cache_dir
 
         server_account = server_account_for(request, normalized_service)
@@ -3011,26 +3174,7 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
 
         cache_data = data.get("cache", {})
         if cache_data and session_cache_tag:
-            if not isinstance(cache_data, dict) or len(cache_data) > MAX_SESSION_CACHE_KEYS:
-                raise APIError(APIErrorCode.INVALID_INPUT, f"cache must hold at most {MAX_SESSION_CACHE_KEYS} entries")
-            import base64
-
-            cache_dir = app_config.directories.cache / session_cache_tag
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            for key, content in cache_data.items():
-                safe_name = safe_cache_key(key)
-                if not safe_name:
-                    log.warning(f"Rejecting unsafe session cache key: {sanitize_log(key)}")
-                    continue
-                if not isinstance(content, str):
-                    raise APIError(APIErrorCode.INVALID_INPUT, "cache values must be base64 strings")
-                decompressed = safe_inflate(base64.b64decode(content)).decode("utf-8")
-                target = cache_dir / f"{safe_name}.json"
-                try:
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(decompressed, encoding="utf-8")
-                except OSError as e:
-                    log.warning(f"Skipping session cache key {sanitize_log(key)}: {e}")
+            write_client_cache(cache_data, session_cache_tag)
 
         bridge = InputBridge()
         service_instance._input_bridge = bridge
@@ -3402,18 +3546,38 @@ def resolve_server_cdm(service: str, profile: Optional[str], cdm_type: Optional[
     return None
 
 
-def detect_cdm_type_for_service(service: str, app_config: Any) -> Optional[str]:
-    """Detect the CDM type configured for a service in config.cdm."""
-    cdm_name = ci_get(app_config.cdm, service)
-    if not cdm_name:
-        return None
+def configured_cdm_name(service: str, drm_type: str, app_config: Any) -> Optional[str]:
+    """The device name config.cdm maps a service to for one DRM system; None when the tier decides.
+
+    A dict names a device per system (``widevine`` / ``playready`` keys) or a ``default``.
+    Any other dict shape, such as the quality tiers ``dl`` reads, falls through to the
+    global ``cdm.default``: the server has no track context to pick a tier with.
+    """
+    cdm_name = ci_get(app_config.cdm, service) if service else None
     if isinstance(cdm_name, dict):
         lower_keys = {k.lower(): v for k, v in cdm_name.items()}
-        if {"widevine", "playready"} & lower_keys.keys():
-            return "playready" if "playready" in lower_keys else "widevine"
-        cdm_name = cdm_name.get("default") or next(iter(cdm_name.values()), None)
+        drm_key = drm_type if drm_type in ("widevine", "playready") else None
+        cdm_name = lower_keys.get(drm_key) or lower_keys.get("default") or ci_get(app_config.cdm, "default")
     if cdm_name and isinstance(cdm_name, str):
-        return detect_cdm_type(cdm_name, app_config)
+        return cdm_name
+    return None
+
+
+def detect_cdm_type_for_service(service: str, app_config: Any) -> Optional[str]:
+    """The DRM system config.cdm settles for a service; None when the mapping leaves it open.
+
+    A mapping that names one system gets that system. A device name gets the type of the
+    device ``resolve_device_name`` returns for it, so the routes plan with the device they
+    load. A mapping that names a device for both systems settles nothing.
+    """
+    cdm_name = ci_get(app_config.cdm, service)
+    if isinstance(cdm_name, dict):
+        named = [system for system in ("widevine", "playready") if system in {k.lower() for k in cdm_name}]
+        if named:
+            return named[0] if len(named) == 1 else None
+    device_name = configured_cdm_name(service, "widevine", app_config)
+    if device_name:
+        return detect_cdm_type(device_name, app_config)
     return None
 
 
@@ -3796,12 +3960,8 @@ def resolve_device_name(user_config: dict, drm_type: str, service_tag: str = "")
     """
     from unshackle.core.config import config as app_config
 
-    cdm_name = ci_get(app_config.cdm, service_tag) if service_tag else None
-    if isinstance(cdm_name, dict):
-        drm_key = {"widevine": "widevine", "playready": "playready"}.get(drm_type)
-        lower_keys = {k.lower(): v for k, v in cdm_name.items()}
-        cdm_name = lower_keys.get(drm_key) or lower_keys.get("default") or ci_get(app_config.cdm, "default")
-    if cdm_name and isinstance(cdm_name, str):
+    cdm_name = configured_cdm_name(service_tag, drm_type, app_config)
+    if cdm_name:
         return cdm_name
 
     if drm_type == "playready":
@@ -3813,6 +3973,65 @@ def resolve_device_name(user_config: dict, drm_type: str, service_tag: str = "")
         if not device_name:
             raise APIError(APIErrorCode.INVALID_INPUT, "No Widevine device configured for this API key")
     return device_name
+
+
+def server_drm_candidates(
+    service_tag: str,
+    user_config: dict,
+    client_drm_type: str,
+    track: Any,
+    warn: Callable[[str], None] = log.warning,
+) -> List[str]:
+    """The DRM systems the server can license a track with, in the order to try them.
+
+    The server's config.cdm mapping goes first; with no mapping, the client's choice goes
+    first. A system stays only when the device the server would load for it is of that
+    system, so the route never plans a licence that fails on the wrong device type. The
+    track's own drm_preference moves its system to the front when the server has it.
+    """
+    from unshackle.core.config import config as app_config
+
+    server_type = detect_cdm_type_for_service(service_tag, app_config)
+    first = server_type or (client_drm_type if client_drm_type in ("widevine", "playready") else "widevine")
+    candidates: List[str] = []
+    for drm_type in (first, *(system for system in ("widevine", "playready") if system != first)):
+        try:
+            device_name = resolve_device_name(user_config, drm_type, service_tag)
+        except APIError:
+            continue
+        if detect_cdm_type(device_name, app_config) in (None, drm_type):
+            candidates.append(drm_type)
+
+    preferred = drm_preference_name(track)
+    if preferred:
+        if preferred in candidates:
+            candidates.remove(preferred)
+            candidates.insert(0, preferred)
+        else:
+            warn(
+                f"Track {sanitize_log(str(track.id)[:12])} wants {preferred} DRM "
+                "but the server has no device for it, using the configured DRM instead"
+            )
+    return candidates
+
+
+def pick_server_pssh(track: Any, candidates: List[str]) -> Optional[tuple[str, str]]:
+    """`(drm_type, pssh)` for the first candidate the track carries a header for; None when it has none.
+
+    A track with only a PlayReady header still licenses under the Widevine device: the
+    Widevine DRM class converts the PlayReady PSSH on construction.
+    """
+    for candidate in candidates:
+        pssh_str = extract_pssh_from_track(track, candidate)
+        if not pssh_str and candidate == "widevine":
+            pssh_str = extract_pssh_from_track(track, "playready")
+            if pssh_str:
+                log.info(
+                    f"Track {sanitize_log(str(track.id)[:12])} has only a PlayReady PSSH, licensing it with the Widevine device"
+                )
+        if pssh_str:
+            return candidate, pssh_str
+    return None
 
 
 def load_server_vaults(service_name: str) -> Any:
@@ -3864,17 +4083,30 @@ def check_vaults(kids: list, service_name: str) -> Optional[tuple[Dict[str, str]
     return None
 
 
+CACHED_PAIRS: set[tuple[str, str, str]] = set()
+
+
 def cache_to_vaults(keys: Dict[str, str], service_name: str) -> None:
-    """Cache newly obtained keys to server vaults."""
+    """Cache newly obtained keys to server vaults.
+
+    A PlayReady licence always runs, and a Widevine licence runs when one PSSH KID has no content
+    key in a vault, so the same content keys come back on every request for a title. This process
+    does not send a pair again after every vault accepted it.
+    """
     from uuid import UUID
 
     try:
+        new = {kid: key for kid, key in keys.items() if (service_name, kid, key) not in CACHED_PAIRS}
+        if not new:
+            return
         vaults = load_server_vaults(service_name)
         if not vaults.vaults:
             return
 
-        key_map = {UUID(hex=kid): key for kid, key in keys.items()}
+        key_map = {UUID(hex=kid): key for kid, key in new.items()}
         cached = vaults.add_keys(key_map)
+        if cached == len([vault for vault in vaults.vaults if not vault.no_push]):
+            CACHED_PAIRS.update((service_name, kid, key) for kid, key in new.items())
         if cached:
             log.info(f"Cached {len(key_map)} key(s) to {cached}/{len(vaults)} server vault(s)")
     except (Exception, SystemExit) as e:
@@ -4174,16 +4406,10 @@ async def session_license_handler(
         )
 
     if mode == "server_cdm" and track_ids:
-        from unshackle.core.config import config as app_config
-
         api_key = request.headers.get("X-Secret-Key", "anonymous") if request else "anonymous"
         user_config = serve_user_config(api_key)
         service = session.service_instance
-        has_wv_device = bool(user_config.get("devices"))
-        has_pr_device = bool(user_config.get("playready_devices"))
-
         service_tag = session.service_tag
-        config_cdm_type = detect_cdm_type_for_service(service_tag, app_config)
 
         all_keys: Dict[str, Dict[str, str]] = {}
         vault_keys: list[str] = []
@@ -4221,19 +4447,11 @@ async def session_license_handler(
             track: Any, title: Any, candidates: list
         ) -> tuple[Dict[str, str], Optional[str], Optional[str]]:
             """`(keys, drm_type, pssh)` for the track's current DRM, licensing once per unique PSSH."""
-            for candidate in candidates:
-                pssh_str = extract_pssh_from_track(track, candidate)
-                if not pssh_str and candidate == "widevine":
-                    pssh_str = extract_pssh_from_track(track, "playready")
-                    if pssh_str:
-                        log.info(
-                            f"Track {sanitize_log(str(track.id)[:12])} has only a PlayReady PSSH, licensing it with the Widevine device"
-                        )
-                if pssh_str:
-                    break
-            else:
+            picked = pick_server_pssh(track, candidates)
+            if not picked:
                 warn(f"No PSSH on track {sanitize_log(str(track.id)[:12])} for {', '.join(candidates) or 'any CDM'}")
                 return {}, None, None
+            candidate, pssh_str = picked
 
             cache_key = (pssh_str, pssh_set(track))
             if cache_key not in keys_by_pssh:
@@ -4266,28 +4484,7 @@ async def session_license_handler(
                 continue
 
             title = find_title_for_track(tid, session)
-
-            if config_cdm_type == "playready":
-                candidates = ["playready", "widevine"]
-            elif config_cdm_type == "widevine":
-                candidates = ["widevine", "playready"]
-            else:
-                candidates = [
-                    name
-                    for name, has_device in (("widevine", has_wv_device), ("playready", has_pr_device))
-                    if has_device
-                ]
-
-            preferred = drm_preference_name(track)
-            if preferred:
-                if preferred in candidates:
-                    candidates.remove(preferred)
-                    candidates.insert(0, preferred)
-                else:
-                    warn(
-                        f"Track {sanitize_log(tid[:12])} wants {preferred} DRM "
-                        "but the server has no device for it, using the configured DRM instead"
-                    )
+            candidates = server_drm_candidates(service_tag, user_config, drm_type, track, warn)
 
             keys, track_drm_type, pssh_str = license_track(track, title, candidates)
 
@@ -4349,18 +4546,43 @@ async def session_license_handler(
         service = session.service_instance
 
         pssh_b64 = data.get("pssh")
-        if pssh_b64:
+        if pssh_b64 or mode == "server_cdm":
             ensure_track_drm(track, getattr(service, "session", None))
+
+        if mode == "server_cdm":
+            # The server's config.cdm mapping decides the DRM system, as in the batch path.
+            # The client only knows its own local device, which the server never uses here.
+            api_key = request.headers.get("X-Secret-Key", "anonymous") if request else "anonymous"
+            candidates = server_drm_candidates(session.service_tag, serve_user_config(api_key), drm_type, track)
+            picked = pick_server_pssh(track, candidates)
+            if not picked:
+                raise APIError(
+                    APIErrorCode.INVALID_INPUT,
+                    f"No PSSH on track {sanitize_log(track_id[:12])} for {', '.join(candidates) or 'any CDM'}",
+                )
+            server_drm_type, server_pssh = picked
+            if pssh_b64 and server_drm_type != drm_type:
+                log.info(
+                    f"Client asked for {sanitize_log(drm_type)} on track {sanitize_log(track_id[:12])}, "
+                    f"licensing with the server's {server_drm_type} CDM"
+                )
+                pssh_b64 = None
+            if pssh_b64:
+                require_track_pssh(track, pssh_b64, drm_type)
+                if drm_type == "playready":
+                    track.pr_pssh = pssh_b64
+            key_sources: Dict[str, str] = {}
+            keys = handle_single_server_cdm(
+                service, title, track, pssh_b64 or server_pssh, server_drm_type, request, key_sources
+            )
+            log.info(f"Server CDM resolved {len(keys)} key(s) for track {sanitize_log(track_id[:12])}")
+            note_served_keys(session, keys, key_sources)
+            return web.json_response({"keys": keys, "vault_keys": list(key_sources), "drm_type": server_drm_type})
+
+        if pssh_b64:
             require_track_pssh(track, pssh_b64, drm_type)
             if drm_type == "playready":
                 track.pr_pssh = pssh_b64
-
-        if mode == "server_cdm":
-            key_sources: Dict[str, str] = {}
-            keys = handle_single_server_cdm(service, title, track, pssh_b64, drm_type, request, key_sources)
-            log.info(f"Server CDM resolved {len(keys)} key(s) for track {sanitize_log(track_id[:12])}")
-            note_served_keys(session, keys, key_sources)
-            return web.json_response({"keys": keys, "vault_keys": list(key_sources)})
 
         return handle_proxy_license(service, title, track, challenge_b64, drm_type)
 
@@ -4453,11 +4675,7 @@ async def session_info_handler(session_id: str, request: Optional[web.Request] =
 
 async def session_delete_handler(session_id: str, request: Optional[web.Request] = None) -> web.Response:
     """Delete a remote session, return updated cache files, and clean up server-side data."""
-    import base64
-    import zlib
-
     from unshackle.core.api.session_store import get_session_store
-    from unshackle.core.config import config as app_config
 
     session = await get_validated_session(session_id, request)
     store = get_session_store()
@@ -4466,18 +4684,7 @@ async def session_delete_handler(session_id: str, request: Optional[web.Request]
         session.input_bridge.cancel()
 
     cache_tag = session.cache_tag
-    cache_data: Dict[str, str] = {}
-    if cache_tag and session.client_auth:
-        cache_dir = app_config.directories.cache / cache_tag
-        if cache_dir.is_dir():
-            for f in sorted(cache_dir.rglob("*.json")):
-                key = f.relative_to(cache_dir).as_posix()[: -len(".json")]
-                if f.stem.startswith("titles_") or not safe_cache_key(key):
-                    continue
-                try:
-                    cache_data[key] = base64.b64encode(zlib.compress(f.read_bytes())).decode("ascii")
-                except OSError:
-                    pass
+    cache_data = collect_cache_files(cache_tag) if cache_tag and session.client_auth else {}
 
     await store.delete(session_id)
 

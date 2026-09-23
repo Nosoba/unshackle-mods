@@ -1596,7 +1596,7 @@ class dl:
 
         self.cdm_override = ctx.params.get("cdm_name")
         cdm_only = ctx.params.get("cdm_only")
-        self.vault_cache_tally: Optional[tuple[int, int]] = None
+        self.vault_cache_tally: Optional[tuple[set[UUID], int]] = None
 
         if cdm_only:
             self.vaults = Vaults(self.vault_service)
@@ -3315,13 +3315,14 @@ class dl:
                     service_session=service.session,
                 )
 
-            if getattr(self._remote_service, "_server_cdm", False) and self.cdm is None:
-                cdm_type = getattr(self._remote_service, "_server_cdm_type", "widevine")
-                self.cdm = cdm_type_stub(cdm_type)
-                self.log.info(f"Using server CDM ({cdm_type.title()}); no local CDM required")
+            server_cdm_type = None
+            if getattr(self._remote_service, "_server_cdm", False):
+                server_cdm_type = getattr(self._remote_service, "_server_cdm_type", "widevine")
+                self.cdm = cdm_type_stub(server_cdm_type)
+                self.log.info(f"Using server CDM ({server_cdm_type.title()}); no local CDM required")
 
             video_tracks = title.tracks.videos
-            if video_tracks:
+            if video_tracks and not server_cdm_type:
                 highest_quality = max((track.height for track in video_tracks if track.height), default=0)
                 if highest_quality > 0:
                     if is_widevine_cdm(self.cdm):
@@ -4562,7 +4563,8 @@ class dl:
         if not (self.vault_cache_tally and self.vault_cache_tally[0]):
             self.vault_cache_tally = None
             return
-        keys, successful_caches = self.vault_cache_tally
+        kids, successful_caches = self.vault_cache_tally
+        keys = len(kids)
         self.vault_cache_tally = None
         self.log.info(f"Cached {keys} Key{'' if keys == 1 else 's'} to {successful_caches}/{len(self.vaults)} Vaults")
 
@@ -4617,12 +4619,14 @@ class dl:
     def cache_keys_to_vaults(self, content_keys: dict[UUID, str]) -> None:
         """Store licence keys in every vault. A licence key clears a flag on its pair first: the
         flag came from a decode check that was wrong, and a local vault refuses a flagged pair."""
+        if not content_keys or not self.vaults:
+            return
         for kid, key in content_keys.items():
             if self.vaults.is_flagged(kid, key):
                 self.vaults.unflag_bad_key(kid, key)
         successful_caches = self.vaults.add_keys(content_keys)
-        keys, caches = self.vault_cache_tally or (0, successful_caches)
-        self.vault_cache_tally = (keys + len(content_keys), min(caches, successful_caches))
+        kids, caches = self.vault_cache_tally or (set(), successful_caches)
+        self.vault_cache_tally = (kids | content_keys.keys(), min(caches, successful_caches))
 
     @classmethod
     def drm_lock(cls, drm: DRM_T) -> Lock:
