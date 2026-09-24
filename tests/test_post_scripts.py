@@ -200,6 +200,37 @@ def test_tagging_ids_are_read_at_dispatch_not_snapshotted():
         )
 
 
+def test_the_folder_flag_is_never_rebound_inside_result():
+    """``folder`` is the --folder parameter, so a loop variable of the same name clobbers it.
+
+    Regression: the season post-script dispatch reused the name for a Path. Once the first
+    episode of a season finished, the parameter held a Path, which is truthy, so every later
+    episode went into a folder even without --folder. Only bindings in the function's own
+    scope clobber the parameter, so nested closures are skipped.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from unshackle.commands.dl import dl
+
+    def bindings_in_own_scope(nodes):
+        for node in nodes:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                continue  # a nested scope has its own `folder`
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                yield node
+            yield from bindings_in_own_scope(ast.iter_child_nodes(node))
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(dl.result)))
+    result = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "result")
+    rebound = [node.lineno for node in bindings_in_own_scope(result.body) if node.id == "folder"]
+    assert not rebound, (
+        f"dl.result binds `folder` at source line(s) {rebound} relative to the function; "
+        "that shadows the --folder parameter, so folder creation stays on for later episodes"
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
 

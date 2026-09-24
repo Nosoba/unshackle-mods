@@ -4087,8 +4087,10 @@ class dl:
                     group_key = post_script_group(title)
                     post_script_pending[group_key] = post_script_pending.get(group_key, 1) - 1
                     if post_script_pending[group_key] <= 0:
-                        for folder, context in post_script_last.get(group_key, {}).items():
-                            dispatch("success", "season", season_context(context, folder), postscript)
+                        # a Path, not the --folder flag: the same name would clobber the parameter
+                        # and make every later episode look folder-enabled
+                        for season_folder, context in post_script_last.get(group_key, {}).items():
+                            dispatch("success", "season", season_context(context, season_folder), postscript)
 
                 title_dl_time = time_elapsed_since(dl_start_time)
                 downloaded_label = "Track" if isinstance(title, Song) else "Title"
@@ -4114,8 +4116,8 @@ class dl:
 
         if post_script_folders and post_script_sample:
             run_context = dict.fromkeys(post_script_sample, "")
-            for folder in post_script_folders:
-                run_context["folder"] = str(folder)
+            for run_folder in post_script_folders:
+                run_context["folder"] = str(run_folder)
                 dispatch("success", "run", run_context, postscript)
 
         self.wait_vault_writes()
