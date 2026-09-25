@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import logging
 import re
@@ -96,6 +97,53 @@ def api_handler(handler: Handler) -> Handler:
             return await handler(request)
         except APIError as e:
             return build_error_response(e, request.app.get("debug_api", False))
+
+    return wrapper
+
+
+HEARTBEAT_INTERVAL = 30.0
+
+
+def heartbeat(handler: Handler) -> Handler:
+    """Keep a slow request alive with a newline every ``HEARTBEAT_INTERVAL`` seconds.
+
+    A response that is ready within one interval goes out unchanged. After that the route
+    sends status 200 and the headers, then a newline for each interval until the JSON body is
+    ready. JSON parsers ignore the leading whitespace. The status is already sent, so a late
+    failure arrives as the usual error body with ``"status": "error"`` and a 200 status. The
+    work continues if the client disconnects, so the remote session state stays complete.
+    """
+
+    @functools.wraps(handler)
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        task = asyncio.ensure_future(handler(request))
+        done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL)
+        if done:
+            return task.result()
+
+        headers = {"Content-Type": "application/json", "X-Accel-Buffering": "no", **CORS_HEADERS}
+        response = web.StreamResponse(headers=headers)
+        await response.prepare(request)
+        try:
+            while not done:
+                await response.write(b"\n")
+                done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL)
+        except ConnectionResetError:
+            log.info(f"Client left {request.path} before the response was ready; the work continues")
+            return response
+        debug_mode = request.app.get("debug_api", False)
+        try:
+            result = task.result()
+        except APIError as e:
+            result = build_error_response(e, debug_mode)
+        except Exception as e:
+            log.exception(f"Error in {request.path}")
+            result = handle_api_exception(e, debug_mode=debug_mode)
+        response["late_status"] = result.status
+        body = result.body if isinstance(result, web.Response) else None
+        await response.write(bytes(body) if isinstance(body, (bytes, bytearray)) else b"{}")
+        await response.write_eof()
+        return response
 
     return wrapper
 
@@ -404,7 +452,7 @@ async def search(request: web.Request) -> web.Response:
                 description: Profile to use for credentials and cookies (default - None)
               proxy:
                 type: string
-                description: Full proxy URI, or a country code when the API key has server_proxy (default - None)
+                description: Full proxy URI, a Control D resolver as controld://<resolver>@dns.controld.com, or a country code when the API key has server_proxy (default - None)
               no_proxy:
                 type: boolean
                 description: Force disable all proxy use (default - false)
@@ -668,7 +716,7 @@ async def list_tracks(request: web.Request) -> web.Response:
                 description: Specific episode/season, or song ("1-5", "2x3" for disc 2 track 3) (optional)
               proxy:
                 type: string
-                description: Proxy configuration (optional)
+                description: Full proxy URI, a Control D resolver as controld://<resolver>@dns.controld.com, or a country code when the API key has server_proxy (default - None)
               dl_params:
                 type: object
                 description: |
@@ -757,7 +805,9 @@ async def download(request: web.Request) -> web.Response:
                 type: array
                 items:
                   type: integer
-                description: Download resolution(s) (default - best available)
+                description: >-
+                  Download resolution(s) (default - best available). An API key with a
+                  server_cdm_max_height for the service must pass a quality at or under that height.
               vcodec:
                 oneOf:
                   - type: string
@@ -782,7 +832,9 @@ async def download(request: web.Request) -> web.Response:
                 type: array
                 items:
                   type: string
-                description: Video colour range (SDR, HDR10, HDR10+, HLG, DV, HYBRID) (default - ["SDR"])
+                description: >-
+                  Video colour range (SDR, HDR10, HDR10+, HLG, DV, HYBRID) (default - ["SDR"]).
+                  An API key with a server_cdm_max_height for the service cannot set HYBRID.
               channels:
                 type: number
                 description: Audio channels (e.g., 2.0, 5.1, 7.1) (default - None)
@@ -889,7 +941,7 @@ async def download(request: web.Request) -> web.Response:
                 description: Skip downloading, only retrieve decryption keys (default - false)
               export:
                 type: boolean
-                description: Export manifest, track URLs, keys, and subtitles to JSON in the exports directory (default - false)
+                description: Export manifest, DRM init data, keys, and track info to a JSON file in the exports directory (default - false)
               cdm_only:
                 type: boolean
                 description: Only use CDM for content key retrieval (true) or only vaults (false) (default - None)
@@ -898,7 +950,7 @@ async def download(request: web.Request) -> web.Response:
                 description: CDM device name on the server to license with, overriding the cdm config mapping. Requires serve.cdm_overrides to allow it (default - None)
               proxy:
                 type: string
-                description: Full proxy URI, or a country code when the API key has server_proxy (default - None)
+                description: Full proxy URI, a Control D resolver as controld://<resolver>@dns.controld.com, or a country code when the API key has server_proxy (default - None)
               no_proxy:
                 type: boolean
                 description: Force disable all proxy use (default - false)
@@ -951,7 +1003,9 @@ async def download(request: web.Request) -> web.Response:
                 description: Amount of tracks to download concurrently (default - 1)
               best_available:
                 type: boolean
-                description: Continue with best available if requested quality unavailable (default - false)
+                description: >-
+                  Continue with best available if requested quality unavailable (default - false).
+                  An API key with a server_cdm_max_height for the service cannot set it.
               worst:
                 type: boolean
                 description: Select the lowest bitrate track within the specified quality. Requires `quality` (default - false)
@@ -995,6 +1049,10 @@ async def download(request: web.Request) -> web.Response:
                   type: string
       '400':
         description: Invalid request
+      '403':
+        description: >-
+          A gated parameter is not permitted (FORBIDDEN), or the job goes above the
+          server_cdm_max_height of the API key (SERVER_CDM_CAPPED)
     """
     try:
         data = await request.json()
@@ -1691,6 +1749,15 @@ async def session_create(request: web.Request) -> web.Response:
                   forced_subs:
                     type: boolean
                     default: false
+              cdm_type:
+                type: string
+                enum: [widevine, playready]
+                description: DRM system of the client's local CDM; absent when the client has none
+              cdm_security_level:
+                type: integer
+                description: |
+                  Security level of the client's local CDM, in the device's own numbers
+                  (Widevine 1 to 3, PlayReady 150 to 3000)
               client:
                 type: object
                 additionalProperties: true
@@ -1715,8 +1782,23 @@ async def session_create(request: web.Request) -> web.Response:
                 server_account:
                   type: boolean
                   description: True when the server authenticated with one of its own accounts
+                server_cdm:
+                  type: boolean
+                  description: |
+                    True when the server CDM licenses this remote session. False when the client's own
+                    local CDM licenses it.
+                server_cdm_max_height:
+                  type: integer
+                  nullable: true
+                  description: |
+                    Tallest video track the server CDM licenses live for this API key and service;
+                    null for no limit
       '400':
         description: Invalid request
+      '403':
+        description: |
+          SERVER_CDM_CAPPED when `quality` asks for more than the server CDM limit and the client
+          reported no local CDM
       '401':
         description: Authentication failed
     """
@@ -1737,6 +1819,7 @@ async def session_create(request: web.Request) -> web.Response:
 
 
 @api_handler
+@heartbeat
 async def session_titles(request: web.Request) -> web.Response:
     """
     Get titles for an authenticated remote session.
@@ -1751,7 +1834,10 @@ async def session_titles(request: web.Request) -> web.Response:
           type: string
     responses:
       '200':
-        description: List of titles
+        description: >-
+          List of titles.
+          After 30 s the route sends 200 and a newline every 30 s. A failure after that time
+          arrives as the error body with status 200.
       '404':
         description: Remote session not found
     """
@@ -1766,6 +1852,7 @@ async def session_titles(request: web.Request) -> web.Response:
 
 
 @api_handler
+@heartbeat
 async def session_tracks(request: web.Request) -> web.Response:
     """
     Get tracks and chapters for a specific title.
@@ -1792,7 +1879,10 @@ async def session_tracks(request: web.Request) -> web.Response:
                 description: ID of the title to get tracks for
     responses:
       '200':
-        description: Tracks and chapters for the title
+        description: >-
+          Tracks and chapters for the title.
+          After 30 s the route sends 200 and a newline every 30 s. A failure after that time
+          arrives as the error body with status 200.
       '404':
         description: Remote session or title not found
     """
@@ -1915,6 +2005,7 @@ async def session_segment_filter(request: web.Request) -> web.Response:
 
 
 @api_handler
+@heartbeat
 async def session_license(request: web.Request) -> web.Response:
     """
     Proxy DRM license through authenticated service.
@@ -1954,7 +2045,11 @@ async def session_license(request: web.Request) -> web.Response:
           an array of KID hex strings that may be absent and may repeat a KID shared by several
           tracks, lists the content keys a server vault supplied, which the client has to prove
           before it trusts them. `clear_tracks`, absent when empty, lists the requested track ids
-          that carry no DRM and so have no keys.
+          that carry no DRM and so have no keys. `capped_tracks`, absent when empty, maps each
+          track id the server refused to license live to the refusal details (`reason` and
+          `max_height`); the client licenses those tracks with its own local CDM.
+          After 30 s the route sends 200 and a newline every 30 s. A failure after that time
+          arrives as the error body with status 200.
       '404':
         description: Remote session or track not found
     """
@@ -1969,7 +2064,10 @@ async def session_license(request: web.Request) -> web.Response:
     try:
         return await session_license_handler(data, session_id, request)
     except Exception as e:
-        log.exception("Error in session license")
+        if isinstance(e, APIError) and e.error_code is APIErrorCode.SERVER_CDM_CAPPED:
+            log.info(f"Session licence refused: {e.message}")
+        else:
+            log.exception("Error in session license")
         return handle_api_exception(
             e, context={"operation": "session_license"}, debug_mode=request.app.get("debug_api", False)
         )
@@ -2533,6 +2631,9 @@ async def dashboard_keys(request: web.Request) -> web.Response:
                       dashboard API key with no `serve.users` entry does
                   server_cdm:
                     description: false, true, or the list of service tags it covers
+                  server_cdm_max_height:
+                    nullable: true
+                    description: The configured live licence height limit, a map of service tag to one, or null
                   server_accounts:
                     description: false, true, or the list of service tags it covers
                   server_proxy:
@@ -2564,19 +2665,31 @@ async def dashboard_keys(request: web.Request) -> web.Response:
 @api_handler
 async def dashboard_services(request: web.Request) -> web.Response:
     """
-    Dashboard: every discovered service and its load state.
+    Dashboard: every configured service and its load state.
     ---
     summary: Dashboard services
     description: >
-      Unlike `/api/services` this is not filtered by any allowlist and it keeps the services
-      that failed to import, with their error. `state` is `loaded`, `staged` (an update is on
+      Shows only the services configured on this server: the global `serve.services`
+      allowlist, else the union of every `serve.users` key's `services`, else every discovered
+      service. An API key with no `services` list does not widen the union, so the list can be
+      smaller than what an unrestricted API key can reach. `?all=1` lists every installed
+      service instead. Unlike `/api/services` it keeps the
+      services that failed to import, with their error. `state` is `loaded`, `staged` (an update is on
       disk but a busy service blocks the re-import) or `failed`.
       A staged service applies when its last job finishes; watch the `service` event on
       `/api/dashboard/events` instead of polling for it.
     tags: [Dashboard]
+    parameters:
+      - name: all
+        in: query
+        required: false
+        schema:
+          type: string
+          enum: ["1"]
+        description: List every installed service, not only the configured ones
     responses:
       '200':
-        description: One row per discovered service
+        description: One row per listed service
         content:
           application/json:
             schema:

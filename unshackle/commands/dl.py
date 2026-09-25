@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import json
 import logging
 import math
 import os
@@ -30,6 +29,7 @@ from urllib.parse import urlparse
 from uuid import UUID
 
 import click
+import mediaexport
 import yaml
 from click.core import ParameterSource
 from langcodes import Language, tag_is_valid
@@ -43,7 +43,7 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from unshackle.core import binaries, providers
+from unshackle.core import __version__, binaries, providers
 from unshackle.core.cdm import DecryptLabsRemoteCDM
 from unshackle.core.cdm.detect import cdm_type_stub, is_playready_cdm, is_widevine_cdm
 from unshackle.core.config import config, resolve_cdm_name, resolve_decryption
@@ -51,12 +51,23 @@ from unshackle.core.console import GradientPulseBarColumn, SyncLive, console, li
 from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack, context_settings
 from unshackle.core.credential import Credential
 from unshackle.core.downloaders import default_max_workers, format_speed, parse_speed_limit, set_speed_limit
-from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine, verify
+from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine, own_kids, verify
 from unshackle.core.events import events
+from unshackle.core.export_name import ExportNamer, move_export, plural, season_episodes, title_label
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.providers.tvdb import SEASON_TYPES, parse_int
-from unshackle.core.proxies import Basic, ExpressVPN, Gluetun, Hola, NordVPN, ProtonVPN, SurfsharkVPN, WindscribeVPN
-from unshackle.core.proxies.resolve import is_loopback, resolve_proxy
+from unshackle.core.proxies import (
+    Basic,
+    ControlD,
+    ExpressVPN,
+    Gluetun,
+    Hola,
+    NordVPN,
+    ProtonVPN,
+    SurfsharkVPN,
+    WindscribeVPN,
+)
+from unshackle.core.proxies.resolve import REGION, is_loopback, resolve_proxy
 from unshackle.core.service import Service, grow_session_pool
 from unshackle.core.services import Services
 from unshackle.core.temp import with_task_temp
@@ -1731,9 +1742,13 @@ class dl:
                         self.proxy_providers.append(Gluetun(**config.proxy_providers["gluetun"]))
                     if binaries.HolaProxy:
                         self.proxy_providers.append(Hola())
+                    if config.proxy_providers.get("controld"):
+                        self.proxy_providers.append(ControlD(**config.proxy_providers["controld"]))
                     for proxy_provider in self.proxy_providers:
                         self.log.info(f"Loaded {proxy_provider.__class__.__name__}: {proxy_provider}")
 
+            if proxy and proxy.startswith("controld://"):
+                proxy = ctx.params["proxy"] = resolve_proxy(proxy, [])
             if proxy:
 
                 def log_proxy_used(provider: object, uri: str) -> None:
@@ -1745,11 +1760,8 @@ class dl:
                 if re.match(r"^[a-z]+:.+$", proxy, re.IGNORECASE):
                     # requesting proxy from a specific proxy provider
                     requested_provider, proxy = proxy.split(":", maxsplit=1)
-                # Match simple region codes (us, ca, uk1, us:ny) or provider:region (nordvpn:ca, protonvpn:us:ny).
-                # ':' is allowed as a city separator (e.g. nordvpn:us:seattle, protonvpn:de:berlin).
-                if re.match(r"^[a-z]{2}(?:[-:][a-z0-9]+)*(?:\d+)?$", proxy, re.IGNORECASE) or re.match(
-                    r"^[a-z]+:[a-z]{2}(?:[-:][a-z0-9]+)*(?:\d+)?$", proxy, re.IGNORECASE
-                ):
+                # Match region codes (us, ca, uk1, us:ny, yul) or provider:region (nordvpn:ca, protonvpn:us:ny).
+                if re.fullmatch(rf"(?:[a-z]+:)?{REGION}", proxy, re.IGNORECASE):
                     proxy = proxy.lower()
                     # Preserve the original user query (region code) for service-specific proxy_map overrides.
                     # NOTE: `proxy` may be overwritten with the resolved proxy URI later.
@@ -1946,8 +1958,11 @@ class dl:
         self.service_anime = bool(getattr(service, "ANIME", False))
         self.service_daily = bool(getattr(service, "DAILY", False))
         self.server_cdm = getattr(service, "_server_cdm", False)
-        if self.server_cdm and self.cdm_override:
-            self.log.warning("--cdm is ignored: this remote service licenses with the server CDM")
+        from unshackle.core.import_service import ImportService
+
+        # a remote session sends --cdm to the server, which can hand it the tracks above its cap
+        if self.cdm_override and isinstance(service, ImportService):
+            self.log.warning("--cdm is ignored: an import uses the keys in the export")
         self._remote_service = service if hasattr(service, "_server_cdm") else None
         start_time = time.time()
 
@@ -2021,7 +2036,10 @@ class dl:
 
         if no_proxy or no_proxy_download:
             proxy_download = None
-        elif proxy_download and re.match(r"^(?:[a-z]+:){0,2}[a-z]{2}(?:[-:][a-z0-9]+)*(?:\d+)?$", proxy_download, re.I):
+        elif proxy_download and (
+            proxy_download.startswith("controld://")
+            or re.fullmatch(rf"(?:[a-z]+:){{0,2}}{REGION}", proxy_download, re.I)
+        ):
             # same shapes --proxy resolves against providers (two prefixes for gluetun:nordvpn:ca); else an explicit URI
             try:
                 proxy_download = resolve_proxy(proxy_download.lower(), self.proxy_providers)
@@ -2031,8 +2049,10 @@ class dl:
 
         if export:
             config.directories.exports.mkdir(parents=True, exist_ok=True)
+            # a working name until the first write, which renames it after what it holds
             export_path = config.directories.exports / f"export_{self.service}_{int(time.time())}.json"
             self.export_service = service
+            self.export_namer = ExportNamer(self.service)
         else:
             export_path = None
 
@@ -2246,6 +2266,10 @@ class dl:
 
         if list_titles:
             return
+
+        if export_path and isinstance(titles, Series):
+            # before --select-titles and -w drop titles, so a whole season can be told from part of one
+            self.export_namer.seasons = season_episodes(titles)
 
         if select_titles and isinstance(titles, Movies) and len(titles) > 1:
             console.print(Padding(Rule("[rule.text]Select Titles"), (1, 2)))
@@ -3319,7 +3343,12 @@ class dl:
             if getattr(self._remote_service, "_server_cdm", False):
                 server_cdm_type = getattr(self._remote_service, "_server_cdm_type", "widevine")
                 self.cdm = cdm_type_stub(server_cdm_type)
-                self.log.info(f"Using server CDM ({server_cdm_type.title()}); no local CDM required")
+                from unshackle.core.import_service import ImportService
+
+                if isinstance(self._remote_service, ImportService):
+                    self.log.info("Using keys from the export; no CDM required")
+                else:
+                    self.log.info(f"Using server CDM ({server_cdm_type.title()}); no local CDM required")
 
             video_tracks = title.tracks.videos
             if video_tracks and not server_cdm_type:
@@ -3421,22 +3450,16 @@ class dl:
                 )
                 self.wait_vault_writes()
                 self.cleanup_temp_files(temp_external_subs)
+                if export_path:
+                    self.log_export_summary()
                 return
             except Exception as e:  # noqa
                 # Reported and swallowed (no re-raise) so the CLI exits cleanly; flag it so the
                 # API worker sees the title failed rather than completing with no output.
                 self.download_failed = True
-                error_messages = [
-                    ":x: Download Failed...",
-                    f"   {type(e).__name__}: {e}",
-                ]
-                if hasattr(e, "returncode"):
-                    error_messages.append(f"   Binary call failed, Process exit code: {e.returncode}")
-                error_messages.append(
-                    "   An unexpected error occurred in one of the download workers.",
-                )
-                console.print(Padding(Group(*error_messages), (1, 5)))
-                console.print_exception()
+                console.print(Padding(Group(*self.failure_lines(e)), (1, 5)))
+                if not isinstance(e, click.ClickException):
+                    console.print_exception()
 
                 if self.debug_logger:
                     self.debug_logger.log_error(
@@ -3464,9 +3487,13 @@ class dl:
                 )
                 self.wait_vault_writes()
                 self.cleanup_temp_files(temp_external_subs)
+                if export_path:
+                    self.log_export_summary()
                 return
 
             self.wait_vault_writes()
+            if export_path:
+                self.log_export_title(title)
 
             if skip_dl:
                 console.log("Skipped downloads as --skip-dl was used...")
@@ -4121,6 +4148,8 @@ class dl:
                 dispatch("success", "run", run_context, postscript)
 
         self.wait_vault_writes()
+        if export_path:
+            self.log_export_summary()
         dl_time = time_elapsed_since(start_time)
 
         console.print(Padding(f"Processed all titles in [progress.elapsed]{dl_time}", (0, 5, 1, 5)))
@@ -4352,63 +4381,217 @@ class dl:
         return meta
 
     def write_export(self, export: Path, title: Title_T, track: AnyTrack, drm: Any = None) -> None:
-        """Write a shareable v2 export usable by ``unshackle import``.
+        """Write a shareable mediaexport file usable by ``unshackle import`` and unidl.
 
-        Carries no HTTP session, cookies, or dl-flags. The export records the region (country
-        code) only when the export used ``--proxy``, as an import geofence. Each track records
-        only the licensed DRM system. Content keys live once under the track's ``keys``. ``drm`` may be None
-        (DRM-free track) or a DRM system without ``to_dict``/``content_keys`` (e.g. ClearKey) -
-        the export still records the track, manifest, chapter and attachment info.
+        Carries no HTTP session or cookies. The export records the region (country code)
+        only when the export used ``--proxy``, as an import geofence. DRM init data and
+        content keys live once per title. ``drm`` may be None (DRM-free track) or a DRM
+        system without ``to_dict``/``content_keys`` (e.g. ClearKey) - the export still
+        records the track, manifest, chapter and attachment info. unshackle's full track
+        dicts and title meta go under ``x-unshackle`` for its own importer.
         """
+        namer: Optional[ExportNamer] = getattr(self, "export_namer", None)
         with self.EXPORT_LOCK:
-            doc: dict[str, Any] = {}
-            if export.is_file():
-                doc = json.loads(export.read_text(encoding="utf8")) or {}
+            if namer and namer.path:
+                export = namer.path
+            try:
+                doc = mediaexport.read(export) if export.is_file() else mediaexport.Document(service_tag=self.service)
+            except mediaexport.ExportError as e:
+                # a download mid-licensing must not die over the file it exports to
+                self.log.warning(f"Not exporting {title.id}: {export} is not a usable export ({e})")
+                return
+            doc.generator.setdefault("app", "unshackle")
+            doc.generator.setdefault("version", __version__)
+            if not doc.region and getattr(self, "proxy_requested", False):
+                doc.region = getattr(getattr(self, "export_service", None), "current_region", None) or ""
 
-            doc.setdefault("version", 2)
-            doc.setdefault("service", self.service)
-            if "region" not in doc and getattr(self, "proxy_requested", False):
-                region = getattr(getattr(self, "export_service", None), "current_region", None)
-                if region:
-                    doc["region"] = region
+            entry = doc.get(str(title.id))
+            if entry is None:
+                entry = self.export_entry(title)
+                doc.add(entry)
 
-            titles = doc.setdefault("titles", {})
-            tinfo = titles.setdefault(str(title.id), {})
-            tinfo.setdefault("meta", self.title_to_meta(title))
+            tracks_map = entry.ext("unshackle").setdefault("tracks", {})
+            tracks_map.setdefault(str(track.id), track.to_dict())
+            # the row names the track's KIDs, so an import gives the track only their keys
+            track_kids = [kid.hex for kid in own_kids(drm)] if drm is not None else []
+            for row in entry.tracks:
+                if row.get("id") == str(track.id):
+                    row["selected"] = True
+                    if track_kids:
+                        row["kids"] = list(dict.fromkeys([*(row.get("kids") or []), *track_kids]))
 
-            if title.tracks.manifest_url:
-                tinfo.setdefault("manifest_url", title.tracks.manifest_url)
-
-            all_tracks = [*title.tracks.videos, *title.tracks.audio, *title.tracks.subtitles]
-            if "manifest_type" not in tinfo:
-                tinfo["manifest_type"] = next(
-                    (t.descriptor.name for t in all_tracks if t.descriptor != Video.Descriptor.URL), None
-                )
-
-            tracks_map = tinfo.setdefault("tracks", {})
-            if not tracks_map:
-                for t in all_tracks:
-                    tracks_map[str(t.id)] = t.to_dict()
-
-            track_data = tracks_map.setdefault(str(track.id), track.to_dict())
             if drm is not None:
                 if hasattr(drm, "to_dict"):
-                    track_data["drm"] = [drm.to_dict()]
+                    d = drm.to_dict()
+                    own = entry.ext("unshackle").setdefault("drm", [])
+                    if d not in own:
+                        own.append(d)
+                    system = str(d.get("system", "")).lower().replace("cenc", "")
+                    pssh = str(d.get("pssh_b64") or "")
+                    if system and all(x.pssh != pssh or x.system != system for x in entry.drm):
+                        entry.drm.append(mediaexport.Drm(system, pssh))
                 content_keys = getattr(drm, "content_keys", None) or {}
-                if content_keys:
-                    keys = track_data.setdefault("keys", {})
-                    for kid, key in content_keys.items():
-                        keys[kid.hex] = key
+                pool = doc.key_pool()
+                for kid, key in content_keys.items():
+                    # a KID that already holds a different key must not be overwritten:
+                    # the reader rejects a file that disagrees with itself
+                    if pool.setdefault(kid.hex, key.lower()) != key.lower():
+                        self.log.warning(
+                            f"KID {kid.hex} already has a different key in {export}, keeping the existing one"
+                        )
+                        continue
+                    try:
+                        entry.add_key(kid.hex, key)
+                    except mediaexport.ExportError as e:
+                        # a key the format cannot hold (not 16 bytes of hex) costs the export that key,
+                        # never the download
+                        self.log.warning(f"Not exporting the key for KID {kid.hex}: {e}")
 
-            if "chapters" not in tinfo:
-                tinfo["chapters"] = [
-                    {"timestamp": chapter.timestamp, "name": chapter.name} for chapter in (title.tracks.chapters or [])
-                ]
+            try:
+                mediaexport.write(export, doc)
+            except (mediaexport.ExportError, OSError) as e:
+                self.log.warning(f"Could not write export {export}: {e}")
+                return
+            if namer:
+                self.rename_export(namer, export, title, track)
 
-            if "attachments" not in tinfo:
-                tinfo["attachments"] = [a.to_dict() for a in (title.tracks.attachments or []) if a.url]
+    def rename_export(self, namer: ExportNamer, export: Path, title: Title_T, track: AnyTrack) -> None:
+        """Give the run's export a name that tells what it holds, after each write to it.
 
-            export.write_text(json.dumps(doc, indent=4, ensure_ascii=False), encoding="utf8")
+        The file on disk is complete after each write, so a run that stops early still leaves
+        a usable file with a name that matches what it holds.
+        """
+        first = namer.path is None
+        namer.add(title, track)
+        try:
+            namer.path = move_export(export, namer.name())
+        except OSError as e:
+            self.log.warning(f"Could not rename export {export}: {e}")
+            namer.path = export
+        if first:
+            self.log.info(f"Exporting to {namer.path.name}")
+        elif namer.path != export:
+            self.log.debug(f"Renamed the export to {namer.path.name}")
+
+    def log_export_title(self, title: Title_T) -> None:
+        """Log what the export holds for one title: its track counts and its keys."""
+        namer: Optional[ExportNamer] = getattr(self, "export_namer", None)
+        entry = None
+        if namer and namer.path:
+            try:
+                entry = mediaexport.read(namer.path).get(str(title.id))
+            except (mediaexport.ExportError, OSError) as e:
+                self.log.warning(f"Could not read export {namer.path}: {e}")
+                return
+        if entry is None:
+            self.log.warning(f"Exported nothing for {title_label(title)}")
+            return
+        selected = [r.get("type") for r in entry.tracks if r.get("selected")]
+        self.log.info(
+            f"Exported {title_label(title)}: {selected.count('video')} video, {selected.count('audio')} audio, "
+            f"{plural(selected.count('subtitle'), 'subtitle')}, {plural(len(entry.keys), 'key')}"
+        )
+
+    def log_export_summary(self) -> None:
+        """Log where the run's export is and what it holds, and that it must stay private."""
+        namer: Optional[ExportNamer] = getattr(self, "export_namer", None)
+        if not namer or not namer.path:
+            self.log.warning("Nothing was exported")
+            return
+        try:
+            doc = mediaexport.read(namer.path)
+        except (mediaexport.ExportError, OSError) as e:
+            self.log.warning(f"Could not read export {namer.path}: {e}")
+            return
+        keys = len(doc.key_pool())
+        self.log.info(f"Saved the export to {namer.path}: {plural(len(doc.titles), 'title')}, {plural(keys, 'key')}")
+        if keys:
+            self.log.warning("The export holds content keys. Keep it private.")
+
+    def export_entry(self, title: Title_T) -> mediaexport.Entry:
+        """A mediaexport entry for ``title``: manifests, chapters, a small track list, no keys yet."""
+        meta = self.title_to_meta(title)
+        all_tracks = [*title.tracks.videos, *title.tracks.audio, *title.tracks.subtitles]
+        primary_url = title.tracks.manifest_url or next(
+            (str(t.url) for t in all_tracks if t.descriptor != Video.Descriptor.URL), ""
+        )
+        manifest_type = next(
+            (t.descriptor.name.lower() for t in all_tracks if t.descriptor != Video.Descriptor.URL), ""
+        )
+        session = getattr(getattr(self, "export_service", None), "session", None)
+        # mediaexport drops Cookie and Authorization itself, on write and on read
+        headers = dict(getattr(session, "headers", None) or {})
+        manifests = [mediaexport.Manifest(primary_url, manifest_type, headers, role="primary")] if primary_url else []
+        # the whole URL identifies a manifest: two profiles on one endpoint are two manifests
+        seen = {primary_url}
+        for t in all_tracks:
+            url = str(t.url)
+            if t.descriptor in (Video.Descriptor.DASH, Video.Descriptor.ISM) and url not in seen:
+                seen.add(url)
+                manifests.append(mediaexport.Manifest(url, t.descriptor.name.lower(), role="extra"))
+
+        rows = []
+        for t in all_tracks:
+            codec = getattr(t, "codec", None)
+            row: dict[str, Any] = {
+                "id": str(t.id),
+                "type": t.__class__.__name__.lower(),
+                # a subtitle side-load names its file format so another tool can fetch it
+                "codec": (codec.value if isinstance(t, Subtitle) else codec.name).lower() if codec else "",
+                "language": str(t.language) if t.language else "",
+                "bitrate": int(bitrate) if (bitrate := getattr(t, "bitrate", None)) else None,
+            }
+            if isinstance(t, Video):
+                row.update(width=t.width, height=t.height, range=t.range.name.lower() if t.range else "")
+            elif isinstance(t, Audio):
+                row.update(channels=str(t.channels) if t.channels else "", atmos=bool(t.joc), descriptive=t.descriptive)
+            elif isinstance(t, Subtitle):
+                row.update(sdh=t.sdh, forced=t.forced, cc=t.cc)
+            if t.descriptor == Video.Descriptor.URL:
+                row["url"] = str(t.url)
+            rows.append({k: v for k, v in row.items() if v not in (None, "")})
+
+        return mediaexport.Entry(
+            id=str(title.id),
+            kind=meta.get("type", "movie"),
+            title=meta.get("name") or "",
+            series=meta.get("series_title") or "",
+            season=meta.get("season"),
+            episode=meta.get("number"),
+            year=meta.get("year"),
+            language=meta.get("language") or "",
+            artist=meta.get("artist") or "",
+            album=meta.get("album") or "",
+            track_number=meta.get("track"),
+            manifests=manifests,
+            chapters=[
+                {"start_ms": mediaexport.ts_ms(c.timestamp), "title": c.name or ""}
+                for c in (title.tracks.chapters or [])
+            ],
+            tracks=rows,
+            extensions={
+                "x-unshackle": {
+                    "meta": meta,
+                    "tracks": {},
+                    "attachments": [a.to_dict() for a in (title.tracks.attachments or []) if a.url],
+                }
+            },
+        )
+
+    @staticmethod
+    def failure_lines(e: BaseException) -> list[str]:
+        """Return the lines that report a failed download.
+
+        A ClickException is a deliberate stop with a message for the user, so it gets no
+        "unexpected error" line, and the caller prints no traceback for it.
+        """
+        if isinstance(e, click.ClickException):
+            return [":x: Download Failed...", f"   {e.format_message()}"]
+        lines = [":x: Download Failed...", f"   {type(e).__name__}: {e}"]
+        if (returncode := getattr(e, "returncode", None)) is not None:
+            lines.append(f"   Binary call failed, Process exit code: {returncode}")
+        lines.append("   An unexpected error occurred in one of the download workers.")
+        return lines
 
     def decrypt_verified(
         self,
@@ -4452,11 +4635,25 @@ class dl:
                 self.LICENSE_KEY_CACHE.pop(kid)
             return key
 
+        def relicense(dropped: set[UUID]) -> None:
+            """Licence again, then ask for each dropped KID that is still without a content key.
+
+            prepare_drm licenses only for a KID it is told to need, so without the second call a
+            track that still holds other content keys would decrypt without the dropped one.
+            """
+            if not licence:
+                return
+            licence(drm, track_kid=track_kid)
+            for kid in sorted(dropped):
+                # prepare_drm can replace the dict, so read it from the DRM each time
+                if kid != track_kid and kid not in getattr(drm, "content_keys", {}):
+                    licence(drm, track_kid=kid)
+
         known_bad = flagged_kids()
         if known_bad and licence:
             for kid in known_bad:
                 drop(kid)
-            licence(drm, track_kid=track_kid)
+            relicense(set(known_bad))
 
         def vault_kids() -> dict[UUID, Vault]:
             """The KIDs whose key on the track came from a vault, with that vault."""
@@ -4535,7 +4732,7 @@ class dl:
                     raise ValueError("The content key from the vault did not decrypt the track; run again")
                 path.unlink()
                 os.link(backup, path)
-                licence(drm, track_kid=track_kid)
+                relicense(set(bad))
                 for kid, key in bad.items():
                     if keys.get(kid) != key:
                         continue
@@ -4688,8 +4885,10 @@ class dl:
 
         svc_for_cdm = getattr(self, "_remote_service", None)
         server_cdm = getattr(svc_for_cdm, "_server_cdm", getattr(self, "server_cdm", False))
+        client_licensed = getattr(svc_for_cdm, "client_licensed", ())
+        licensed_locally = bool(client_licensed) and str(track.id) in client_licensed
 
-        if server_cdm:
+        if server_cdm and not licensed_locally:
             with self.drm_lock(drm):
                 pending_vault_writes: list[Callable[[], Any]] = []
                 vault_kids = list(getattr(drm, "kids", None) or [])
@@ -4716,6 +4915,8 @@ class dl:
                             drm_system="playready" if drm.__class__.__name__ == "PlayReady" else "widevine",
                             challenge=b"",
                         )
+                    except click.ClickException:
+                        raise
                     except Exception as e:
                         self.log.debug(f"Server CDM licence with an empty challenge failed: {e!r}")
 
@@ -4733,6 +4934,9 @@ class dl:
                     pending_vault_writes.append(partial(self.cache_keys_to_vaults, new_keys))
                 self.flush_vault_writes(pending_vault_writes)
 
+            # the server can refuse the licence above its cap and hand the track to this machine
+            licensed_locally = bool(client_licensed) and str(track.id) in client_licensed
+        if server_cdm and not licensed_locally:
             if not drm.content_keys:
                 self.log.warning("Server CDM did not resolve any keys for this track")
                 return
@@ -4796,6 +5000,28 @@ class dl:
             track_quality = max((v.height for v in title.tracks.videos if v.height), default=None)
 
         track_cdm = self.cdm
+        if licensed_locally:
+            track_cdm = getattr(svc_for_cdm, "local_cdm", None)
+            local_drm = track.get_drm_for_cdm(track_cdm)
+            if local_drm is not None and local_drm is not drm:
+                # a mid-download handover leaves drm on the server's DRM system, and the caller decrypts with it
+                self.prepare_drm(
+                    local_drm,
+                    track,
+                    title,
+                    certificate,
+                    licence,
+                    clearkey_licence,
+                    track_kid,
+                    table,
+                    cdm_only,
+                    vaults_only,
+                    export,
+                    service_session,
+                )
+                with self.drm_lock(drm):
+                    drm.content_keys.update(local_drm.content_keys)
+                return
 
         licence = partial(licence, drm_system="playready" if isinstance(drm, PlayReady) else "widevine")
 

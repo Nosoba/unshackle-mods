@@ -134,7 +134,7 @@ FULLWIDTH_REPLACEMENTS = {
 }
 
 
-def sanitize_filename(filename: str, spacer: str = ".") -> str:
+def sanitize_filename(filename: str, spacer: str = ".", unicode: Optional[bool] = None) -> str:
     """
     Sanitise a string to be filename safe.
 
@@ -145,13 +145,18 @@ def sanitize_filename(filename: str, spacer: str = ".") -> str:
     original language (for example Korean, Japanese, or Chinese) instead of
     transliterating them to ASCII equivalents. Characters Windows forbids in a
     path are then swapped for their fullwidth twins so the title stays readable.
+    Pass ``unicode`` to decide the transliteration for one call instead of the
+    config value.
     """
     if filename is None:
         return ""
 
     filename = str(filename)
 
-    if not config.unicode_filenames:
+    # The two knobs are independent: the `unicode` argument only decides whether this
+    # call transliterates, while the config value decides whether the title is kept in
+    # its original characters with the fullwidth swaps applied.
+    if not (config.unicode_filenames if unicode is None else unicode):
         filename = unidecode(filename)
         filename = re.sub(r"\[\(+", "[", filename)
         filename = re.sub(r"\)+\]", "]", filename)

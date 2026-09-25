@@ -121,7 +121,12 @@ hood the client walks a remote session through its lifecycle.
       it sits in a different region from the reported one, asking the client to
       pass `--proxy` with its own proxy, or `--no-proxy` to accept the server's
       own connection. With `server_proxy` the server picks a proxy that matches
-      the client region itself
+      the client region itself. For `--proxy controld:ca` the client points its
+      Control D profile at the region and sends only the resolver, as
+      `controld://<resolver>@dns.controld.com`. The server counts it as a full proxy
+      URI and runs its own forwarder for it. A bare region skips Control D, because its
+      proxy is a forwarder on the client. See
+      [Control D](../../guide/proxies-and-vpn.md#control-d)
     - Track-selection hints (`range_`, `vcodec`, `quality`, `best_available`) so
       the server fetches the right manifests
     - Your language and audio codec selection (`-l`, `-vl`, `-al`, `-a`, `-fs`)
@@ -145,7 +150,8 @@ hood the client walks a remote session through its lifecycle.
     `GET /api/services` advertises the regions those accounts cover. When your own
     region is not one of them and you set no `--proxy`, the client resolves a proxy for
     the first advertised region itself, so both sides sit in a region the account
-    works in.
+    works in. This is a bare region query, so it skips Control D. A server-account
+    service does not accept a `controld://` resolver from the client.
 
     The server responds immediately with a session ID and a status. Authentication
     runs in the background on the server.
@@ -262,6 +268,15 @@ There are two ways DRM keys get resolved, chosen by the client's `server_cdm` fl
       already answered. The client proves it, and a server key waits as the next
       candidate.
 
+!!! note "A height limit on the server CDM"
+    An API key with `server_cdm_max_height` gets the server CDM only up to that height. The
+    session create response tells the client who licenses the session in `server_cdm` and gives
+    the limit in `server_cdm_max_height`. In a server CDM session, the batch licence response
+    lists each track the server refused to license live under `capped_tracks`. A single-track
+    server CDM licence answers `403 SERVER_CDM_CAPPED` for such a track. In both cases the client
+    licenses those tracks in proxy mode with its own local CDM. See
+    [`server_cdm_max_height`](../../reference/configuration/services.md).
+
 ---
 
 ## Remote session lifecycle and expiry
@@ -271,8 +286,8 @@ generally never touch this directly, but it explains behaviour you might observe
 
 | Behavior | Value | Notes |
 |---|---|---|
-| Idle session TTL | **300s** (5 min) default | Refreshed on every request to the session |
-| Max concurrent sessions | **100** default | Oldest (least recently used) is evicted when full |
+| Idle session TTL | **300s** (5 min) default | Refreshed on every request to the session and when a `titles` or `tracks` request ends. A remote session does not expire while a request works on it |
+| Max concurrent sessions | **100** default | Oldest (least recently used) is evicted when full. A remote session that a request works on goes last |
 | Auth/input timeout | **600s** (10 min) | Sessions still authenticating or awaiting a prompt use this longer window instead of the TTL |
 | Cleanup sweep | every 60s | Expired sessions are removed and their input prompts cancelled |
 
@@ -397,6 +412,9 @@ layer.
 - `InputBridge.request_input(prompt, timeout=600)` blocks the sync auth thread on a
   `threading.Event` until `submit_response()` or `cancel()` fires.
 - A timeout raises `TimeoutError` and marks the remote session `FAILED`.
+- A prompt after authentication (in `get_titles()`, `get_tracks()` or licensing) raises
+  `RuntimeError` at once. The client polls for prompts only during authentication, so
+  no answer can come.
 - `AUTH_INPUT_TIMEOUT = 600.0` seconds. This is also the TTL granted to
   `AUTHENTICATING` / `PENDING_INPUT` sessions in the store.
 
@@ -507,9 +525,18 @@ Source: `unshackle/core/remote_service.py`. This is the canonical consumer of th
 remote session API and a good template for any client.
 
 - **`RemoteClient.request`** sets `X-Secret-Key` and `User-Agent: unshackle/<version>`,
-  uses a 120s timeout for `POST` and 30s for `GET`/`DELETE`, and treats any
-  `status_code >= 400` as fatal: it logs `Server error [<error_code>]: <message>`
-  and raises `SystemExit(1)`.
+  uses the server's `timeout` from `remote_services` (default 120s) as the read timeout,
+  and treats any `status_code >= 400` as fatal: it logs `Server error [<error_code>]: <message>`
+  and raises `SystemExit(1)`. A `200` body with `"status": "error"` is also fatal (see
+  the heartbeat below).
+- **Heartbeat.** The `titles`, `tracks` and `license` routes send a newline every 30s while
+  the service works. The read timeout starts again at each byte, so a slow request stays
+  open for as long as the server works on it, and a reverse proxy does not close it as
+  idle. A route that answers within 30s sends the usual response. After 30s the status
+  is already `200`, so a failure after that time arrives as the usual error body with
+  status `200`. Your client must check `status` in the body. JSON parsers ignore the
+  leading newlines. The server does not gzip-compress a heartbeat response, because gzip
+  output cannot start before the body is ready.
 - **Retries.** The download-side HTTP session mounts an adapter with
   `Retry(total=5, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504])`.
 - **Flow.** `authenticate()` → `create` (+ poll `prompt` every 2s up to a 600s

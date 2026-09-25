@@ -612,6 +612,106 @@ def server_cdm_allowed(request: Optional[web.Request] = None, service: Optional[
     return bool(allowed)
 
 
+def is_whole_number(value: Any) -> bool:
+    """True for a non-negative int that is not a bool."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def server_cdm_max_height_error(where: str, value: Any) -> Optional[str]:
+    """Why *value* cannot serve as ``server_cdm_max_height``, or None when it can (unset included)."""
+
+    def bad(height: Any) -> bool:
+        return height is not None and not is_whole_number(height)
+
+    if isinstance(value, dict):
+        if any(bad(height) for height in value.values()):
+            return f"{where}.server_cdm_max_height values must be whole numbers of pixels, not {value!r}"
+        return None
+    if bad(value):
+        return (
+            f"{where}.server_cdm_max_height must be a whole number of pixels or a map of service to one, not {value!r}"
+        )
+    return None
+
+
+def server_cdm_max_height(request: Optional[web.Request], service: Optional[str]) -> Optional[int]:
+    """The tallest video track the server CDM licenses live for this API key on ``service``; None for no cap.
+
+    The setting is one height, or a map of service tag to height where ``default`` covers a missing or null tag.
+    """
+    if not request:
+        return None
+    cap = serve_user_config(request_secret_key(request) or "").get("server_cdm_max_height")
+    if isinstance(cap, dict):
+        own = ci_get(cap, Services.get_tag(service)) if service else None
+        cap = own if own is not None else ci_get(cap, "default")
+    return cap if is_whole_number(cap) else None
+
+
+def capped_error(message: str, cap: Optional[int] = None) -> APIError:
+    """The SERVER_CDM_CAPPED refusal; a client reads ``details`` to license the track itself."""
+    details = {"reason": "server_cdm_max_height", "max_height": cap} if cap is not None else {"reason": "client_device"}
+    return APIError(APIErrorCode.SERVER_CDM_CAPPED, message, details=details)
+
+
+def requested_height(quality: Any) -> Optional[int]:
+    """The tallest height a client asked for with ``-q``; None when it asked for the best there is."""
+    from unshackle.core.utils.click_types import QUALITY_LIST
+
+    try:
+        heights = QUALITY_LIST.convert(quality)
+    except click.BadParameter as e:
+        raise APIError(APIErrorCode.INVALID_INPUT, f"quality: {e.message}")
+    if any(height <= 0 for height in heights):
+        raise APIError(APIErrorCode.INVALID_INPUT, f"quality: every height must be above 0, not {quality!r}")
+    return max(heights) if heights else None
+
+
+def choose_session_cdm(
+    request: Optional[web.Request], service: str, data: Dict[str, Any]
+) -> tuple[bool, Optional[int]]:
+    """``(server_cdm, max_height)`` for a new remote session.
+
+    The service picks its manifest from the CDM it sees, so it decides once, before any tracks.
+    When ``-q`` asks for more than the cap, the client's own device licenses, and a client with no device gets a refusal.
+    """
+    if not server_cdm_allowed(request, service):
+        return False, None
+    cap = server_cdm_max_height(request, service)
+    wanted = requested_height(data.get("quality"))
+    if cap is None or wanted is None or wanted <= cap:
+        return True, cap
+    if data.get("cdm_type"):
+        return False, cap
+    raise capped_error(
+        f"The server CDM licenses {service} up to {cap}p for this API key. "
+        f"Set up a local CDM to license {wanted}p with your own device, or pass -q {cap}.",
+        cap,
+    )
+
+
+def live_licence_refusal(session: Any, track: Any) -> Optional[APIError]:
+    """Why the server CDM must not make a live licence for ``track`` in ``session``; None when it may.
+
+    Only a live licence spends the server's device, so a vault hit always passes. A track measures as the
+    smallest ``-q`` that selects it: the lower of its height and the 16:9 height of its width.
+    """
+    if getattr(session, "server_cdm", None) is False:
+        return capped_error("This session licenses with your own device, so the server CDM makes no licence for it.")
+    cap = getattr(session, "server_cdm_max_height", None)
+    height = getattr(track, "height", None) if isinstance(track, Video) else None
+    width = getattr(track, "width", None) if isinstance(track, Video) else None
+    measures = [m for m in (height, int(width * 9 / 16) if width else None) if m]
+    height = min(measures) if measures else None
+    # ponytail: a track with no size passes; a parser that fills sizes in closes that gap
+    if cap is None or not height or height <= cap:
+        return None
+    return capped_error(
+        f"The server CDM licenses up to {cap}p for this API key; license this {height}p track with your own device.",
+        cap,
+    )
+
+
 _account_counters: Dict[str, int] = {}
 
 
@@ -1830,13 +1930,44 @@ def enforce_download_gates(params: Dict[str, Any], request: Optional[web.Request
     ``server_cdm`` cannot submit or retry jobs. A job can also spend the server's proxy providers,
     through an explicit ``proxy`` country code or through the geofence auto-proxy, so the
     ``server_proxy`` policy from :func:`resolve_handler_proxy` applies here too: without the opt-in
-    the job must carry a full proxy URI or no proxy at all.
+    the job must carry a full proxy URI or no proxy at all. Under a ``server_cdm_max_height`` the job
+    must set a quality at or under it, no ``best_available`` and no HYBRID range, as a job has no client device
+    to fall back to. Pass the job's merged parameters, so the gate sees the values the job runs with.
     """
     if not server_cdm_allowed(request, params.get("service")):
         raise APIError(
             APIErrorCode.FORBIDDEN,
             "Download jobs license with the server CDM, which is not enabled for this key on this service.",
         )
+    cap = server_cdm_max_height(request, params.get("service"))
+    if cap is not None:
+        serve_defaults = config.serve or {}
+
+        def effective(key: str) -> Any:
+            """The job's own value for this parameter, or the ``serve:`` dl default that the job falls back to."""
+            return params[key] if key in params else serve_defaults.get(key)
+
+        wanted = requested_height(effective("quality"))
+        if wanted is None or wanted > cap:
+            raise capped_error(
+                f"Download jobs license with the server CDM, which covers up to {cap}p for this API key. "
+                f"Pass a quality of {cap} or lower.",
+                cap,
+            )
+        if effective("best_available"):
+            raise capped_error(
+                f"Download jobs license with the server CDM, which covers up to {cap}p for this API key. "
+                "Turn off best_available, because it can fall back to a track above that height.",
+                cap,
+            )
+        ranges = effective("range") or []
+        ranges = [ranges] if isinstance(ranges, str) else ranges
+        if any(str(getattr(r, "value", r)).upper() == "HYBRID" for r in ranges):
+            raise capped_error(
+                f"Download jobs license with the server CDM, which covers up to {cap}p for this API key. "
+                "Remove HYBRID from range, because it always keeps the lowest DV track, whatever the quality.",
+                cap,
+            )
 
     if params.get("proxy_download") is not None and not isinstance(params["proxy_download"], str):
         raise APIError(APIErrorCode.INVALID_INPUT, "proxy_download must be a string.")
@@ -1894,8 +2025,6 @@ async def download_handler(data: Dict[str, Any], request: Optional[web.Request] 
             details={"service": normalized_service, "title_id": title_id},
         )
 
-    await asyncio.to_thread(enforce_download_gates, data, request)
-
     try:
         service_module = Services.load(normalized_service)
         service_specific_defaults = {}
@@ -1907,9 +2036,6 @@ async def download_handler(data: Dict[str, Any], request: Optional[web.Request] 
             for param in service_module.cli.params:
                 if hasattr(param, "name") and param.default is not None and not isinstance(param.default, enum.Enum):
                     service_specific_defaults[param.name] = param.default
-
-        manager = get_download_manager()
-        await manager.start_workers()
 
         filtered_params = {k: v for k, v in data.items() if k not in ["service", "title_id"]}
         # Overlay any dl-relevant keys from `serve:` config (e.g. downloads, workers) so the API
@@ -1923,6 +2049,10 @@ async def download_handler(data: Dict[str, Any], request: Optional[web.Request] 
             **service_specific_defaults,
             **filtered_params,
         }
+        await asyncio.to_thread(enforce_download_gates, {**params_with_defaults, "service": service_tag}, request)
+
+        manager = get_download_manager()
+        await manager.start_workers()
         # The download worker reads this to decide whether dl may load the server's proxy
         # providers. Always stamped server-side so a client-sent value cannot grant it.
         params_with_defaults["server_proxy"] = server_proxy_allowed(request)
@@ -2107,6 +2237,24 @@ async def download_job_events_handler(job_id: str, request: web.Request) -> web.
     return response
 
 
+def configured_service_tags() -> List[str]:
+    """The installed services this server names in its config, for the dashboard.
+
+    The global ``serve.services`` list, else the union of every ``serve.users`` key's ``services``, else every
+    installed service. An API key with no ``services`` list does not widen the union, and a malformed entry is skipped.
+    """
+    tags = Services.get_tags()
+    allowed = allowed_services_for_key(None)
+    if allowed is None:
+        users = config.serve.get("users")
+        lists = [u.get("services") for u in users.values() if isinstance(u, dict)] if isinstance(users, dict) else []
+        allowed = [Services.get_tag(s) for lst in lists if isinstance(lst, list) for s in lst if isinstance(s, str)]
+    if not allowed:
+        return tags
+    named = set(allowed)
+    return [tag for tag in tags if tag in named]
+
+
 async def dashboard_status_handler(request: web.Request) -> web.Response:
     """Server-wide stats for the developer dashboard."""
     from unshackle.core.api.download_manager import get_download_manager
@@ -2118,7 +2266,7 @@ async def dashboard_status_handler(request: web.Request) -> web.Response:
     return web.json_response(
         {
             **stats.to_dict(),
-            "services": len(Services.get_tags()),
+            "services": len(configured_service_tags()),
             "sessions": store.session_count,
             "max_sessions": store.max_sessions,
             "session_ttl": store.ttl,
@@ -2202,6 +2350,7 @@ async def dashboard_keys_handler(request: web.Request) -> web.Response:
             "label": mask_key(secret_key),
             "services": allowed_services_for_key(secret_key) if api_access else [],
             "server_cdm": user_grant(secret_key, "server_cdm") if api_access else False,
+            "server_cdm_max_height": serve_user_config(secret_key).get("server_cdm_max_height") if api_access else None,
             "server_accounts": user_grant(secret_key, "server_accounts") if api_access else False,
             "server_proxy": user_grant(secret_key, "server_proxy") is True if api_access else False,
             "tier": key_tier(secret_key),
@@ -2238,10 +2387,7 @@ def user_grant(secret_key: str, name: str) -> Any:
 
 
 async def dashboard_services_handler(request: web.Request) -> web.Response:
-    """Every discovered service and its load state, including the ones that failed to import.
-
-    Not allowlist-filtered: an operator needs to see the services their keys cannot reach.
-    """
+    """Every service configured on this server, or every installed one with ``?all=1``, and its load state."""
     from unshackle.core import services as services_module
     from unshackle.core.api.download_manager import TERMINAL_STATUSES, get_download_manager
     from unshackle.core.api.session_store import get_session_store
@@ -2252,8 +2398,9 @@ async def dashboard_services_handler(request: web.Request) -> web.Response:
     errors = {err.split(":", 1)[0]: err for err in services_module.LOAD_ERRORS if ":" in err}
     staged_commits: Dict[Any, Optional[str]] = {}
 
+    tags = Services.get_tags() if request.query.get("all") == "1" else configured_service_tags()
     rows = []
-    for tag in Services.get_tags():
+    for tag in tags:
         error = errors.get(tag)
         staged = tag in services_module.PENDING
         row: Dict[str, Any] = {
@@ -2973,6 +3120,7 @@ SESSION_TRANSPORT_KEYS = {
     "client_region",
     "proxy_region",
     "cdm_type",
+    "cdm_security_level",
     "range_",
     "vcodec",
     "quality",
@@ -3027,8 +3175,11 @@ def create_service_instance(
     profile: Optional[str],
     server_account: bool = False,
     server_cdm: bool = False,
+    client_device: bool = False,
 ) -> Any:
     """Make a service instance and resolve its credentials and cookies.
+
+    With ``client_device`` the service sees a stand-in with the client's DRM system and security level.
 
     With ``server_account`` the service takes the server's own credential and cookie file for
     ``profile`` and drops anything the client sent. Otherwise only client-sent data counts: a
@@ -3040,7 +3191,12 @@ def create_service_instance(
     from unshackle.core.tracks import Video
 
     service_config = load_service_yaml(normalized_service)
-    cdm = load_full_cdm(normalized_service, profile, None if server_cdm else data.get("cdm_type"))
+    cdm: Any
+    if client_device:
+        level = data.get("cdm_security_level")
+        cdm = cdm_type_stub(str(data.get("cdm_type")), level if is_whole_number(level) else None)
+    else:
+        cdm = load_full_cdm(normalized_service, profile, None if server_cdm else data.get("cdm_type"))
 
     # Reconstruct enum track-selection params from client data so service code that reads
     # ctx.parent.params (Service.__init__ proxy/range/vcodec/best_available block) sees enums.
@@ -3146,6 +3302,8 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
             profile = next_server_profile(normalized_service, region)
             log.info(f"Using server account '{sanitize_log(profile or 'default')}' for {normalized_service}")
 
+        use_server_cdm, max_height = choose_session_cdm(request, normalized_service, data)
+        client_device = max_height is not None and not use_server_cdm
         log_buffer = None if server_account else SessionLogBuffer()
         service_class_name = getattr(Services.load(normalized_service), "__name__", normalized_service)
 
@@ -3159,7 +3317,8 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
                     proxy_providers,
                     profile,
                     server_account=server_account,
-                    server_cdm=server_cdm_allowed(request, normalized_service),
+                    server_cdm=use_server_cdm,
+                    client_device=client_device,
                 )
 
         service_instance, cookies, credential = await asyncio.to_thread(build_service)
@@ -3189,6 +3348,8 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
             server_account=(profile or "default") if server_account else None,
         )
         session.cache_tag = session_cache_tag
+        session.server_cdm = use_server_cdm
+        session.server_cdm_max_height = max_height
         session.client_auth = not server_account and (
             cookies is not None or credential is not None or bool(cache_data and session_cache_tag)
         )
@@ -3223,6 +3384,8 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
                 "service": normalized_service,
                 "status": "authenticating",
                 "server_account": server_account,
+                "server_cdm": use_server_cdm,
+                "server_cdm_max_height": max_height,
             }
         )
 
@@ -3251,7 +3414,10 @@ async def session_titles_handler(session_id: str, request: Optional[web.Request]
     try:
         service_instance = session.service_instance
         async with session.lock:
-            titles = await asyncio.to_thread(service_instance.get_titles)
+            try:
+                titles = await asyncio.to_thread(service_instance.get_titles)
+            finally:
+                session.touch()
         session.titles = titles
 
         if hasattr(titles, "__iter__") and not isinstance(titles, str):
@@ -3354,7 +3520,10 @@ async def session_tracks_handler(
     try:
         service_instance = session.service_instance
         async with session.lock:
-            tracks = await asyncio.to_thread(service_instance.get_tracks, title)
+            try:
+                tracks = await asyncio.to_thread(service_instance.get_tracks, title)
+            finally:
+                session.touch()
 
             title_tracks: Dict[str, Any] = {}
             for track in tracks.videos:
@@ -3436,7 +3605,7 @@ async def session_tracks_handler(
                 "track_manifests": track_manifests,
                 "session_headers": session_headers,
                 "session_cookies": session_cookies,
-                "server_cdm": server_cdm_allowed(request, service_tag),
+                "server_cdm": session.server_cdm,
                 "server_cdm_type": server_cdm_type,
             }
         )
@@ -3742,7 +3911,7 @@ def resolve_handler_proxy(
 
     if (
         proxy_param
-        and re.match(r"^(https?://|socks)", str(proxy_param))
+        and re.match(r"^(https?://|socks|controld://)", str(proxy_param))
         and server_account_for(request, normalized_service)
     ):
         raise APIError(
@@ -4188,11 +4357,13 @@ def handle_single_server_cdm(
     drm_type: str,
     request: Optional[web.Request],
     sources: Optional[Dict[str, str]] = None,
+    refusal: Optional[APIError] = None,
 ) -> Dict[str, str]:
     """Do the single-track server_cdm licensing with the DRM class get_content_keys() flow.
 
     ``sources`` is filled with the vault name for every returned content key a server vault
-    supplied. A content key the CDM licensed gets no entry.
+    supplied. A content key the CDM licensed gets no entry. It raises ``refusal`` before a live licence:
+    after a Widevine vault miss, or at once for PlayReady, whose licence can carry keys its header does not name.
     """
     import base64
 
@@ -4224,6 +4395,9 @@ def handle_single_server_cdm(
         # Gate on the caller's CDM device first: no device, no keys from the vault or CDM.
         device_name = resolve_device_name(user_config, drm_type, service.__class__.__name__)
 
+        if refusal:
+            raise refusal
+
         cdm = load_cdm(device_name, service_name=service.__class__.__name__)
         if not is_playready_cdm(cdm):
             raise APIError(APIErrorCode.INVALID_INPUT, f"CDM device '{device_name}' is not a PlayReady device")
@@ -4254,6 +4428,8 @@ def handle_single_server_cdm(
             if sources is not None:
                 sources.update(vault_sources)
             return vault_keys
+        if refusal:
+            raise refusal
 
         cdm = load_cdm(device_name, service_name=service.__class__.__name__)
         if not is_widevine_cdm(cdm):
@@ -4307,14 +4483,14 @@ def handle_proxy_license(
     # Surface it as a structured licence error, not an uncaught 500 the edge turns into a 502.
     try:
         if drm_type == "widevine":
-            license_response = service.get_widevine_license(
+            license_blob = service.get_widevine_license(
                 **declared_kwargs(
                     service.get_widevine_license, {"challenge": challenge_bytes, "title": title, "track": track}
                 )
             )
         else:
             challenge_str = challenge_bytes.decode("utf-8", errors="replace")
-            license_response = service.get_playready_license(
+            license_blob = service.get_playready_license(
                 **declared_kwargs(
                     service.get_playready_license, {"challenge": challenge_str, "title": title, "track": track}
                 )
@@ -4325,10 +4501,10 @@ def handle_proxy_license(
         log.exception(f"{sanitize_log(drm_type)} licence request failed for the proxied challenge")
         raise APIError(APIErrorCode.SERVICE_ERROR, f"Licence request failed: {exc}") from None
 
-    if isinstance(license_response, str):
-        license_response = license_response.encode("utf-8")
+    if isinstance(license_blob, str):
+        license_blob = license_blob.encode("utf-8")
 
-    return web.json_response({"license": base64.b64encode(license_response).decode("ascii")})
+    return web.json_response({"license": base64.b64encode(license_blob).decode("ascii")})
 
 
 async def session_segment_filter_handler(
@@ -4358,7 +4534,7 @@ async def session_segment_filter_handler(
     if not callable(segment_filter) or not getattr(track, "url", None):
         return web.json_response({"unwanted": None})
 
-    try:
+    def unwanted_segments() -> list[str]:
         import m3u8
         import requests
 
@@ -4368,7 +4544,11 @@ async def session_segment_filter_handler(
         if isinstance(response, requests.Response):
             response.encoding = response.encoding or "utf-8"
         playlist = m3u8.loads(response.text, uri=str(track.url))
-        unwanted = [segment.absolute_uri for segment in playlist.segments if segment_filter(segment)]
+        return [segment.absolute_uri for segment in playlist.segments if segment_filter(segment)]
+
+    try:
+        async with session.lock:
+            unwanted = await asyncio.to_thread(unwanted_segments)
     except (Exception, SystemExit):
         # `from None`: a debug-mode traceback would otherwise carry the service's exception chain
         log.exception(f"Error running the segment filter for track {sanitize_log(str(track_id))}")
@@ -4393,6 +4573,14 @@ async def session_license_handler(
     session = await get_validated_session(session_id, request)
     require_authenticated(session)
 
+    async with session.lock:
+        return await asyncio.to_thread(license_response, data, session, session_id, request)
+
+
+def license_response(
+    data: Dict[str, Any], session: Any, session_id: str, request: Optional[web.Request]
+) -> web.Response:
+    """The licence response for :func:`session_license_handler`, made on a worker thread."""
     track_id = data.get("track_id")
     track_ids = data.get("track_ids")
     challenge_b64 = data.get("challenge")
@@ -4419,6 +4607,7 @@ async def session_license_handler(
         sources_by_pssh: Dict[tuple, Dict[str, str]] = {}
         drm_type_by_pssh: Dict[tuple, str] = {}
         actual_drm_type: Optional[str] = None
+        capped_tracks: Dict[str, Dict[str, Any]] = {}
 
         def pssh_set(track: Any) -> tuple:
             """Every PSSH and KID the track carries, as the rest of the cache key.
@@ -4446,7 +4635,11 @@ async def session_license_handler(
         def license_track(
             track: Any, title: Any, candidates: list
         ) -> tuple[Dict[str, str], Optional[str], Optional[str]]:
-            """`(keys, drm_type, pssh)` for the track's current DRM, licensing once per unique PSSH."""
+            """`(keys, drm_type, pssh)` for the track's current DRM, licensing once per unique PSSH.
+
+            A track the server must not license live goes into ``capped_tracks`` with no keys, and its PSSH
+            stays uncached, as a track under the cap can share it.
+            """
             picked = pick_server_pssh(track, candidates)
             if not picked:
                 warn(f"No PSSH on track {sanitize_log(str(track.id)[:12])} for {', '.join(candidates) or 'any CDM'}")
@@ -4459,7 +4652,14 @@ async def session_license_handler(
                 sources_by_pssh[cache_key] = {}
                 try:
                     keys = handle_single_server_cdm(
-                        service, title, track, pssh_str, candidate, request, sources_by_pssh[cache_key]
+                        service,
+                        title,
+                        track,
+                        pssh_str,
+                        candidate,
+                        request,
+                        sources_by_pssh[cache_key],
+                        live_licence_refusal(session, track),
                     )
                     if keys:
                         keys_by_pssh[cache_key] = keys
@@ -4467,6 +4667,10 @@ async def session_license_handler(
                 except SystemExit:
                     warn(f"Service exited while resolving keys for track {sanitize_log(str(track.id)[:12])}, skipping")
                 except (Exception, SystemExit) as e:
+                    if isinstance(e, APIError) and e.error_code is APIErrorCode.SERVER_CDM_CAPPED:
+                        del keys_by_pssh[cache_key], sources_by_pssh[cache_key]
+                        capped_tracks[str(track.id)] = e.details
+                        return {}, None, pssh_str
                     warn(f"Failed to resolve keys for track {sanitize_log(str(track.id)[:12])}: {redact_all(str(e))}")
             return keys_by_pssh[cache_key], drm_type_by_pssh.get(cache_key), pssh_str
 
@@ -4487,6 +4691,8 @@ async def session_license_handler(
             candidates = server_drm_candidates(service_tag, user_config, drm_type, track, warn)
 
             keys, track_drm_type, pssh_str = license_track(track, title, candidates)
+            # a refused track still tries its init segment PSSH, where a server vault can hold the key
+            refusal = capped_tracks.pop(tid, None)
 
             track_kid = None
             if init_data:
@@ -4498,6 +4704,7 @@ async def session_license_handler(
                 manifest_drm = track.drm
                 track.drm = drm_from_init_segment(track, init_data=init_data) or manifest_drm
                 init_keys, init_drm_type, init_pssh = license_track(track, title, candidates)
+                init_refusal = capped_tracks.pop(tid, None)
                 if init_pssh != pssh_str:
                     log.info(
                         f"The manifest PSSH gave no content key for KID {track_kid.hex} of track "
@@ -4505,9 +4712,15 @@ async def session_license_handler(
                     )
                 if track_kid.hex in init_keys:
                     keys, track_drm_type, pssh_str = init_keys, init_drm_type, init_pssh
+                    refusal = None
                 else:
                     track.drm = manifest_drm
-                    warn(f"No content key for KID {track_kid.hex} of track {sanitize_log(tid[:12])}")
+                    refusal = refusal or init_refusal
+                    if not refusal:
+                        warn(f"No content key for KID {track_kid.hex} of track {sanitize_log(tid[:12])}")
+            if refusal:
+                capped_tracks[tid] = refusal
+                continue
 
             if keys:
                 all_keys[tid] = keys
@@ -4528,6 +4741,8 @@ async def session_license_handler(
             response["drm_type"] = actual_drm_type
         if drm_types:
             response["drm_types"] = drm_types
+        if capped_tracks:
+            response["capped_tracks"] = capped_tracks
         return web.json_response(response)
 
     if not track_id:
@@ -4573,7 +4788,14 @@ async def session_license_handler(
                     track.pr_pssh = pssh_b64
             key_sources: Dict[str, str] = {}
             keys = handle_single_server_cdm(
-                service, title, track, pssh_b64 or server_pssh, server_drm_type, request, key_sources
+                service,
+                title,
+                track,
+                pssh_b64 or server_pssh,
+                server_drm_type,
+                request,
+                key_sources,
+                live_licence_refusal(session, track),
             )
             log.info(f"Server CDM resolved {len(keys)} key(s) for track {sanitize_log(track_id[:12])}")
             note_served_keys(session, keys, key_sources)

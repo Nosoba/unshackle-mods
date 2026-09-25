@@ -722,12 +722,14 @@ unshackle dl --tag MYGRP --repack EXAMPLE 81234567
 
 ## Proxies
 
-`--proxy` accepts a full proxy URI, a 2-letter country code (resolved through your
-configured proxy providers), or a `provider:region` form.
+`--proxy` accepts a full proxy URI, a country or location code (resolved through your
+configured proxy providers), or a `provider:region` form. See
+[Proxies & VPN](proxies-and-vpn.md#how-proxy-resolution-works) for the exact grammar.
 
 ```shell title="Proxy forms"
 unshackle dl --proxy us EXAMPLE 81234567
 unshackle dl --proxy nordvpn:ca EXAMPLE 81234567
+unshackle dl --proxy controld:yul EXAMPLE 81234567
 unshackle dl --proxy 'http://user:pass@host:8080' EXAMPLE 81234567
 ```
 
@@ -776,13 +778,59 @@ a content key when the vault misses. You can force one side or the other:
 unshackle dl --skip-dl EXAMPLE 81234567
 ```
 
-`--export` writes a JSON file, into the configured exports directory, containing track
-info and the acquired content keys for each title. This is the format consumed by
-`unshackle import` to reconstruct a download later.
+`--export` writes a `mediaexport` JSON file into the configured exports directory. It holds
+the manifest, the DRM init data, the content keys, the KIDs of each track and the title
+metadata for each title. `unshackle import` reads it to reconstruct a download later, and gives
+each track only the content keys for its KIDs. The importer also reads the
+older unshackle `version: 2` files and unidl's own export files.
 
 ```shell title="Export track info and keys"
 unshackle dl --skip-dl --export EXAMPLE 81234567
 ```
+
+The file name tells what the file holds, in the form
+`{title}.{scope}.{resolutions}.{codecs}.{ranges}.{manifests}.{audio}-{SERVICE}.json`:
+
+| Export | File name |
+|---|---|
+| A movie | `Example.Movie.2024.1080p.h264.sdr.hls.aac2.0-EXAMPLE.json` |
+| A whole season | `Example.Show.S01.2160p.h265.sdr.hdr10.dash.dd5.1-EXAMPLE.json` |
+| Episodes 5 to 9 and 12 | `Example.Show.S01E05-E09.S01E12.1080p.h264.sdr.dash.aac2.0-EXAMPLE.json` |
+
+- A dot separates each part and each word of the title. The name has no spaces or
+  underscores. It does not follow your `output_template`: a template with spaces does not
+  change the export name.
+- The scope is `S01` only when the file holds every episode the service lists for that season.
+  Otherwise it names each run of episodes. Whole seasons in a row become `S01-S03`. After three
+  parts, `+N` counts the parts left out. A movie has no scope.
+- The quality parts come from the video and audio tracks selected for the titles in the file.
+  Each value shows once.
+- unshackle renames the file after each write, so the name always matches what the file holds.
+  When a run stops early, the file is complete for the titles it holds.
+- When another file already has the name, unshackle adds `-2`, `-3`, and so on. It never
+  writes over another export.
+
+The run logs the file name at the first write, the track and content key counts for each title, and
+at the end the path and the total counts.
+
+The export holds a content key for each track your flags selected and no others. To make a
+file another person can use, select generously: for example `-a AAC,EC3` and every language
+you want them to have. An import can only pick tracks whose key is in the file. A track
+that another tool exported as a direct file URL is added next to the manifest's own tracks.
+An export with no manifest, for example a unidl export of whole media files, gets all of its
+tracks from those URLs. If such an export does not give the title a language, `orig` has no
+value: select the languages with `-l` and `-vl`.
+
+An import uses only the content keys in the file and in your vaults. It never gets a licence
+from a CDM. When a track needs a content key that neither has, the import stops and names the
+KID. To fix this, export the title again with that track selected.
+
+!!! warning "The export file is a secret"
+    It holds the content keys and usually a signed manifest URL. Hand it over on purpose,
+    not by accident.
+
+The [mediaexport](https://github.com/unshackle-dl/mediaexport) package specifies the
+`mediaexport` format and is the reader and writer unshackle uses.
 
 !!! note "Region is recorded only with a proxy"
     When you use `--proxy`, the export records the region so an import can reproduce the
@@ -794,6 +842,10 @@ unshackle dl --skip-dl --export EXAMPLE 81234567
     back to the title's original language, which comes from `Title.language` on the exporting
     service. If a service never sets it, importing that export fails with a message naming
     the service. Neither end guesses a language for you, so the fix belongs in the service.
+
+    An HLS master playlist gives no language for a video track. When the export gives no
+    title language, the video track takes the language of the default audio track. When
+    the master playlist gives no audio language either, the import stops with a message.
 
 ## Metadata and tagging
 

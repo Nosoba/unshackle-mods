@@ -83,7 +83,7 @@ auth tokens in localStorage rather than in HTTP cookies need. Extraction is read
 Definitions of remote unshackle service servers, used by the `--remote` mode. Each entry is
 named by you (pick it with `--server`, or do not write that flag when you configure only one) and gives
 the server's `url` (required), an optional `api_key`, an optional `auth_headers` list, an
-optional `server_cdm` boolean, and an optional `services` sub-dict of per-service local
+optional `server_cdm` boolean, an optional `timeout` in seconds, and an optional `services` sub-dict of per-service local
 overrides such as `title_map`.
 
 Leave `server_cdm` unset and the client follows the server: it uses the server CDM for each
@@ -96,6 +96,12 @@ first name. If the server answers `401`, it retries the same request with the ne
 keeps the one that works for the rest of the HTTP session. Names you give keep your spelling and
 are not repeated in the fallbacks, so unshackle tries
 `auth_headers: ["Authorization", "x-secret-key"]` as `Authorization`, `x-secret-key`, `X-Api-Key`.
+
+`timeout` is the time in seconds that the client waits for data from the server. The
+default is `120`. The server sends a heartbeat every 30 seconds while it gets titles, tracks
+or licences, so a slow service does not cause a timeout. Increase `timeout` only when the
+server runs an older version that sends no heartbeat. Give a number of seconds. With a
+value below 30 the client can time out before the first heartbeat. `0` means the default.
 
 In `--remote` mode unshackle turns the server's service list into synthetic CLI
 commands that operate against it, falling back to the tags in that `services` sub-dict when
@@ -147,6 +153,32 @@ client configured with `server_cdm: true` to license with its own local CDM inst
 client that asks anyway gets a `FORBIDDEN` error. Because a download job always licenses with the server's CDM,
 an API key without `server_cdm` for that service also cannot submit or retry `/api/download`
 jobs. Keys that have no `users` entry, such as `api_secret`, keep server CDM access.
+
+`server_cdm_max_height` limits the live licences the server's device makes for that API key.
+Set it to a height in pixels for every service, or to a map of service tag to height with an
+optional `default` entry. A service the map does not name or sets to `null` gets the `default`, and
+with no `default` it has no limit. The server compares the limit with the lowest `-q` that selects
+the track: the track height, or the 16:9 height from the width when that is lower. The server reads
+the remote client's `-q` when the remote session starts:
+
+- With no `-q`, or a `-q` at or below the limit, the server CDM licenses the remote session. The server
+  refuses a live licence for a video track taller than the limit, and the client licenses that
+  track with its own local CDM.
+- With a `-q` above the limit, the client's own local CDM licenses every track of the remote session.
+  The service sees the DRM system and security level of the client's device. A client with no
+  local CDM gets a `SERVER_CDM_CAPPED` error.
+- A download job must pass a `quality` at or below the limit, and must not set `best_available` or
+  a `HYBRID` range. `HYBRID` always keeps the lowest Dolby Vision track, at any quality. A job with
+  no `quality`, with a higher one, with `best_available`, or with `HYBRID` gets a `SERVER_CDM_CAPPED`
+  error. The server checks the values the job runs with, after it applies the service defaults
+  and the `serve:` download defaults.
+
+The limit protects the server's device, not the content keys. For a Widevine track, a server vault
+still supplies a content key at every height. A PlayReady track never reads the vault, so above
+the limit it always goes to the client's device. A licence for a lower track can carry the
+content key of a higher track when the service shares one content key between them. With server
+accounts enabled, a client that reports a stronger device than it holds makes the server's
+account request those manifests; the licence server still refuses its challenge.
 
 `admin` is a boolean that lets the API key run the maintenance endpoints (clear-cache, clear-temp, refresh-services). It is `false` unless the entry sets it. Keys that have no `users` entry, such as `api_secret`, keep that access.
 
@@ -236,6 +268,7 @@ serve:
       tier: bot                   # 600 requests/hour; 429 with Retry-After once over
     e5f6a7b8:
       server_cdm: true            # this key may have the server do the licensing
+      server_cdm_max_height: 1080 # above 1080p the client licenses with its own device
     c9d0e1f2:
       services: [EXAMPLE1, EXAMPLE2]
       server_cdm: [EXAMPLE1]      # the server licenses only EXAMPLE1; EXAMPLE2 needs a local CDM

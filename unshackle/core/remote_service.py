@@ -25,6 +25,7 @@ from uuid import UUID
 
 import click
 import requests
+import urllib3
 from langcodes import Language
 from requests.adapters import HTTPAdapter, Retry
 from rich.padding import Padding
@@ -61,8 +62,15 @@ def redact_secrets(text: str, data: Optional[Dict[str, Any]] = None) -> str:
 class RemoteClient:
     """HTTP client for the unshackle serve API."""
 
-    def __init__(self, server_url: str, api_key: str, auth_headers: Optional[list[str]] = None) -> None:
+    def __init__(
+        self,
+        server_url: str,
+        api_key: str,
+        auth_headers: Optional[list[str]] = None,
+        timeout: Optional[float] = None,
+    ) -> None:
         self.server_url = server_url.rstrip("/")
+        self.timeout = timeout or 120
         self.api_key = api_key
         self.auth_headers = list(auth_headers) if auth_headers else list(DEFAULT_AUTH_HEADERS)
         self._auth_header_index = 0
@@ -90,39 +98,61 @@ class RemoteClient:
         return True
 
     def request(
-        self, method: str, endpoint: str, data: Optional[Dict[str, Any]] = None, optional: bool = False
+        self,
+        method: str,
+        endpoint: str,
+        data: Optional[Dict[str, Any]] = None,
+        optional: bool = False,
+        expect: tuple[str, ...] = (),
     ) -> Dict[str, Any]:
+        """Send one request and return its JSON body; an error outside ``expect`` exits, one inside it returns."""
         url = f"{self.server_url}{endpoint}"
         while True:
             try:
-                resp = getattr(self.session, method)(url, json=data, timeout=120)
-            except requests.ConnectionError:
+                resp = getattr(self.session, method)(url, json=data, timeout=self.timeout)
+            except requests.ConnectionError as e:
+                if isinstance(e.args[0] if e.args else None, urllib3.exceptions.ReadTimeoutError):
+                    log.error(
+                        f"Request to remote server timed out after {self.timeout}s: {endpoint}. "
+                        "Raise 'timeout' for this server in remote_services."
+                    )
+                    raise SystemExit(1)
                 server_url = safe_display_url(self.server_url)
                 log.error(f"Could not connect to remote server at {server_url}. Is it running? (unshackle serve)")
                 raise SystemExit(1)
             except requests.Timeout:
-                log.error(f"Request to remote server timed out: {endpoint}")
+                log.error(
+                    f"Request to remote server timed out after {self.timeout}s: {endpoint}. "
+                    "Raise 'timeout' for this server in remote_services."
+                )
                 raise SystemExit(1)
             # servers differ on which header carries the key, so retry the rest before giving up
             if resp.status_code == 401 and self.next_auth_header():
                 continue
             break
-        if resp.status_code >= 400:
-            try:
-                detail = resp.json()
-            except ValueError:
-                detail = {}
-            error_msg = redact_secrets(str(detail.get("message", resp.text)), data)
+        try:
+            detail = resp.json()
+        except ValueError:
+            if resp.status_code < 400:
+                raise
+            detail = {}
+        late_error = isinstance(detail, dict) and detail.get("status") == "error" and "error_code" in detail
+        if resp.status_code >= 400 or late_error:
+            page_title = re.search(r"<title>(.*?)</title>", resp.text, re.S) if not detail else None
+            fallback = f"HTTP {resp.status_code}: {page_title.group(1).strip()}" if page_title else resp.text
+            error_msg = redact_secrets(str(detail.get("message", fallback)), data)
             error_code = detail.get("error_code", "UNKNOWN")
+            if error_code in expect:
+                return detail
             if optional:
                 log.debug(f"Optional endpoint {endpoint} unavailable [{error_code}]: {error_msg}")
                 return {}
             log.error(f"Server error [{error_code}]: {error_msg}")
             raise SystemExit(1)
-        return resp.json()
+        return detail
 
-    def post(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        return self.request("post", endpoint, data)
+    def post(self, endpoint: str, data: Dict[str, Any], expect: tuple[str, ...] = ()) -> Dict[str, Any]:
+        return self.request("post", endpoint, data, expect=expect)
 
     def post_optional(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """POST to an endpoint that an older server may not have. Empty dict when the route is missing."""
@@ -632,6 +662,7 @@ def resolve_server(server_name: Optional[str]) -> tuple[str, str, dict]:
         services = svc.get("services", {})
         services["_server_cdm"] = svc.get("server_cdm")
         services["_auth_headers"] = resolve_auth_headers(svc, server_name)
+        services["_timeout"] = svc.get("timeout")
         return svc["url"], svc.get("api_key", ""), services
 
     if len(remote_services) == 1:
@@ -642,6 +673,7 @@ def resolve_server(server_name: Optional[str]) -> tuple[str, str, dict]:
         services = svc.get("services", {})
         services["_server_cdm"] = svc.get("server_cdm")
         services["_auth_headers"] = resolve_auth_headers(svc, name)
+        services["_timeout"] = svc.get("timeout")
         return svc["url"], svc.get("api_key", ""), services
 
     available = ", ".join(remote_services.keys())
@@ -680,6 +712,33 @@ def resolve_proxy_arg(proxy_arg: Optional[str]) -> Optional[str]:
     try:
         providers = initialize_proxy_providers()
         return resolve_proxy(proxy_arg, providers)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+
+
+def resolve_remote_proxy_arg(proxy_arg: str) -> Optional[str]:
+    """
+    Get the proxy URI to send to a server for a --proxy value.
+
+    Control D's proxy URI is a forwarder on this machine, so for a server it becomes the
+    profile's resolver instead (`controld://`), and a bare region query skips Control D.
+    """
+    from unshackle.core.proxies.controld import ControlD
+    from unshackle.core.proxies.resolve import initialize_proxy_providers, resolve_proxy
+
+    try:
+        providers = initialize_proxy_providers()
+        provider, _, query = proxy_arg.partition(":")
+        if provider.lower() == "controld" and query:
+            controld = next((x for x in providers if isinstance(x, ControlD)), None)
+            if not controld:
+                raise ValueError("Proxy provider 'controld' is not configured")
+            uri = controld.get_remote_proxy(query)
+            if not uri:
+                raise ValueError(f"Control D has no location for {query}")
+            log.info(f"Using a Control D proxy in {query}, resolved by the server")
+            return uri
+        return resolve_proxy(proxy_arg, [x for x in providers if not isinstance(x, ControlD)])
     except ValueError as e:
         raise click.ClickException(str(e))
 
@@ -815,7 +874,9 @@ class RemoteService:
 
         self.service_tag = service_tag
         self.title_id = title_id
-        self.client = RemoteClient(server_url, api_key, services_config.get("_auth_headers"))
+        self.client = RemoteClient(
+            server_url, api_key, services_config.get("_auth_headers"), services_config.get("_timeout")
+        )
         self.ctx = ctx
         self._service_params = service_params or {}
         self.log = logging.getLogger(service_tag)
@@ -827,6 +888,7 @@ class RemoteService:
         self._chapters_by_title: Dict[str, list] = {}
         self._session_id: Optional[str] = None
         self._server_cdm_type: str = "widevine"
+        self.client_licensed: set[str] = set()  # track ids this machine's device licenses by challenge relay
         self.server_vault_keys: Dict[UUID, str] = {}
         self.server_vault = ServerVault(self)
         self._segment_filters: Dict[str, tuple[set[str], set[str]]] = {}
@@ -924,7 +986,7 @@ class RemoteService:
             regions = [str(r).lower() for r in self._server_accounts.get("regions") or []]
             if regions and client_region and client_region not in regions:
                 try:
-                    create_data["proxy"] = resolve_proxy_arg(regions[0])
+                    create_data["proxy"] = resolve_remote_proxy_arg(regions[0])
                     create_data["proxy_region"] = regions[0]
                     self.log.info(f"Using a '{regions[0]}' proxy to match a server account ({', '.join(regions)})")
                 except click.ClickException:
@@ -934,7 +996,7 @@ class RemoteService:
                         "rejects the remote session"
                     )
         elif not no_proxy and proxy:
-            resolved_proxy = resolve_proxy_arg(proxy)
+            resolved_proxy = resolve_remote_proxy_arg(proxy)
             if resolved_proxy:
                 create_data["proxy"] = resolved_proxy
                 query = (self.ctx.parent.params.get("proxy_query") if self.ctx.parent else None) or proxy
@@ -987,11 +1049,15 @@ class RemoteService:
             create_data.update(self._service_params)
             create_data["service_params"] = self._service_params
 
-        cdm = self.ctx.obj.cdm if self.ctx.obj and not self._server_cdm else None
+        # sent with the server CDM too: a capped server hands the tracks above its cap to this device
+        cdm = self.local_cdm
         if cdm is not None:
             from unshackle.core.cdm.detect import is_playready_cdm
 
             create_data["cdm_type"] = "playready" if is_playready_cdm(cdm) else "widevine"
+            level = getattr(cdm, "security_level", None)
+            if isinstance(level, int):
+                create_data["cdm_security_level"] = level
 
         cache_data = self.load_cache_files(profile) if self._server_accounts is None else None
         if cache_data:
@@ -1011,12 +1077,39 @@ class RemoteService:
         result = self.client.post("/api/session/create", create_data)
         self._session_id = result["session_id"]
         atexit.register(self.close)
+        # an older server omits the field, and the tracks response settles it
+        if "server_cdm" in result:
+            self.adopt_session_cdm(bool(result["server_cdm"]), result.get("server_cdm_max_height"))
 
         status = result.get("status", "authenticated")
         if status == "authenticating":
             self.poll_auth_completion()
         self.drain_server_logs()
         self.start_keepalive()
+
+    @property
+    def local_cdm(self) -> Any:
+        """The CDM device dl loaded on this machine, or None. dl may later swap its own copy for a stub."""
+        return self.ctx.obj.cdm if self.ctx.obj else None
+
+    def adopt_session_cdm(self, server_cdm: bool, max_height: Optional[int]) -> None:
+        """Take the server's choice of who licenses this remote session, and say why when a cap made it."""
+        if self._server_cdm and not server_cdm and max_height is None:
+            self.log.warning(
+                f"{self.service_tag} is not available for server CDM licensing with this API key, "
+                "falling back to the local CDM"
+            )
+        self._server_cdm = server_cdm
+        if max_height is None:
+            if server_cdm and self.ctx.parent and self.ctx.parent.params.get("cdm_name"):
+                self.log.warning("--cdm is ignored: the server CDM licenses this remote session")
+            return
+        message = f"The server CDM licenses up to {max_height}p for this API key"
+        if not server_cdm:
+            message += "; licensing with your own device"
+        elif self.local_cdm is not None:
+            message += "; pass a higher -q to license above it with your own device"
+        self.log.info(message)
 
     def start_keepalive(self) -> None:
         """Send keep-alive requests so that a long download or mux operation does not outlive the server's idle TTL.
@@ -1203,6 +1296,8 @@ class RemoteService:
         server_cdm_type. We send track IDs and the server does the full
         CDM flow, returning KID:KEY pairs.
         """
+        # track ids can repeat across titles, so a refusal for the last title must not carry over
+        self.client_licensed.clear()
         if not self._server_cdm:
             return
 
@@ -1215,6 +1310,7 @@ class RemoteService:
         drm_type = getattr(self, "_server_cdm_type", "widevine")
         self.log.debug(f"Requesting server CDM keys (server_cdm_type={drm_type})")
 
+        capped: Dict[str, Any] = {}
         try:
             with console.status("Retrieving Remote License...", spinner="dots"):
                 resp = self.client.post(
@@ -1233,13 +1329,14 @@ class RemoteService:
                 self.note_vault_keys(track_keys, vault_kids)
             server_drm_type = resp.get("drm_type", drm_type)
             drm_types_by_track = resp.get("drm_types", {})
+            capped = resp.get("capped_tracks") or {}
             self._server_cdm_type = server_drm_type
             self.log.debug(f"Server responded with drm_type={server_drm_type}, keys for {len(keys_by_track)} track(s)")
 
             for track in title.tracks:
                 track_keys = keys_by_track.get(str(track.id), {})
                 if not track_keys:
-                    if str(track.id) in track_ids and str(track.id) not in clear_tracks:
+                    if str(track.id) in track_ids and str(track.id) not in clear_tracks | set(capped):
                         self.log.warning(f"Server CDM returned no content keys for track {track.id}")
                     continue
 
@@ -1257,6 +1354,34 @@ class RemoteService:
                 self.log.debug(f"Server CDM resolved {key_count} key(s) using {server_drm_type.upper()}")
         except Exception as e:
             self.log.warning("Failed to resolve server CDM keys: %s", e)
+
+        for track in title.tracks:
+            if str(track.id) in capped:
+                self.license_locally(track, capped[str(track.id)])
+
+    def license_locally(self, track: AnyTrack, refusal: Dict[str, Any]) -> None:
+        """Hand a track the server CDM refused to license live to this machine's own device.
+
+        dl then licenses it through the challenge relay. An HLS track with no DRM yet passes, as its
+        media playlist names the DRM and the downloader honours ``drm_preference``.
+        """
+        from unshackle.core.cdm.detect import is_playready_cdm
+
+        cap = refusal.get("max_height")
+        why = f"The server CDM licenses up to {cap}p for this key" if cap else "The server CDM refused this track"
+        cdm = self.local_cdm
+        if cdm is None:
+            raise click.ClickException(f"{why}, and {track} needs a local CDM to license it with your own device.")
+        drm_class = "PlayReady" if is_playready_cdm(cdm) else "Widevine"
+        if track.drm and not any(d.__class__.__name__ == drm_class for d in track.drm):
+            height = getattr(track, "height", None)
+            raise click.ClickException(
+                f"{why}, and {track} carries no {drm_class} DRM for your local device to license. "
+                f"Pass -q {height or 'with that height'} so the session starts on your own device."
+            )
+        track.drm_preference = drm_class.lower()
+        self.client_licensed.add(str(track.id))
+        self.log.info(f"{why}; licensing {track.id} with your own {drm_class} device")
 
     def note_vault_keys(self, keys: Dict[str, str], vault_kids: set[str]) -> None:
         """Remember which of the served keys a server vault supplied, and forget the rest."""
@@ -1318,7 +1443,8 @@ class RemoteService:
             kid_uuids = [UUID(hex=k) for k in kid_hexes]
             WIDEVINE_SYSTEM_ID = UUID("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
             dummy_pssh = WvPSSH.new(system_id=WIDEVINE_SYSTEM_ID, key_ids=kid_uuids)
-            return Widevine(pssh=dummy_pssh, kid=kid_hexes[0])
+            # no kid: the stub names several KIDs, and the first is not the track's own
+            return Widevine(pssh=dummy_pssh)
 
     def get_chapters(self, title: Title_T) -> Chapters:
         title_id = str(title.id)
@@ -1367,7 +1493,7 @@ class RemoteService:
         if isinstance(challenge, str):
             challenge = challenge.encode("utf-8")
 
-        if self._server_cdm:
+        if self._server_cdm and str(track.id) not in self.client_licensed:
             from uuid import UUID
 
             server_type = self._server_cdm_type
@@ -1375,6 +1501,7 @@ class RemoteService:
             drm_type, pssh_b64 = server_type, track_pssh(track, server_type)
             if not pssh_b64:
                 drm_type, pssh_b64 = other_type, track_pssh(track, other_type)
+            refusal: Optional[Dict[str, Any]] = None
             if pssh_b64:
                 try:
                     resp = self.client.post(
@@ -1385,7 +1512,10 @@ class RemoteService:
                             "mode": "server_cdm",
                             "pssh": pssh_b64,
                         },
+                        expect=("SERVER_CDM_CAPPED",),
                     )
+                    if resp.get("error_code") == "SERVER_CDM_CAPPED":
+                        refusal = resp.get("details") or {}
                     self._server_cdm_type = resp.get("drm_type", server_type)
                     keys = resp.get("keys", {})
                     self.note_vault_keys(keys, set(resp.get("vault_keys", [])))
@@ -1399,6 +1529,9 @@ class RemoteService:
                     self.log.warning("server_cdm license failed: %s", e)
             else:
                 self.log.warning(f"Track {track.id} has no PSSH to send to the server CDM")
+            if refusal is not None:
+                # dl sees the track in client_licensed and calls again with this device's challenge
+                self.license_locally(track, refusal)
             return challenge
 
         pssh_b64 = track_pssh(track, drm_type)
