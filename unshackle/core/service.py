@@ -23,6 +23,7 @@ from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
 from unshackle.core.drm import DRM_T
 from unshackle.core.proxies.basic import Basic
+from unshackle.core.proxies.resolve import find_provider
 from unshackle.core.search_result import SearchResult
 from unshackle.core.session import (
     BACKOFF_FACTOR,
@@ -158,6 +159,9 @@ class Service(metaclass=ABCMeta):
     # Auth methods the service accepts ("cookies"/"credentials"); when None the REST /services
     # endpoint infers them from authenticate().
     AUTH_METHODS: Optional[tuple[str, ...]] = None
+    # Config keys a remote client may supply for a session its own device licenses (a device identity
+    # such as an ESN); the server's own values for these keys are withheld from that session.
+    CLIENT_CONFIG: tuple[str, ...] = ()
 
     def __init__(self, ctx: click.Context):
         console.print(Padding(Rule(f"[rule.text]Service: {self.__class__.__name__}"), (1, 2)))
@@ -214,10 +218,10 @@ class Service(metaclass=ABCMeta):
                     )
                     if proxy_provider_name:
                         # Specific provider requested
-                        proxy_provider = next(
-                            (x for x in ctx.obj.proxy_providers if x.__class__.__name__.lower() == proxy_provider_name),
-                            None,
-                        )
+                        try:
+                            proxy_provider = find_provider(ctx.obj.proxy_providers, proxy_provider_name)
+                        except ValueError:
+                            proxy_provider = None
                         if proxy_provider:
                             mapped_proxy_uri = proxy_provider.get_proxy(mapped_value)
                             if mapped_proxy_uri:
@@ -464,10 +468,9 @@ class Service(metaclass=ABCMeta):
     def request_input(self, prompt: str) -> str:
         """Request interactive input from the user.
 
-        When running locally (CLI), prompts through the shared rich console so the
-        prompt renders correctly alongside Live progress / log handlers.
-        When running in serve mode with an :class:`InputBridge` attached,
-        delegates to the bridge which relays the prompt to the remote client.
+        Locally, prompts through the shared rich console so the prompt renders alongside
+        Live progress. A remote-dl session relays it through its :class:`InputBridge`, and a
+        REST download job relays it through ``prompt_user`` to the job's ``input_prompt``.
         """
         if self._input_bridge is not None:
             return self._input_bridge.request_input(prompt)

@@ -12,23 +12,11 @@ from rich.rule import Rule
 from rich.tree import Tree
 
 from unshackle.commands.dl import dl
-from unshackle.core import binaries
 from unshackle.core.config import config
 from unshackle.core.console import console
 from unshackle.core.constants import context_settings
-from unshackle.core.proxies import (
-    Basic,
-    ControlD,
-    ExpressVPN,
-    Gluetun,
-    Hola,
-    NordVPN,
-    ProtonVPN,
-    SurfsharkVPN,
-    WindscribeVPN,
-)
 from unshackle.core.proxies.proxy import Proxy
-from unshackle.core.proxies.resolve import REGION
+from unshackle.core.proxies.resolve import REGION, describe_proxy, load_proxy_providers, pick_proxy, split_proxy_query
 from unshackle.core.service import Service
 from unshackle.core.services import Services
 from unshackle.core.utils.click_types import ContextData
@@ -78,74 +66,24 @@ def search(ctx: click.Context, no_proxy: bool, profile: Optional[str] = None, pr
         ctx.params["proxy"] = None
     else:
         with console.status("Loading Proxy Providers...", spinner="dots"):
-            if config.proxy_providers.get("basic"):
-                proxy_providers.append(Basic(**config.proxy_providers["basic"]))
-            expressvpn = ExpressVPN(**(config.proxy_providers.get("expressvpn") or {}))
-            if config.proxy_providers.get("expressvpn") or expressvpn.cache_path.is_file():
-                proxy_providers.append(expressvpn)
-            if config.proxy_providers.get("nordvpn"):
-                proxy_providers.append(NordVPN(**config.proxy_providers["nordvpn"]))
-            proton = ProtonVPN(**(config.proxy_providers.get("protonvpn") or {}))
-            if config.proxy_providers.get("protonvpn") or proton.cookie_path.is_file():
-                proxy_providers.append(proton)
-            if config.proxy_providers.get("surfsharkvpn"):
-                proxy_providers.append(SurfsharkVPN(**config.proxy_providers["surfsharkvpn"]))
-            if config.proxy_providers.get("windscribevpn"):
-                proxy_providers.append(WindscribeVPN(**config.proxy_providers["windscribevpn"]))
-            if config.proxy_providers.get("gluetun"):
-                proxy_providers.append(Gluetun(**config.proxy_providers["gluetun"]))
-            if binaries.HolaProxy:
-                proxy_providers.append(Hola())
-            if config.proxy_providers.get("controld"):
-                proxy_providers.append(ControlD(**config.proxy_providers["controld"]))
-            for proxy_provider in proxy_providers:
-                log.info(f"Loaded {proxy_provider.__class__.__name__}: {proxy_provider}")
+            proxy_providers = load_proxy_providers()
 
         if proxy:
-            requested_provider = None
-            if re.match(r"^[a-z]+:.+$", proxy, re.IGNORECASE):
-                requested_provider, proxy = proxy.split(":", maxsplit=1)
-            if re.fullmatch(rf"(?:[a-z]+:)?{REGION}", proxy, re.IGNORECASE):
-                proxy = proxy.lower()
-                with console.status(f"Getting a Proxy to {proxy}...", spinner="dots"):
-                    if requested_provider:
-                        proxy_provider = next(
-                            (x for x in proxy_providers if x.__class__.__name__.lower() == requested_provider), None
-                        )
-                        if not proxy_provider:
-                            log.error(f"The proxy provider '{requested_provider}' was not recognised.")
-                            sys.exit(1)
-                        proxy_uri = proxy_provider.get_proxy(proxy)
-                        if not proxy_uri:
-                            log.error(f"The proxy provider {requested_provider} had no proxy for {proxy}")
-                            sys.exit(1)
-                        proxy = ctx.params["proxy"] = proxy_uri
-                        display = None
-                        if hasattr(proxy_provider, "last_connection_display"):
-                            display = proxy_provider.last_connection_display()
-                        if display:
-                            log.info(f"Using {proxy_provider.__class__.__name__} Proxy {display}")
-                        else:
-                            log.info(
-                                f"Using {proxy_provider.__class__.__name__} Proxy: "
-                                f"{mask_proxy(proxy, isinstance(proxy_provider, Basic))}"
-                            )
-                    else:
-                        for proxy_provider in proxy_providers:
-                            proxy_uri = proxy_provider.get_proxy(proxy)
-                            if proxy_uri:
-                                proxy = ctx.params["proxy"] = proxy_uri
-                                display = None
-                                if hasattr(proxy_provider, "last_connection_display"):
-                                    display = proxy_provider.last_connection_display()
-                                if display:
-                                    log.info(f"Using {proxy_provider.__class__.__name__} Proxy {display}")
-                                else:
-                                    log.info(
-                                        f"Using {proxy_provider.__class__.__name__} Proxy: "
-                                        f"{mask_proxy(proxy, isinstance(proxy_provider, Basic))}"
-                                    )
-                                break
+            try:
+                requested_provider, query = split_proxy_query(proxy, proxy_providers)
+            except ValueError as e:
+                log.error(str(e))
+                sys.exit(1)
+            if re.fullmatch(rf"(?:[a-z]+:)?{REGION}", query, re.IGNORECASE):
+                query = query.lower()
+                with console.status(f"Getting a Proxy to {query}...", spinner="dots"):
+                    try:
+                        proxy_provider, proxy_uri = pick_proxy(proxy_providers, query, requested_provider)
+                    except ValueError as e:
+                        log.error(str(e))
+                        sys.exit(1)
+                    ctx.params["proxy"] = proxy_uri
+                    log.info(describe_proxy(proxy_provider, proxy_uri, query))
             else:
                 log.info(f"Using explicit Proxy: {mask_proxy(ctx.params['proxy'])}")
 
