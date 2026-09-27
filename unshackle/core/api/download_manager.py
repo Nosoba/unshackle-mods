@@ -116,6 +116,8 @@ class DownloadJob:
     phase: Optional[str] = None
     title: Optional[str] = None
     current_title: Optional[str] = None
+    episode_name: Optional[str] = None
+    episode_description: Optional[str] = None
     completed_tracks: int = 0
     total_tracks: int = 0
     active_tracks: List[str] = field(default_factory=list)
@@ -153,6 +155,8 @@ class DownloadJob:
             "progress": self.progress,
             "phase": self.phase,
             "current_title": self.current_title,
+            "episode_name": self.episode_name,
+            "episode_description": self.episode_description,
             "completed_tracks": self.completed_tracks,
             "total_tracks": self.total_tracks,
             "active_tracks": self.active_tracks,
@@ -1097,6 +1101,10 @@ class DownloadQueueManager:
                                 job.current_title = str(progress_data["current_title"])
                             if progress_data.get("title"):
                                 job.title = str(progress_data["title"])
+                            if progress_data.get("episode_name"):
+                                job.episode_name = str(progress_data["episode_name"])
+                            if progress_data.get("episode_description"):
+                                job.episode_description = str(progress_data["episode_description"])
                             if progress_data.get("output_files"):
                                 job.output_files = [str(f) for f in progress_data["output_files"]]
                             if progress_data.get("total_tracks"):

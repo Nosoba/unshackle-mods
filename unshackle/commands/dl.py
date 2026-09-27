@@ -2380,11 +2380,16 @@ class dl:
 
             if progress_sink:
                 if isinstance(title, Episode):
+                    _ep_desc = getattr(title, "description", None)
+                    if not _ep_desc and hasattr(title, "data") and isinstance(title.data, dict):
+                        _ep_desc = title.data.get("description") or title.data.get("ep_description") or title.data.get("synopsis")
                     progress_sink(
                         {
                             "title": title.title,
                             "current_title": f"S{title.season or 0:02}E{title.number or 0:02}"
                             + (f".{title.part}" if title.part is not None else ""),
+                            "episode_name": getattr(title, "name", None),
+                            "episode_description": _ep_desc,
                         }
                     )
                 else:
