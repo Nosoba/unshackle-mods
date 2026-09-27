@@ -131,6 +131,8 @@ class DownloadJob:
     # dict (id / language / title) so a client can report which weren't available.
     skipped_subtitles: List[Dict[str, Any]] = field(default_factory=list)
 
+    track_tree_text: Optional[str] = None
+
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
     # Guards against writing the same job to the persistent history file twice.
@@ -160,6 +162,7 @@ class DownloadJob:
             "speed": self.speed,
             "skipped_subtitles": self.skipped_subtitles,
             "input_prompt": self.input_prompt,
+            "track_tree_text": self.track_tree_text,
         }
 
         if include_full_details:
@@ -1116,6 +1119,8 @@ class DownloadQueueManager:
                                 job.input_prompt = progress_data["input_prompt"]
                             if progress_data.get("skipped_subtitles"):
                                 job.skipped_subtitles = progress_data["skipped_subtitles"]
+                            if progress_data.get("track_tree_text"):
+                                job.track_tree_text = progress_data["track_tree_text"]
                             if "progress" in progress_data:
                                 new_progress = float(progress_data["progress"])
                                 if new_progress != job.progress:

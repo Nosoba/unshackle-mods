@@ -3229,6 +3229,14 @@ class dl:
             )
 
             if progress_sink is not None:
+                import io
+                from rich.console import Console
+                
+                plain_tree, _ = title.tracks.tree(add_progress=False)
+                buf = io.StringIO()
+                Console(file=buf, force_terminal=False, color_system=None).print(plain_tree)
+                progress_sink({"track_tree_text": buf.getvalue()})
+
                 from unshackle.core.api.progress import build_job_progress_callables
 
                 tracks_progress_callables = build_job_progress_callables(
