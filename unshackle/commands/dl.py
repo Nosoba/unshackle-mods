@@ -2700,10 +2700,12 @@ class dl:
 
                 if isinstance(title, (Movie, Episode)):
                     if keep_videos and vcodec:
-                        title.tracks.select_video(lambda x: x.codec in vcodec)
+                        title.tracks.select_video(lambda x: x.codec in vcodec or x.codec is None)
                         missing_codecs = [c for c in vcodec if not any(x.codec == c for x in title.tracks.videos)]
-                        for codec in missing_codecs:
-                            self.log.warning(f"Skipping {codec.name} video tracks as none are available.")
+                        has_unknown = any(x.codec is None for x in title.tracks.videos)
+                        if missing_codecs and not has_unknown:
+                            for codec in missing_codecs:
+                                self.log.warning(f"Skipping {codec.name} video tracks as none are available.")
                         if not title.tracks.videos:
                             self.log.error(f"There's no {', '.join(c.name for c in vcodec)} Video Track...")
                             sys.exit(1)
