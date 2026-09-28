@@ -1097,7 +1097,7 @@ class DownloadQueueManager:
                 try:
                     stat = os.stat(progress_path)
                     stat_key = (stat.st_mtime_ns, stat.st_size)
-                    if stat_key != last_progress_stat:
+                    if stat.st_size > 0 and stat_key != last_progress_stat:
                         with open(progress_path, "r", encoding="utf-8") as handle:
                             progress_data = json.load(handle)
                             prompt_before = job.input_prompt
