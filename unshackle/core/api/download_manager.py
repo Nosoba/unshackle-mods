@@ -659,7 +659,11 @@ def perform_download(
             log.error(f"Download exited with code {exc.code}")
             log.error(f"Stdout: {stdout_str}")
             log.error(f"Stderr: {stderr_str}")
-            raise APIError(APIErrorCode.DOWNLOAD_ERROR, f"Download failed with exit code {exc.code}")
+            msg = f"Download failed with exit code {exc.code}"
+            tail = (stderr_str or stdout_str or "").strip()[-800:]
+            if tail:
+                msg += f": {tail}"
+            raise APIError(APIErrorCode.DOWNLOAD_ERROR, msg)
 
     except Exception as exc:  # noqa: BLE001 - propagate to caller
         stdout_str = stdout_capture.getvalue()
@@ -1020,7 +1024,9 @@ class DownloadQueueManager:
 
             job.status = JobStatus.FAILED
             job.error_message = str(e)
-            job.error_details = str(e)
+            # run_download_async already resolved a richer detail (worker stderr / "stderr" tail);
+            # only fall back to the exception string when it left one unset.
+            job.error_details = job.error_details or str(e)
 
             api_error = categorize_exception(
                 e, context={"service": job.service, "title_id": job.title_id, "job_id": job.job_id}
@@ -1191,6 +1197,11 @@ class DownloadQueueManager:
                 if result_data:
                     job.error_details = result_data.get("error_details", message)
                     job.error_code = result_data.get("error_code")
+                
+                # Expose stderr to the caller if we lack a concrete reason
+                if safe_stderr and (not job.error_details or job.error_details == message or "SystemExit" in message):
+                    job.error_details = safe_stderr[-1000:].strip()
+                    
                 raise Exception(f"Worker exited with code {returncode}: {message}")
 
             if not result_data or result_data.get("status") != "success":

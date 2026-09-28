@@ -139,12 +139,17 @@ def main(argv: list[str]) -> int:
 
         result = {"status": "success", "output_files": output_files}
 
-    except Exception as exc:  # noqa: BLE001 - capture for parent process
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 - capture for parent process
         from unshackle.core.api.errors import categorize_exception
 
         exit_code = 1
         tb = traceback.format_exc()
         log.error(f"Worker failed with error: {exc}")
+
+        if isinstance(exc, SystemExit):
+            msg = f"SystemExit({exc.code})"
+        else:
+            msg = str(exc)
 
         api_error = categorize_exception(
             exc,
@@ -157,7 +162,7 @@ def main(argv: list[str]) -> int:
 
         result = {
             "status": "error",
-            "message": str(exc),
+            "message": msg,
             "error_details": api_error.message,
             "error_code": api_error.error_code.value,
             "traceback": tb,
