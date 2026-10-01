@@ -600,6 +600,7 @@ def perform_download(
                 select_titles=False,
                 wanted=params.get("wanted", []),
                 latest_episode=params.get("latest_episode", False),
+                latest_episodes=params.get("latest_episodes"),
                 season_override=params.get("season_override"),
                 episode_override=params.get("episode_override"),
                 set_year=params.get("set_year"),
@@ -1024,16 +1025,13 @@ class DownloadQueueManager:
 
             job.status = JobStatus.FAILED
             job.error_message = str(e)
-            # run_download_async already resolved a richer detail (worker stderr / "stderr" tail);
-            # only fall back to the exception string when it left one unset.
-            job.error_details = job.error_details or str(e)
 
             api_error = categorize_exception(
                 e, context={"service": job.service, "title_id": job.title_id, "job_id": job.job_id}
             )
-            job.error_code = api_error.error_code.value
-
-            job.error_traceback = traceback.format_exc()
+            job.error_details = job.error_details or str(e)
+            job.error_code = job.error_code or api_error.error_code.value
+            job.error_traceback = job.error_traceback or traceback.format_exc()
 
             log.error(f"Download failed for job {job.job_id}: {e}")
             raise
@@ -1191,6 +1189,9 @@ class DownloadQueueManager:
                 except json.JSONDecodeError as exc:
                     log.error(f"Failed to parse worker result for job {job.job_id}: {exc}")
                 break
+
+            if result_data:
+                job.error_traceback = result_data.get("traceback")
 
             if returncode != 0:
                 message = result_data.get("message") if result_data else "unknown error"

@@ -55,6 +55,7 @@ DEFAULT_DOWNLOAD_PARAMS = {
     "no_atmos": False,
     "wanted": [],
     "latest_episode": False,
+    "latest_episodes": None,
     # Must match dl's own --lang default ("best"), not "orig". A title whose service
     # reports no original language cannot resolve "orig": the request collapses to
     # nothing and the job dies with "There's no orig Audio Track". "best" does not
@@ -1879,7 +1880,7 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
         if not isinstance(data["downloads"], int) or data["downloads"] <= 0:
             return "downloads must be a positive integer"
 
-    for name in ("tmdb_id", "tvdb_id"):
+    for name in ("tmdb_id", "tvdb_id", "latest_episodes"):
         if data.get(name) is not None:
             value = data[name]
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -2148,7 +2149,7 @@ async def list_download_jobs_handler(data: Dict[str, Any], request: Optional[web
         jobs = sorted(jobs, key=get_sort_key, reverse=reverse)
 
         include_full = str(data.get("full") or "").lower() == "true"
-        job_list = [job.to_dict(include_full_details=include_full) for job in jobs]
+        job_list = [client_job_view(job.to_dict(include_full_details=include_full), request) for job in jobs]
 
         return web.json_response({"jobs": job_list})
 
@@ -2162,6 +2163,16 @@ async def list_download_jobs_handler(data: Dict[str, Any], request: Optional[web
             context={"operation": "list_download_jobs"},
             debug_mode=debug_mode,
         )
+
+
+def client_job_view(job: Dict[str, Any], request: Optional[web.Request]) -> Dict[str, Any]:
+    """Drop a job's traceback and stderr for API clients unless the server runs with ``--debug-api``.
+
+    Redaction masks only the job's own secrets, so these fields can still carry server-side values.
+    """
+    if request is not None and request.app.get("debug_api", False):
+        return job
+    return {k: v for k, v in job.items() if k not in ("error_traceback", "worker_stderr")}
 
 
 async def get_download_job_handler(job_id: str, request: Optional[web.Request] = None) -> web.Response:
@@ -2179,7 +2190,7 @@ async def get_download_job_handler(job_id: str, request: Optional[web.Request] =
                 details={"job_id": job_id},
             )
 
-        return web.json_response(job.to_dict(include_full_details=True))
+        return web.json_response(client_job_view(job.to_dict(include_full_details=True), request))
 
     except APIError:
         raise
@@ -2221,7 +2232,7 @@ async def download_job_events_handler(job_id: str, request: web.Request) -> web.
     await response.prepare(request)
 
     async def send(event: str, data: Dict[str, Any]) -> None:
-        payload = json.dumps(data, separators=(",", ":"), default=str)
+        payload = json.dumps(client_job_view(data, request), separators=(",", ":"), default=str)
         await response.write(f"event: {event}\ndata: {payload}\n\n".encode())
 
     queue: Optional[asyncio.Queue] = None
@@ -2310,6 +2321,14 @@ async def dashboard_jobs_handler(request: web.Request) -> web.Response:
     return web.json_response([job.to_dict(include_full_details=True) for job in get_download_manager().list_jobs()])
 
 
+def _poll_cursor(before: int, items: List[Dict[str, Any]]) -> int:
+    """Cursor for the next poll, from the buffer's seq read *before* its ``since()`` call.
+
+    This poll or the next one returns a record added between the two reads; no poll skips it.
+    """
+    return max(before, items[-1]["seq"]) if items else before
+
+
 async def dashboard_logs_handler(request: web.Request) -> web.Response:
     """Recent log records; `since` (seq) and `level` filter the ring buffer."""
     from unshackle.core.api.stats import ring
@@ -2318,8 +2337,9 @@ async def dashboard_logs_handler(request: web.Request) -> web.Response:
         since = int(request.query.get("since", 0))
     except ValueError:
         since = 0
+    before = ring.seq
     records = ring.since(since, request.query.get("level"), request.query.get("logger"))
-    return web.json_response({"seq": ring.seq, "records": records})
+    return web.json_response({"seq": _poll_cursor(before, records), "records": records})
 
 
 async def dashboard_session_logs_handler(request: web.Request) -> web.Response:
@@ -2340,13 +2360,9 @@ async def dashboard_session_logs_handler(request: web.Request) -> web.Response:
     except ValueError:
         since = 0
     buffer = session.log_buffer
-    return web.json_response(
-        {
-            "session_id": session_id,
-            "records": buffer.since(since) if buffer else [],
-            "last_seq": buffer.last_seq if buffer else 0,
-        }
-    )
+    before = buffer.last_seq if buffer else 0
+    records = buffer.since(since) if buffer else []
+    return web.json_response({"session_id": session_id, "records": records, "last_seq": _poll_cursor(before, records)})
 
 
 async def dashboard_keys_handler(request: web.Request) -> web.Response:
@@ -2638,7 +2654,11 @@ async def dashboard_events_handler(request: web.Request) -> web.StreamResponse:
         except ValueError:
             since = 0
         status = await dashboard_status_handler(request)
-        return web.json_response({"seq": bus.seq, "stats": json.loads(status.text or "{}"), "events": bus.since(since)})
+        before = bus.seq
+        events = bus.since(since)
+        return web.json_response(
+            {"seq": _poll_cursor(before, events), "stats": json.loads(status.text or "{}"), "events": events}
+        )
 
     response = web.StreamResponse(
         headers={

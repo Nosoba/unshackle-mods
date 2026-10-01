@@ -429,6 +429,7 @@ Make a download job. It requires `service` and `title_id`. Every other field is 
 | `no_atmos` | boolean | `false` | Exclude Atmos tracks. |
 | `wanted` | string / string[] | `[]` | Episode/season selectors, as a list or as one comma-separated string. Accepts the part form, `"S01E01.2"`, and the air-date form, `"2026-08-11"` or `"2026-08-01:2026-08-31"`. For a music release, a selector is a track number, `"1-5"` or `"1,3,7"`, or `"{disc}x{track}"` such as `"2x3"`. |
 | `latest_episode` | boolean | `false` | Only the newest episode. |
+| `latest_episodes` | integer | `null` | Only the N newest episodes. A positive integer. When set, it overrides `latest_episode`. |
 | `lang` / `v_lang` / `a_lang` / `s_lang` | string[] | `["orig"]` / `[]` / `[]` / `["all"]` | Language filters. |
 | `require_audio` | string[] | `[]` | Audio languages that must exist. The job fails if one is missing, even with `best_available`. |
 | `require_video` | string[] | `[]` | Video languages that must exist. The job fails if one is missing, even with `best_available`. |
@@ -558,7 +559,7 @@ Show download jobs, with optional filtering and sorting.
     }
     ```
 
-With `full=true`, each job additionally includes `parameters` (with secrets redacted), `started_time`, `completed_time`, `output_files`, `error_message`, `error_details`, `error_code`, `error_traceback`, and `worker_stderr`.
+With `full=true`, each job additionally includes `parameters` (with secrets redacted), `started_time`, `completed_time`, `output_files`, `error_message`, `error_details`, and `error_code`. When you start the server with `--debug-api`, each job also includes `error_traceback` and `worker_stderr`.
 
 | Status | Error code | Meaning |
 | --- | --- | --- |
