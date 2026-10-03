@@ -143,15 +143,19 @@ def sanitize_filename(filename: str, spacer: str = ".", unicode: Optional[bool] 
 
     Set `unicode_filenames: true` in config to preserve the characters of the
     original language (for example Korean, Japanese, or Chinese) instead of
-    transliterating them to ASCII equivalents. Characters Windows forbids in a
-    path are then swapped for their fullwidth twins so the title stays readable.
-    Pass ``unicode`` to decide the transliteration for one call instead of the
-    config value.
+    transliterating them to ASCII equivalents. Pass ``unicode`` to decide that
+    for one call instead of the config value. The name goes to NFC first, so
+    composed and decomposed spellings of a title give the same name.
+
+    When ``unicode_filenames`` is on, the characters Windows forbids in a path are
+    swapped for their fullwidth twins so the title stays readable, and
+    ``filename_replacements`` is applied on top of those swaps.
     """
     if filename is None:
         return ""
 
     filename = str(filename)
+    filename = unicodedata.normalize("NFC", filename)
 
     # The two knobs are independent: the `unicode` argument only decides whether this
     # call transliterates, while the config value decides whether the title is kept in
@@ -160,7 +164,7 @@ def sanitize_filename(filename: str, spacer: str = ".", unicode: Optional[bool] 
         filename = unidecode(filename)
         filename = re.sub(r"\[\(+", "[", filename)
         filename = re.sub(r"\)+\]", "]", filename)
-    filename = "".join(c for c in filename if unicodedata.category(c) not in ("Mn", "Cc"))
+    filename = "".join(c for c in filename if unicodedata.category(c) != "Cc")
 
     if config.unicode_filenames:
         # the title is kept as-is, so the characters Windows rejects are remapped to
@@ -169,7 +173,6 @@ def sanitize_filename(filename: str, spacer: str = ".", unicode: Optional[bool] 
             filename = filename.replace(char, replacement)
     else:
         filename = filename.replace("/", " & ").replace(";", " & ")  # e.g. multi-episode filenames
-
     if spacer == ".":
         filename = re.sub(r" - ", spacer, filename)  # title separators to spacer (avoids .-. pattern)
     filename = re.sub(r"[:; ]", spacer, filename)
@@ -178,7 +181,8 @@ def sanitize_filename(filename: str, spacer: str = ".", unicode: Optional[bool] 
     filename = re.sub(rf"[{spacer}]{{2,}}", spacer, filename)  # remove extra neighbouring (spacer)s
     filename = filename.strip(" .")  # strip leading and trailing spaces and dots for OS path safety
 
-    return filename
+    # A removed character can leave a letter next to a mark it did not have before.
+    return unicodedata.normalize("NFC", filename)
 
 
 def is_close_match(language: Union[str, Language], languages: Sequence[Union[str, Language, None]]) -> bool:
@@ -278,6 +282,24 @@ def embedded_audio_langs(videos: Sequence[Any], keep_videos: bool) -> list[str]:
     if not keep_videos:
         return []
     return [video.data["audio_language"] for video in videos if video.data.get("audio_language")]
+
+
+def apply_original_language(title: Any, language: Language) -> None:
+    """
+    Make ``language`` the title's original language over the one the service set.
+
+    A service tags its videos and original-language flags with its own guess, so the videos that
+    carry that guess move to ``language`` and every track's flag is set again.
+    """
+    guess = title.language
+    if guess == language:
+        return
+    for video in title.tracks.videos:
+        if guess and video.language == guess:
+            video.language = language
+    for track in title.tracks:
+        track.is_original_lang = bool(track.language and is_close_match(track.language, [language]))
+    title.language = language
 
 
 def find_missing_langs(

@@ -148,8 +148,8 @@ unshackle dl -q 2160 -r HDR10,DV EXAMPLE '...'
 !!! warning "HYBRID requires dovi_tool"
     `-r HYBRID` makes a single hybrid track by injecting the Dolby Vision RPU
     metadata onto an HDR10/HDR10+ base layer with **dovi_tool**.
-    It requires the `dovi_tool` binary, resolved from unshackle's `binaries/` folder or
-    your `PATH`. The normal case is a DV track plus an HDR10 or HDR10+ base. With HDR10+
+    It requires the `dovi_tool` binary, resolved from unshackle's `binaries/` folder,
+    the `binaries` folder of your user data directory, or your `PATH`. The normal case is a DV track plus an HDR10 or HDR10+ base. With HDR10+
     and no DV, unshackle converts the HDR10+ metadata to DV instead, which also needs
     `hdr10plus_tool`. With no DV and no HDR10+, the title fails.
     When HDR10+ is present, unshackle prefers it over HDR10 as the base layer.
@@ -777,7 +777,7 @@ By default, unshackle checks your **key vaults** first and only asks a **CDM** t
 a content key when the vault misses. You can force one side or the other:
 
 - `--cdm-only`: only use the CDM (skip vaults). Over a `server_cdm` remote session the flag does not reach the server, whose vault shortcut still runs; it only skips the client's decode check on a server key.
-- `--cdm <name>`: use the named CDM device for this run, ignoring the `cdm` config mapping (including its quality and Widevine/PlayReady sub-entries).
+- `--cdm <name>`: use the named CDM device for this run, ignoring the `cdm` config mapping (including its quality and Widevine/PlayReady sub-entries). Over `--remote`, that device licenses the remote session, not the server CDM.
 - `--vaults-only`: only use key vaults and never license through the CDM. A missing
   content key fails.
 
