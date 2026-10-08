@@ -26,16 +26,21 @@ RESULT = {"id": "t", "title": "Title", "description": "Description", "label": "M
 class FakeService:
     # Exercise the real dispatch without Service.__init__ doing any external setup.
     request_input = Service.request_input
+    ensure_input_supported = Service.ensure_input_supported
     prompt_on_auth = True
 
     def __init__(self):
         self._input_bridge = None
         self.login_material = None
         self.authenticated = False
+        self.otp_requests = 0
 
     def authenticate(self, cookies, credential):
         self.login_material = (cookies, credential)
         if self.prompt_on_auth:
+            # Match DSNP's guarded _request_otp -> request_input order.
+            self.ensure_input_supported()
+            self.otp_requests += 1
             self.request_input(PROMPT)
         self.authenticated = True
 
@@ -119,6 +124,7 @@ def test_stateless_attaches_guard_before_authentication(operation, services):
     assert isinstance(service._input_bridge, StatelessInputBridge)
     assert service.login_material == ("cookies", "credential")
     assert not service.authenticated
+    assert service.otp_requests == 0
 
 
 def test_no_prompt_paths_succeed_with_per_instance_guards(operation, services, monkeypatch):
@@ -169,6 +175,39 @@ async def test_remote_bridge_still_relays_service_input():
             bridge.cancel()
 
 
+def test_stateless_preflight_never_sends_otp(operation, services):
+    # Repeated picker/search requests may check login but must issue zero codes.
+    for _ in range(3):
+        with pytest.raises(APIError) as raised:
+            run_stateless(operation)
+        assert raised.value.details == {"reason": "interactive_auth_required"}
+    assert sum(service.otp_requests for service in services) == 0
+
+
+def test_cli_preflight_is_noop_and_still_prompts(monkeypatch):
+    service = FakeService()
+    terminal = Mock(return_value="001234")
+    monkeypatch.setattr(service_module, "prompt_user", terminal)
+    assert service.ensure_input_supported() is None
+    assert service.request_input(PROMPT) == "001234"
+    terminal.assert_called_once_with(PROMPT)
+
+
+def test_remote_preflight_does_not_issue_or_answer_a_prompt():
+    service = FakeService()
+    service._input_bridge = bridge = InputBridge()
+    assert service.ensure_input_supported() is None
+    assert bridge.status is AuthStatus.AUTHENTICATING
+    assert bridge.get_pending_prompt() is None
+    assert not bridge.answered
+    bridge.status = AuthStatus.AUTHENTICATED
+    with pytest.raises(RuntimeError, match="after authentication"):
+        service.ensure_input_supported()
+    bridge.cancel()
+    with pytest.raises(RuntimeError, match="cancelled"):
+        service.ensure_input_supported()
+
+
 def test_download_worker_still_relays_service_input(monkeypatch):
     monkeypatch.setattr(service_module, "prompt_user", console_module.prompt_user)
     monkeypatch.setattr(download_worker, "AUTH_INPUT_TIMEOUT", 2)
@@ -186,6 +225,8 @@ def test_download_worker_still_relays_service_input(monkeypatch):
         download_worker.relay_prompts(answer_on_prompt)
         service = FakeService()
         assert service._input_bridge is None
+        assert service.ensure_input_supported() is None
+        assert updates == []  # Preflight itself does not create a prompt or submit input.
         assert service.request_input(PROMPT) == "123456"
     finally:
         console_module.set_prompt_handler(previous_handler)

@@ -468,6 +468,17 @@ class Service(metaclass=ABCMeta):
         # Store credential for cache key generation
         self.credential = credential
 
+    def ensure_input_supported(self) -> None:
+        """Fail before issuing an OTP when no caller can answer it.
+
+        Call this before sending an email/SMS challenge, not just before reading
+        its answer. Stateless list/search requests must not consume OTP requests
+        or invalidate a code an active download is waiting for. Local CLI and
+        download-worker input are supported without an InputBridge.
+        """
+        if self._input_bridge is not None:
+            self._input_bridge.ensure_input_supported()
+
     def request_input(self, prompt: str) -> str:
         """Request interactive input from the user.
 

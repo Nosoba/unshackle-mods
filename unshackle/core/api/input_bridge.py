@@ -13,7 +13,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, NoReturn, Optional
 
 from unshackle.core.api.errors import APIError, APIErrorCode
 
@@ -56,6 +56,14 @@ class InputBridge:
     _response_ready: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _picked_up: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def ensure_input_supported(self) -> None:
+        """Check before sending an OTP that this session can accept its answer."""
+        with self._lock:
+            if self._cancelled:
+                raise RuntimeError("Session was cancelled")
+            if self._status == AuthStatus.AUTHENTICATED:
+                raise RuntimeError("Remote mode cannot relay input after authentication")
 
     def request_input(self, prompt: str, timeout: float = AUTH_INPUT_TIMEOUT) -> str:
         """Block until the remote client submits a response for *prompt*.
@@ -208,9 +216,12 @@ class InputBridge:
 
 
 class StatelessInputBridge(InputBridge):
-    """Reject prompts on list/search requests, which have no input-response channel."""
+    """Reject prompts and OTP issuance on requests with no input-response channel."""
 
     def request_input(self, prompt: str, timeout: float = AUTH_INPUT_TIMEOUT) -> str:
+        self.ensure_input_supported()
+
+    def ensure_input_supported(self) -> NoReturn:
         self.status = AuthStatus.FAILED
         # Do not echo the prompt: services may include private account information in it.
         raise APIError(
