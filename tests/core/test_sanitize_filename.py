@@ -98,8 +98,16 @@ def test_config_option_decides_when_unicode_is_not_passed(monkeypatch: pytest.Mo
     assert sanitize_filename(THAI).isascii()
 
 
-def test_sanitising_a_name_again_does_not_change_it() -> None:
-    # The removed "?" sits between the letter and its mark.
+@pytest.mark.parametrize(
+    ("unicode_filenames", "expected"),
+    [(False, "\u00e9"), (True, "e\uff1f\u0301")],
+)
+def test_sanitising_a_name_again_does_not_change_it(
+    monkeypatch: pytest.MonkeyPatch, unicode_filenames: bool, expected: str
+) -> None:
+    monkeypatch.setattr(config, "unicode_filenames", unicode_filenames)
+    monkeypatch.setattr(config, "filename_replacements", {})
+    # Stripping "?" lets NFC compose the letter and mark; its fullwidth twin keeps them apart.
     once = sanitize_filename("e?\u0301", unicode=True)
-    assert once == "\u00e9"
+    assert once == expected
     assert sanitize_filename(once, unicode=True) == once

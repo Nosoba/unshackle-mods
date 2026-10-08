@@ -144,7 +144,8 @@ def test_quality_parts_are_deduplicated_and_ordered() -> None:
     assert name == "Example.Movie.2024.2160p.1080p.h264.h265.sdr.hdr10.dv.dash.ism.aac2.0.ddp5.1atmos.ddp2.0-EXAMPLE"
 
 
-def test_title_is_filename_safe_and_keeps_letters() -> None:
+def test_title_is_filename_safe_and_keeps_letters(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "unicode_filenames", False)
     name = export_name([movie('Café: "Ünïcode"/Kanji 映画?', year=None)], [], "EXAMPLE")
     assert name == "Café.Ünïcode.&.Kanji.映画-EXAMPLE"
 

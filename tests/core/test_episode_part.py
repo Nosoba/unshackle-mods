@@ -85,14 +85,14 @@ def test_str_shows_the_selection_syntax():
     assert str(make_episode(part=2)) == "The Show S01E01.2 The Reckoning"
 
 
-def test_str_tells_dated_parts_apart():
+def test_str_tells_dated_parts_apart(reset_template):
     # dated content renders the air date instead of SxxExx, so without the suffix both
     # parts print the same string while their filenames differ
     assert str(make_episode(part=2, air_date="2024-05-06")) == "The Show 2024.05.06.2 The Reckoning"
     assert str(make_episode(air_date="2024-05-06")) == "The Show 2024.05.06 The Reckoning"
 
 
-def test_tree_label_carries_the_part_on_dated_content():
+def test_tree_label_carries_the_part_on_dated_content(reset_template):
     series = Series([make_episode(part=1, air_date="2024-05-06"), make_episode(part=2, air_date="2024-05-06")])
     labels = [node.label for node in series.tree(verbose=True).children[0].children]
     assert labels == [

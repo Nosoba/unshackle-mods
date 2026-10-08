@@ -97,7 +97,7 @@ By default a missing requested resolution is an error. Two flags change that:
 
 | Flag | Behaviour |
 | --- | --- |
-| `--best-available` (`--warn-only`) | If the requested resolution(s) are not present, continue with the best that *is* available instead of failing. Also softens missing video/audio/subtitle languages and hybrid fallbacks. |
+| `--best-available` (`--warn-only`) | If the requested resolution(s) are not present, continue with the best that *is* available instead of failing. Also softens missing video/audio/subtitle languages and hybrid fallbacks, and with `--all-drm` a DRM system that does not license. |
 | `--worst` | Within the specified quality, pick the **lowest** bitrate rendition. **Requires `-q/--quality`.** |
 
 ```shell title="Never fail on a missing resolution"
@@ -416,6 +416,8 @@ video track counts. `--no-audio` and `--no-video` drop the matching requirement.
   `-fs`). Works independently of `--s-lang`, so `-sl all -fsl en` grabs every full
   subtitle but only the English forced track. It accepts exclusions too: `-fsl all,-es`
   keeps every forced subtitle except the Spanish one, and `-fsl -es` means the same.
+- `-fso` / `--forced-subs-only`: keep only the forced subtitle tracks and drop every
+  other subtitle (implies `-fs`). `--s-lang` and `-fsl` still select the languages.
 - `--sub-format`: set the output subtitle format, converting only when necessary.
   Accepts codec names/values and common aliases (`srt`, `vtt`, `ass`, `ssa`, `ttml`,
   and the other codec aliases), or the literal `original` to keep the source format.
@@ -637,8 +639,28 @@ Additional track-type flags:
 
 - `-ad` / `--audio-description`: include descriptive (audio-description) tracks, which
   unshackle drops by default.
+- `-ado` / `--audio-description-only`: keep only the descriptive tracks and drop the
+  standard audio. It does not need `-ad`. Add `-A` to download no video or subtitles.
 - `--skip-subtitle-errors`: if a subtitle fails to download, skip it and continue rather
   than aborting the whole title. Video and audio failures remain fatal.
+
+!!! note "The `-only` kind flags"
+    `-ado` and `-fso` each keep one kind of track inside its track type. They do not drop
+    the other track types: `-ado` still downloads the video, and `-fso` still downloads
+    video and audio. Add `-A` or `-S` for that.
+
+    - The language flags still apply. With the default `-l orig`, `-ado` fails when the
+      descriptive track is not in the original language. Select the language with `-al`.
+    - A flag that drops the same tracks is an error, for example `-ado` with `--no-audio`
+      or `-fso` with `-A`.
+    - A title with no track of that kind stops a run of one title. A run of more than one
+      title skips that title with a warning and continues.
+    - unshackle reads the kind from the manifest or from the service. A track that
+      neither of them marks as descriptive or forced does not match.
+
+```shell title="Audio description only, in English"
+unshackle dl -A -ado -al en EXAMPLE 81234567
+```
 
 ```shell title="Subtitles only"
 unshackle dl -S -sl en EXAMPLE 81234567
@@ -662,6 +684,7 @@ Before committing to a long download, inspect what unshackle *would* do:
 | `--list` | List the tracks the service exposes for each title, then stop. No selection, no download. |
 | `--list-titles` | List every title the service returned, then stop. `-w`, `--latest-episode` and `--latest-episodes` are not applied to this listing. |
 | `--skip-dl` | Skip downloading but still acquire the decryption keys. |
+| `--all-drm` | License each track with both Widevine and PlayReady. See [Widevine and PlayReady on the same title](drm-and-cdm.md#widevine-and-playready-on-the-same-title). |
 
 ```shell title="See the track selection without downloading"
 unshackle dl -q 1080 -v H.265 -r HDR10 --list EXAMPLE 81234567
@@ -793,6 +816,14 @@ older unshackle `version: 2` files and unidl's own export files.
 
 ```shell title="Export track info and keys"
 unshackle dl --skip-dl --export EXAMPLE 81234567
+```
+
+Add `--all-drm` to get the content keys of each DRM system the title offers. The export then
+holds the DRM init data of both. A Key Vault that has a content key stops the challenge for
+its KID; add `--cdm-only` to send a challenge for each DRM system.
+
+```shell title="License with Widevine and PlayReady, no download"
+unshackle dl --skip-dl --all-drm --export EXAMPLE 81234567
 ```
 
 The file name tells what the file holds, in the form

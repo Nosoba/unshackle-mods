@@ -33,7 +33,7 @@ from unshackle.core.proxies.resolve import initialize_proxy_providers, resolve_p
 from unshackle.core.services import Services
 from unshackle.core.titles import Episode, Movie, Song, Title_T
 from unshackle.core.tracks import Audio, Subtitle, Tracks, Video
-from unshackle.core.utilities import declared_kwargs
+from unshackle.core.utilities import declared_kwargs, kind_only_conflict
 from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, SUBTITLE_CODEC, VIDEO_CODEC_LIST
 from unshackle.core.utils.collections import ci_get
 from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_all, redact_secrets, redact_text
@@ -68,6 +68,7 @@ DEFAULT_DOWNLOAD_PARAMS = {
     "require_video": [],
     "require_subs": [],
     "forced_subs": False,
+    "forced_subs_only": False,
     "forced_s_lang": [],
     "exact_lang": False,
     "sub_format": None,
@@ -81,9 +82,11 @@ DEFAULT_DOWNLOAD_PARAMS = {
     "no_video": False,
     "no_attachments": False,
     "audio_description": False,
+    "audio_description_only": False,
     "slow": None,
     "split_audio": None,
     "skip_dl": False,
+    "all_drm": False,
     "export": False,
     "cdm_only": None,
     "proxy": None,
@@ -1842,6 +1845,9 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
             return "output_dir must be a path under the server's downloads directory."
         data["output_dir"] = str(target)
 
+    if data.get("all_drm") and data.get("cdm"):
+        return "all_drm needs a CDM for each DRM system, so it cannot be used with cdm, which selects one device."
+
     if "vcodec" in data and data["vcodec"]:
         err = check_codec(data["vcodec"], VALID_VCODECS, "vcodec")
         if err:
@@ -1929,6 +1935,13 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
         return "Cannot use both no_subs and subs_only"
     if data.get("no_audio") and data.get("audio_only"):
         return "Cannot use both no_audio and audio_only"
+    conflict = kind_only_conflict(data)
+    if conflict:
+        return f"Cannot use both {conflict[0]} and {conflict[1]}"
+
+    for key, default in DEFAULT_DOWNLOAD_PARAMS.items():
+        if isinstance(default, bool) and data.get(key) is not None and not isinstance(data[key], bool):
+            return f"{key} must be a boolean"
 
     for key in ("require_audio", "require_video", "require_subs"):
         value = data.get(key)
@@ -2337,17 +2350,34 @@ def _poll_cursor(before: int, items: List[Dict[str, Any]]) -> int:
     return max(before, items[-1]["seq"]) if items else before
 
 
+def _since(request: web.Request) -> int:
+    """The ``since`` cursor of a poll; 0 (everything) when it is missing or not a number."""
+    try:
+        return int(request.query.get("since", 0))
+    except ValueError:
+        return 0
+
+
 async def dashboard_logs_handler(request: web.Request) -> web.Response:
     """Recent log records; `since` (seq) and `level` filter the ring buffer."""
     from unshackle.core.api.stats import ring
 
-    try:
-        since = int(request.query.get("since", 0))
-    except ValueError:
-        since = 0
+    since = _since(request)
     before = ring.seq
     records = ring.since(since, request.query.get("level"), request.query.get("logger"))
     return web.json_response({"seq": _poll_cursor(before, records), "records": records})
+
+
+async def dashboard_cdm_logs_handler(request: web.Request) -> web.Response:
+    """CDM calls after `since` (seq), plus a snapshot of the open sessions of each live Cdm."""
+    from unshackle.core.api.stats import cdm_calls, cdm_sessions
+
+    since = _since(request)
+    before = cdm_calls.seq
+    records = cdm_calls.since(since)
+    return web.json_response(
+        {"seq": _poll_cursor(before, records), "records": records, "sessions": cdm_sessions(request.app)}
+    )
 
 
 async def dashboard_session_logs_handler(request: web.Request) -> web.Response:
@@ -2363,10 +2393,7 @@ async def dashboard_session_logs_handler(request: web.Request) -> web.Response:
     session = get_session_store().peek(session_id)
     if session is None:
         raise APIError(APIErrorCode.SESSION_NOT_FOUND, f"Remote session not found: {session_id}")
-    try:
-        since = int(request.query.get("since", 0))
-    except ValueError:
-        since = 0
+    since = _since(request)
     buffer = session.log_buffer
     before = buffer.last_seq if buffer else 0
     records = buffer.since(since) if buffer else []

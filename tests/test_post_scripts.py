@@ -62,17 +62,11 @@ def test_bare_variable_expanding_to_a_flag_is_refused(caplog, hostile_value):
     assert "option-like token" in caplog.text
 
 
-def test_flag_prefixed_variable_is_not_refused(caplog):
+def test_flag_prefixed_variable_is_not_refused(monkeypatch, caplog):
     """--opt={var} is the user's own flag; the value in the middle can never forge one."""
     calls = []
-    import unshackle.core.utils.post_scripts as ps
-
-    original = ps.subprocess.Popen
-    ps.subprocess.Popen = lambda argv, **kw: calls.append(argv) or original(["true"])
-    try:
-        dispatch("success", "file", {"title": "--evil=1"}, ["echo --title={title}"])
-    finally:
-        ps.subprocess.Popen = original
+    monkeypatch.setattr(ps.subprocess, "Popen", lambda argv, **kw: calls.append(argv))
+    dispatch("success", "file", {"title": "--evil=1"}, ["echo --title={title}"])
     assert calls and calls[0] == ["echo", "--title=--evil=1"]
     assert "option-like token" not in caplog.text
 
@@ -276,15 +270,20 @@ def _episode(part):
     return Episode(id_="episode-id", service=Svc, title="T", season=1, number=5, part=part, name="Ep")
 
 
-def test_part_is_a_plain_number_on_success_and_failure():
+@pytest.mark.parametrize("separator", [".", " "])
+def test_part_is_a_plain_number_on_success_and_failure(monkeypatch, separator):
     """{part} agrees on both paths, and the failure path carries every title-owned variable."""
     title = _episode(1)
+    # Resolve the live reference: other tests may rebind the module's config.
+    # A missing series template bypasses get_template_separator and always uses dots.
+    episode_config = title.part_suffix.__globals__["config"]
+    monkeypatch.setattr(episode_config, "output_template", {"series": f"{{title}}{separator}{{season_episode}}"})
     success = build_context(title, SimpleNamespace(video_tracks=[], audio_tracks=[]), service="SVC")
     failure = build_context(title, None, service="SVC", error="Boom")
     for context in (success, failure):
         assert context["part"] == "1"
         assert context["episode"] == "5"
-        assert context["season_episode"] == "S01E05.Part.1"
+        assert context["season_episode"] == f"S01E05{separator}Part{separator}1"
     assert failure["quality"] == ""
     assert build_context(_episode(None), None, service="SVC")["part"] == ""
 

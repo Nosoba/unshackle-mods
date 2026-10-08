@@ -43,12 +43,15 @@ Common config keys. This is a useful subset, and every `dl` flag works:
 | `sub_format` | str | *(unset)* | Convert subtitles to this format (`srt`, `vtt`, `original`, ...). |
 | `forced_subs` | bool | `false` | Include forced subtitle tracks. |
 | `forced_s_lang` | list | `[]` | Forced subtitle language(s); implies `forced_subs`. A `-` prefix excludes. |
+| `forced_subs_only` | bool | `false` | Keep only forced subtitle tracks; implies `forced_subs`. |
+| `audio_description` | bool | `false` | Include descriptive (audio-description) tracks. |
+| `audio_description_only` | bool | `false` | Keep only descriptive (audio-description) tracks. |
 | `no_subs` / `no_audio` / `no_chapters` / `no_attachments` | bool | `false` | Skip that track type. `no_attachments` also skips attaching subtitle fonts. |
 | `downloads` | int | `1` | Tracks downloaded concurrently. |
 | `workers` | int | *(downloader default)* | Threads per track. |
 | `speed_limit` | str | *(unlimited)* | Total download speed cap across all downloads combined, e.g. `500k`, `5M`, `1.5G` or plain bytes/sec. Values are bytes, not bits (`5M` = 5.0 MB/s). |
 | `slow` | str | *(unset)* | Inter-title delay, e.g. `"20-40"`. |
-| `best_available` | bool | `false` | Warn instead of failing when a requested resolution, range, or language is missing. The CLI flag is `--best-available`, also spelled `--warn-only`. |
+| `best_available` | bool | `false` | Warn instead of failing when a requested resolution, range, or language is missing, or when one DRM system does not license under `--all-drm`. The CLI flag is `--best-available`, also spelled `--warn-only`. |
 | `proxy` | str | *(unset)* | Default proxy URI or 2-letter country. |
 | `no_folder` | bool | `false` | Do not create a per-title folder. |
 

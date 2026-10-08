@@ -21,6 +21,7 @@ from unshackle.core.api.handlers import (
     clear_cache_handler,
     clear_finished_download_jobs_handler,
     clear_temp_handler,
+    dashboard_cdm_logs_handler,
     dashboard_events_handler,
     dashboard_health_handler,
     dashboard_jobs_handler,
@@ -895,6 +896,9 @@ async def download(request: web.Request) -> web.Response:
               forced_subs:
                 type: boolean
                 description: Include forced subtitle tracks (default - false)
+              forced_subs_only:
+                type: boolean
+                description: Download forced subtitle tracks and no other subtitle tracks, implies forced_subs (default - false)
               forced_s_lang:
                 type: array
                 items:
@@ -936,6 +940,9 @@ async def download(request: web.Request) -> web.Response:
               audio_description:
                 type: boolean
                 description: Download audio description tracks (default - false)
+              audio_description_only:
+                type: boolean
+                description: Download audio description tracks and no standard audio tracks (default - false)
               slow:
                 oneOf:
                   - type: boolean
@@ -947,6 +954,9 @@ async def download(request: web.Request) -> web.Response:
               skip_dl:
                 type: boolean
                 description: Skip downloading, only retrieve decryption keys (default - false)
+              all_drm:
+                type: boolean
+                description: License each track with both Widevine and PlayReady. A DRM system sends a challenge only for a KID that no vault has, unless `cdm_only` is true. Needs a CDM for each DRM system and cannot be used with `cdm` (default - false)
               export:
                 type: boolean
                 description: Export manifest, DRM init data, keys, and track info to a JSON file in the exports directory (default - false)
@@ -2636,6 +2646,91 @@ async def dashboard_logs(request: web.Request) -> web.Response:
 
 
 @api_handler
+async def dashboard_cdm_logs(request: web.Request) -> web.Response:
+    """
+    Dashboard: recent CDM calls and open CDM sessions.
+    ---
+    summary: Dashboard CDM call log
+    description: >
+      The last 5000 calls to the Widevine and PlayReady CDM device routes, one record for each
+      call, with a snapshot of the open sessions of each live Cdm. A record never holds an API
+      key, `init_data`, a challenge, a certificate, a licence body or a content key.
+      Poll with `since` set to the `seq` of the last reply. The server does not publish these
+      records on the event stream.
+    tags: [Dashboard]
+    parameters:
+      - name: since
+        in: query
+        required: false
+        schema:
+          type: integer
+        description: Return only records with seq greater than this value
+    responses:
+      '200':
+        description: Records plus the current seq and the open sessions
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seq:
+                  type: integer
+                records:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      seq:
+                        type: integer
+                      ts:
+                        type: number
+                      drm:
+                        type: string
+                        enum: [widevine, playready]
+                      op:
+                        type: string
+                      device:
+                        type: string
+                      key_id:
+                        type: string
+                      user:
+                        type: string
+                      session_id:
+                        type: string
+                        nullable: true
+                      status:
+                        type: integer
+                      ok:
+                        type: boolean
+                      error:
+                        type: string
+                        nullable: true
+                      ms:
+                        type: number
+                sessions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      drm:
+                        type: string
+                      device:
+                        type: string
+                      key_id:
+                        type: string
+                      user:
+                        type: string
+                      open:
+                        type: integer
+                      max:
+                        type: integer
+      '401':
+        description: Dashboard key missing or invalid
+    """
+    return await dashboard_cdm_logs_handler(request)
+
+
+@api_handler
 async def dashboard_session_logs(request: web.Request) -> web.Response:
     """
     Dashboard: one remote session's service log.
@@ -2977,6 +3072,7 @@ DASHBOARD_ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("GET", DASHBOARD_PREFIX + "sessions", dashboard_sessions, True),
     ("GET", DASHBOARD_PREFIX + "jobs", dashboard_jobs, True),
     ("GET", DASHBOARD_PREFIX + "logs", dashboard_logs, True),
+    ("GET", DASHBOARD_PREFIX + "cdm-logs", dashboard_cdm_logs, True),
     ("GET", DASHBOARD_PREFIX + "keys", dashboard_keys, True),
     ("GET", DASHBOARD_PREFIX + "services", dashboard_services, True),
     ("GET", DASHBOARD_PREFIX + "health", dashboard_health, True),
@@ -2985,15 +3081,19 @@ DASHBOARD_ROUTES: list[tuple[str, str, Handler, bool]] = [
 ]
 
 
-def setup_routes(app: web.Application, remote_only: bool = False, dashboard: bool = False) -> None:
+def setup_routes(
+    app: web.Application, remote_only: bool = False, dashboard: bool = False, cdm_only: bool = False
+) -> None:
     """Setup API routes. When remote_only=True, only the remote session endpoints operate.
-    When dashboard=True, this also registers the /api/dashboard/ routes."""
+    When cdm_only=True, only /api/health operates. When dashboard=True, this also registers
+    the /api/dashboard/ routes."""
     add: dict[str, Callable[..., Any]] = {
         "GET": app.router.add_get,
         "POST": app.router.add_post,
         "DELETE": app.router.add_delete,
     }
-    for method, path, handler, remote in ROUTES + (DASHBOARD_ROUTES if dashboard else []):
+    api_routes = [r for r in ROUTES if r[1] == "/api/health"] if cdm_only else ROUTES
+    for method, path, handler, remote in api_routes + (DASHBOARD_ROUTES if dashboard else []):
         if remote_only and not remote:
             continue
         add[method](path, handler)
