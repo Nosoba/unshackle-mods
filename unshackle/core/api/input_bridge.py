@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+from unshackle.core.api.errors import APIError, APIErrorCode
+
 
 class AuthStatus(Enum):
     """Authentication lifecycle states for a remote session."""
@@ -203,3 +205,17 @@ class InputBridge:
     def status(self, value: AuthStatus) -> None:
         with self._lock:
             self._status = value
+
+
+class StatelessInputBridge(InputBridge):
+    """Reject prompts on list/search requests, which have no input-response channel."""
+
+    def request_input(self, prompt: str, timeout: float = AUTH_INPUT_TIMEOUT) -> str:
+        self.status = AuthStatus.FAILED
+        # Do not echo the prompt: services may include private account information in it.
+        raise APIError(
+            APIErrorCode.AUTH_FAILED,
+            "Authentication requires interactive input, which stateless list/search requests cannot answer. "
+            "Start a download job or remote session to provide the OTP or other login input.",
+            details={"reason": "interactive_auth_required"},
+        )
