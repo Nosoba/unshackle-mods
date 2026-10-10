@@ -98,6 +98,7 @@ Show the streaming services available on this server, filtered by your allowlist
           ],
           "needs_auth": true,
           "has_search": true,
+          "anonymous_search": false,
           "has_drm": true,
           "auth_methods": ["cookies"]
         }
@@ -120,6 +121,7 @@ Field notes:
 | `cli_params` | Array of parameter descriptors. Arguments have `{name, kind: "argument", required}`; options have `{name, kind: "option", opts, is_flag, default, help, type, multiple}` and, for choice options, a `choices` list. |
 | `needs_auth` | Whether the service overrides `authenticate()`. |
 | `has_search` | Whether the service supports `POST /api/search`. |
+| `anonymous_search` | Whether `POST /api/search` operates with no login for this service. The server then ignores `credentials` and `cookies` on a search. |
 | `has_drm` | Whether the service overrides a Widevine or PlayReady license hook. |
 | `pending_update` | Set to `true` while a service repository refresh waits for this service's jobs to finish before it swaps in the new code. Absent otherwise. |
 | `server_accounts` | Present when the server lends its own accounts for this service: `{regions: ["ca", "gb"], global: bool}`, the regions those accounts cover. A client sends no credentials, cookies, or cache for such a service. |
@@ -133,6 +135,8 @@ Field notes:
 ### `POST /api/search`
 
 Find titles in a service by query string. The service must have a `search()` method (see `has_search` above).
+
+For a service with `anonymous_search`, the server does not log in and ignores `credentials` and `cookies`. The server account check still applies.
 
 **Request body**
 
@@ -196,6 +200,13 @@ Get the list of titles behind a title ID, for example episodes or a movie, witho
 | `credentials`, `cookies`, `cache` | - | no | Your own login material, on a `--remote-only` server only. See [Client cache on a remote-only server](#client-cache-on-a-remote-only-server). |
 
 You can also pass service-specific CLI options as additional keys.
+
+#### Logins that need the user
+
+`search`, `list-titles` and `list-tracks` have no channel to the user. A login that asks for
+input or waits for an approval on another device fails at once with `AUTH_FAILED` on these
+endpoints. Complete that login in a download job or a remote session, then send the saved
+login with the request.
 
 #### Client cache on a remote-only server
 
@@ -556,7 +567,8 @@ Show download jobs, with optional filtering and sorting.
           "segments_total": 300,
           "speed": "5.2 MB/s",
           "skipped_subtitles": [],
-          "input_prompt": null
+          "input_prompt": null,
+          "notice": null
         }
       ]
     }
@@ -720,6 +732,10 @@ Answer the prompt that a running job waits on. A service can ask for input durin
 example an OTP code, a PIN, or a device-code confirmation. The job then shows the prompt in its
 `input_prompt` field and in its `progress` events. Show the prompt to the user and send the
 answer here.
+
+A job that waits for an approval on another device, such as a pair code login, shows the
+message in its `notice` field instead. A notice needs no answer: show it to the user and keep
+polling.
 
 === "Request"
 
@@ -957,7 +973,7 @@ The `proxy` value must be a full proxy URI, unless the operator gives your API k
     }
     ```
 
-`server_account` is `true` when the server authenticated with one of its own accounts (`serve.server_accounts`). Otherwise the server uses only what the client sent, and never falls back to its own credentials. Only a client that sent its own cookies, credentials, or cache files gets cookies, auth headers, and the remote session cache back. A client that answered a login prompt (a device code or an OTP) gets them too. This applies only when the login then succeeds and the remote session does not use a server account. For any other remote session (a server account, or an anonymous login through the server's proxy) the tracks and segments responses carry no cookies and no auth headers. The server also drops secret-looking keys from track data, and the cache stays on the server. A server-account service also refuses a client proxy URI, because the server's login would pass through it.
+`server_account` is `true` when the server authenticated with one of its own accounts (`serve.server_accounts`). Otherwise the server uses only what the client sent, and never falls back to its own credentials. When the login succeeds and the remote session does not use a server account, the login belongs to the client, and the client gets cookies, auth headers, and the remote session cache back. A remote session on the server's device is the exception: the client gets its cookies back, but no auth headers and no cache. For a server-account remote session the tracks and segments responses carry no cookies and no auth headers. The server also drops secret-looking keys from track data, and the cache stays on the server. A server-account service also refuses a client proxy URI, because the server's login would pass through it.
 
 | Status | Error code | Meaning |
 | --- | --- | --- |

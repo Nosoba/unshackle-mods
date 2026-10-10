@@ -1,10 +1,11 @@
 import logging
+import time
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
 
 if TYPE_CHECKING:
     from unshackle.core.api.input_bridge import InputBridge
@@ -18,7 +19,7 @@ from rich.rule import Rule
 
 from unshackle.core.cacher import Cacher
 from unshackle.core.config import config
-from unshackle.core.console import console, prompt_user
+from unshackle.core.console import console, prompt_user, show_notice
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
 from unshackle.core.drm import DRM_T
@@ -140,6 +141,9 @@ def sanitize_proxy_for_log(uri: Optional[str], mask_host: bool = False) -> Optio
     return mask_proxy(uri, mask_host=mask_host, allow_debug=False)
 
 
+T = TypeVar("T")
+
+
 class Service(metaclass=ABCMeta):
     """The Service Base Class.
 
@@ -154,6 +158,7 @@ class Service(metaclass=ABCMeta):
     GEOBLOCK: tuple[str, ...] = ()  # ip regions where the service refuses to work; everything else is allowed.
     ANIME: bool = False  # service catalogue is anime; metadata lookups prefer AniList. Title.anime overrides per title.
     DAILY: bool = False  # catalog is daily/date-based. episodes are named by air date. Title.daily overrides per title.
+    ANONYMOUS_SEARCH: bool = False  # search() needs no login; a search then skips cookies and authenticate().
     # vault namespace override; when set, key vault read/write uses this tag instead of the service's own.
     VAULT_TAG: Optional[str] = None
     # Auth methods the service accepts ("cookies"/"credentials"); when None the REST /services
@@ -452,7 +457,8 @@ class Service(metaclass=ABCMeta):
 
         This is effectively a login() function. Any API calls or object initializations
         needing to be made, should be made here. unshackle operates this method before
-        any of the following abstract functions.
+        any of the following abstract functions. The one exception is a search on a
+        Service that sets ``ANONYMOUS_SEARCH``, which does not operate this method.
 
         You should avoid storing or using the Credential outside this function.
         Make any calls you need for any Cookies, Tokens, or such, then use those.
@@ -489,6 +495,32 @@ class Service(metaclass=ABCMeta):
         if self._input_bridge is not None:
             return self._input_bridge.request_input(prompt)
         return prompt_user(prompt)
+
+    def wait_for_approval(
+        self, message: str, check: Callable[[], Optional[T]], timeout: float, interval: float = 3.0
+    ) -> T:
+        """Show ``message``, then call ``check`` until it returns a value.
+
+        Use it for a login that the user approves on another device, such as a pair code.
+        ``check`` returns None while the approval is pending, and must return within a few
+        seconds. Raises TimeoutError after ``timeout`` seconds, and RuntimeError when the
+        remote session no longer exists. A REST download job shows ``message`` as its ``notice``.
+        """
+        self.log.info(message)
+        show_notice(message)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if self._input_bridge is not None:
+                    self._input_bridge.ensure_active()
+                result = check()
+                if result is not None:
+                    return result
+                if time.monotonic() + interval >= deadline:
+                    raise TimeoutError(f"No approval within {timeout:.0f}s")
+                time.sleep(interval)
+        finally:
+            show_notice(None)
 
     def search(self) -> Generator[SearchResult, None, None]:
         """

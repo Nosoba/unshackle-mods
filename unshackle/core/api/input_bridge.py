@@ -198,9 +198,15 @@ class InputBridge:
         self._picked_up.set()
         self._response_ready.set()
 
+    def ensure_active(self) -> None:
+        """Raise RuntimeError once the server cancelled the bridge, so a login loop stops."""
+        with self._lock:
+            if self._cancelled:
+                raise RuntimeError("Session was cancelled")
+
     @property
     def answered(self) -> bool:
-        """``True`` once the bridge has accepted a response from the client."""
+        """True once a user input response was accepted; CDM answers do not count."""
         with self._lock:
             return self._answered
 
@@ -221,6 +227,10 @@ class StatelessInputBridge(InputBridge):
     def request_input(self, prompt: str, timeout: float = AUTH_INPUT_TIMEOUT) -> str:
         self.ensure_input_supported()
 
+    def ensure_active(self) -> NoReturn:
+        """Approval polling cannot reach a user on stateless requests either."""
+        self.ensure_input_supported()
+
     def ensure_input_supported(self) -> NoReturn:
         self.status = AuthStatus.FAILED
         # Do not echo the prompt: services may include private account information in it.
@@ -230,3 +240,23 @@ class StatelessInputBridge(InputBridge):
             "Start a download job or remote session to provide the OTP or other login input.",
             details={"reason": "interactive_auth_required"},
         )
+
+
+NO_USER_MESSAGE = (
+    "This login needs the user, and this request cannot reach the user. "
+    "Start a download job or a remote session to complete the authentication"
+)
+
+
+class NoUserBridge(InputBridge):
+    """Bridge for a request with no channel to the user: a login step that needs the user fails at once."""
+
+    def request_input(self, prompt: str, timeout: float = AUTH_INPUT_TIMEOUT) -> str:
+        raise RuntimeError(NO_USER_MESSAGE)
+
+    def ensure_active(self) -> None:
+        raise RuntimeError(NO_USER_MESSAGE)
+
+    def ensure_input_supported(self) -> NoReturn:
+        """Reject before issuing an OTP, not only when requesting its answer."""
+        raise RuntimeError(NO_USER_MESSAGE)

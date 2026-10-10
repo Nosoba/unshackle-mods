@@ -3,6 +3,7 @@
 import asyncio
 import builtins
 import json
+import logging
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -184,6 +185,24 @@ def test_stateless_preflight_never_sends_otp(operation, services):
     assert sum(service.otp_requests for service in services) == 0
 
 
+def test_stateless_approval_never_polls(operation, services, monkeypatch):
+    checks = Mock(return_value="approved")
+
+    def authenticate(self, cookies, credential):
+        self.log = logging.getLogger("test")
+        Service.wait_for_approval(self, "Approve login on another device", checks, timeout=5)
+        self.authenticated = True
+
+    monkeypatch.setattr(FakeService, "authenticate", authenticate)
+    for _ in range(3):
+        with pytest.raises(APIError) as raised:
+            run_stateless(operation)
+        assert raised.value.details == {"reason": "interactive_auth_required"}
+        assert services[-1]._input_bridge.status is AuthStatus.FAILED
+        assert not services[-1].authenticated
+    checks.assert_not_called()
+
+
 def test_cli_preflight_is_noop_and_still_prompts(monkeypatch):
     service = FakeService()
     terminal = Mock(return_value="001234")
@@ -221,6 +240,7 @@ def test_download_worker_still_relays_service_input(monkeypatch):
             os.write(write_fd, b'"123456"\n')
 
     previous_handler = console_module._prompt_handler
+    previous_notice_handler = console_module._notice_handler
     try:
         download_worker.relay_prompts(answer_on_prompt)
         service = FakeService()
@@ -230,6 +250,7 @@ def test_download_worker_still_relays_service_input(monkeypatch):
         assert service.request_input(PROMPT) == "123456"
     finally:
         console_module.set_prompt_handler(previous_handler)
+        console_module.set_notice_handler(previous_notice_handler)
         os.close(write_fd)
         os.close(read_fd)
     assert updates == [{"input_prompt": PROMPT}, {"input_prompt": None}]

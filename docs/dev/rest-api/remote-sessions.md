@@ -127,6 +127,9 @@ hood the client walks a remote session through its lifecycle.
       URI and runs its own forwarder for it. A bare region skips Control D, because its
       proxy is a forwarder on the client. See
       [Control D](../../guide/proxies-and-vpn.md#control-d)
+      The client also downloads playlists and segments through the same proxy,
+      as a local run does. `--no-proxy-download` and `--proxy-download` change
+      that for downloads only.
     - Track-selection hints (`range_`, `vcodec`, `quality`, `best_available`) so
       the server fetches the right manifests
     - Your language and audio codec selection (`-l`, `-vl`, `-al`, `-a`, `-fs`)
@@ -213,9 +216,9 @@ hood the client walks a remote session through its lifecycle.
     deletes the remote session. If the login belongs to the client, the `DELETE`
     request returns the updated cache files (for example a refreshed token) and the
     client saves them locally, so the **next** remote session can skip interactive
-    authentication. The login belongs to the client when the client sent
-    cookies, credentials, or cache files, or answered a login prompt (a device code
-    or an OTP) that led to a successful login. A server-account login never does,
+    authentication. The login belongs to the client when it succeeds and the
+    remote session does not use a server account. This includes a pair code that
+    the user approves on another device. A server-account login never does,
     and neither does a remote session on the server's device (see below).
     The client saves only the returned files that pass the same profile check it
     applies before it sends them, so a file for another profile cannot overwrite

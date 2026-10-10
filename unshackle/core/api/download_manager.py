@@ -128,6 +128,8 @@ class DownloadJob:
 
     # Prompt a service raised through prompt_user() and waits on; answered by submit_input().
     input_prompt: Optional[str] = None
+    # Message a service shows through show_notice() while it waits for an approval; needs no answer.
+    notice: Optional[str] = None
 
     # Subtitles skipped under skip_subtitle_errors (non-fatal). Each entry is a dl.SkippedSubtitle
     # dict (id / language / title) so a client can report which weren't available.
@@ -167,6 +169,7 @@ class DownloadJob:
             "skipped_subtitles": self.skipped_subtitles,
             "input_prompt": self.input_prompt,
             "track_tree_text": self.track_tree_text,
+            "notice": self.notice,
         }
 
         if include_full_details:
@@ -1133,6 +1136,8 @@ class DownloadQueueManager:
                                 job.speed = str(progress_data["speed"])
                             if "input_prompt" in progress_data:
                                 job.input_prompt = progress_data["input_prompt"]
+                            if "notice" in progress_data:
+                                job.notice = progress_data["notice"]
                             if progress_data.get("skipped_subtitles"):
                                 job.skipped_subtitles = progress_data["skipped_subtitles"]
                             if progress_data.get("track_tree_text"):
@@ -1202,11 +1207,11 @@ class DownloadQueueManager:
                 if result_data:
                     job.error_details = result_data.get("error_details", message)
                     job.error_code = result_data.get("error_code")
-                
+
                 # Expose stderr to the caller if we lack a concrete reason
                 if safe_stderr and (not job.error_details or job.error_details == message or "SystemExit" in message):
                     job.error_details = safe_stderr[-1000:].strip()
-                    
+
                 raise Exception(f"Worker exited with code {returncode}: {message}")
 
             if not result_data or result_data.get("status") != "success":
@@ -1226,6 +1231,7 @@ class DownloadQueueManager:
 
             self._download_processes.pop(job.job_id, None)
             job.input_prompt = None
+            job.notice = None
 
             temp_paths = self._job_temp_files.pop(job.job_id, {})
             for path in temp_paths.values():

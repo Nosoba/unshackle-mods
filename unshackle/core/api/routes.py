@@ -388,6 +388,7 @@ async def services(request: web.Request) -> web.Response:
                 if client_config:
                     service_data["client_config"] = list(client_config)
                 service_data["has_search"] = getattr(service_module, "search", None) is not _BaseService.search
+                service_data["anonymous_search"] = bool(getattr(service_module, "ANONYMOUS_SEARCH", False))
                 service_data["has_drm"] = (
                     getattr(service_module, "get_widevine_license", None) is not _BaseService.get_widevine_license
                     or getattr(service_module, "get_playready_license", None) is not _BaseService.get_playready_license
@@ -435,7 +436,7 @@ async def search(request: web.Request) -> web.Response:
     Find titles from a service.
     ---
     summary: Find titles
-    description: Find titles by query string from a service
+    description: Find titles by query string from a service. A service that reports anonymous_search does the search with no login, and ignores credentials and cookies.
     requestBody:
       required: true
       content:
@@ -1375,7 +1376,8 @@ async def download_job_input(request: web.Request) -> web.Response:
     description: >
       Submit the answer to the prompt a running job waits on (an OTP code, a PIN, a device-code
       confirmation). The job shows the prompt in its `input_prompt` field and in its SSE `progress`
-      events. The job fails if nobody answers within the prompt timeout.
+      events. The job fails if nobody answers within the prompt timeout. A job that waits for an
+      approval on another device shows the message in its `notice` field, which takes no answer.
     parameters:
       - name: job_id
         in: path
