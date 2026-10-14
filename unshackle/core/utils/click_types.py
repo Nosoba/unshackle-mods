@@ -184,7 +184,7 @@ class SeasonRange(click.ParamType):
 
     DATE_TOKEN = re.compile(r"^(?P<left>\d{4}-\d{2}-\d{2})(:(?P<right>\d{4}-\d{2}-\d{2}))?$")
     TOKEN = re.compile(
-        r"^(?:S(?P<season>\d+)(E(?P<episode>\d+)(\.(?P<part>\d+))?)?"
+        r"^(?:S(?P<season>\d+(?:\.\d+)?)(E(?P<episode>\d+)(\.(?P<part>\d+))?)?"
         r"|((?P<disc>\d+)x)?(?P<track>\d+))$",
         re.IGNORECASE,
     )
@@ -203,7 +203,7 @@ class SeasonRange(click.ParamType):
             self.fail(f"Invalid range, a date range cannot span more than {self.MAX_DATE_SPAN} days: {token}")
         return [(left + timedelta(days=i)).isoformat() for i in range(span)]
 
-    def token_sides(self, match: re.Match) -> tuple[int, Optional[int], Optional[int]]:
+    def token_sides(self, match: re.Match) -> tuple[int | float, Optional[int], Optional[int]]:
         """Read one side of a token as (season, episode, part), episode/part None when absent.
 
         A music disc x track token shares this (season, episode, part) space, disc reading
@@ -212,10 +212,12 @@ class SeasonRange(click.ParamType):
         silently add tracks on a multi-disc release.
         """
         if match.group("season") is not None:
+            season = match.group("season")
             episode = match.group("episode")
             part = match.group("part")
+            season_number = float(season) if "." in season else int(season)
             return (
-                int(match.group("season")),
+                int(season_number) if isinstance(season_number, float) and season_number.is_integer() else season_number,
                 int(episode) if episode is not None else None,
                 int(part) if part is not None else None,
             )
@@ -226,6 +228,7 @@ class SeasonRange(click.ParamType):
         """
         Parse multiple tokens or ranged tokens as '{s}x{e}' strings.
 
+        A fractional season such as S0.5 uses the same episode keys, but cannot be ranged.
         You address an episode split into separately playable parts as '{s}x{e}.{p}'.
         A part range must stay inside one episode, because how many parts an episode has
         is not knowable here. unshackle cannot remove a part-qualified exclusion from the
@@ -278,7 +281,8 @@ class SeasonRange(click.ParamType):
             parsed = [self.TOKEN.match(x) for x in re.split(r"[:-]", token)]
             if len(parsed) > 2:
                 self.fail(f"Invalid token, only a left and right range is acceptable: {token}")
-            if len(parsed) == 1:
+            is_range = len(parsed) == 2
+            if not is_range:
                 # the same match object is read with different per-side defaults, so a bare
                 # S01 spans from MIN_EPISODE to MAX_EPISODE
                 parsed.append(parsed[0])
@@ -288,6 +292,8 @@ class SeasonRange(click.ParamType):
             from_episode = from_episode_raw if from_episode_raw is not None else self.MIN_EPISODE
             to_season, to_episode_raw, to_part = self.token_sides(parsed[1])  # type: ignore[arg-type]
             to_episode = to_episode_raw if to_episode_raw is not None else self.MAX_EPISODE
+            if is_range and any("." in (match.group("season") or "") for match in parsed):
+                self.fail(f"Invalid range, fractional seasons cannot be ranged: {token}")
             if from_season > to_season:
                 self.fail(f"Invalid range, left side season cannot be bigger than right side season: {token}")
             if from_season == to_season and from_episode > to_episode:
@@ -304,13 +310,18 @@ class SeasonRange(click.ParamType):
                 for p in range(from_part, to_part + 1):
                     (computed if not exclude else exclusions).append(f"{from_season}x{from_episode}.{p}")
                 continue
+            if isinstance(from_season, float):
+                (computed if not exclude else exclusions).extend(
+                    f"{from_season}x{e}" for e in range(from_episode, to_episode + 1)
+                )
+                continue
             for s in range(from_season, to_season + 1):
                 for e in range(
                     from_episode if s == from_season else 0, (self.MAX_EPISODE if s < to_season else to_episode) + 1
                 ):
                     (computed if not exclude else exclusions).append(f"{s}x{e}")
         for exclusion in exclusions:
-            if "." in exclusion:
+            if "." in exclusion.partition("x")[2]:
                 computed.append(f"!{exclusion}")  # base key stays; resolved at match time
             else:
                 # a base exclusion must drop that episode's part keys too, or they still match

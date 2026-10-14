@@ -204,7 +204,7 @@ def test_rest_multi_episode_order_is_stable_across_parts(monkeypatch) -> None:
     assert selected(result) == ["1x1.1", "1x1.2", "1x1.3", "1x2"]
 
 
-SNIFF = r"^!?\d+x\d+(\.\d+)?$"
+SNIFF = r"^!?\d+(?:\.\d+)?x\d+(\.\d+)?$"
 
 
 @pytest.mark.parametrize(
@@ -215,9 +215,12 @@ SNIFF = r"^!?\d+x\d+(\.\d+)?$"
         (["1x1.2"], True),  # part key
         (["!1x1.2"], True),  # negative part key
         (["1x1", "!1x1.2"], True),
+        (["0.5x1"], True),
+        (["0.5x1.2", "!0.5x1.3"], True),
         (["S01E01"], False),
         (["s1e1.2"], False),
         (["S01"], False),
+        (["S0.5E01"], False),
         (["1x1", "S01E02"], False),
     ],
 )
@@ -253,19 +256,40 @@ def test_perform_download_skips_reconversion_for_preparsed_part_keys(monkeypatch
     assert params["wanted"] == ["1x1", "1x1.2", "!1x1.3"]
 
 
-def test_perform_download_still_converts_cli_style_tokens(monkeypatch) -> None:
+def test_perform_download_skips_reconversion_for_fractional_keys(monkeypatch) -> None:
     from unshackle.core.api.download_manager import perform_download
     from unshackle.core.utils.click_types import SeasonRange
 
     calls = []
-    monkeypatch.setattr(SeasonRange, "parse_tokens", lambda self, *t: calls.append(t) or ["1x1"])
+    monkeypatch.setattr(SeasonRange, "parse_tokens", lambda self, *t: calls.append(t) or [])
+    params: Dict[str, Any] = {"wanted": ["0.5x1", "0.5x1.2", "!0.5x1.3"]}
+    with pytest.raises(BaseException):
+        perform_download("job-fractional", "NoSuchServiceXYZ", "t1", params)
+    assert calls == []
+    assert params["wanted"] == ["0.5x1", "0.5x1.2", "!0.5x1.3"]
 
-    params: Dict[str, Any] = {"wanted": "S01E01"}
+
+@pytest.mark.parametrize("token,key", [("S01E01", "1x1"), ("S0.5E01", "0.5x1")])
+def test_perform_download_still_converts_cli_style_tokens(monkeypatch, token, key) -> None:
+    from unshackle.core.api.download_manager import perform_download
+    from unshackle.core.utils.click_types import SeasonRange
+
+    calls = []
+    monkeypatch.setattr(SeasonRange, "parse_tokens", lambda self, *t: calls.append(t) or [key])
+
+    params: Dict[str, Any] = {"wanted": token}
     with pytest.raises(BaseException):
         perform_download("job-2", "NoSuchServiceXYZ", "t1", params)
 
-    assert calls == [("S01E01",)]
-    assert params["wanted"] == ["1x1"]
+    assert calls == [(token,)]
+    assert params["wanted"] == [key]
+
+
+def test_rest_fractional_season_and_part_selection(monkeypatch) -> None:
+    titles = [ep(0.5, 1, 1), ep(0.5, 1, 2), ep(0.5, 2)]
+    assert selected(run_list_tracks(monkeypatch, titles, wanted="S0.5E01")) == ["0.5x1.1", "0.5x1.2"]
+    assert selected(run_list_tracks(monkeypatch, titles, wanted="S0.5E01.2")) == ["0.5x1.2"]
+    assert selected(run_list_tracks(monkeypatch, titles, wanted=["S0.5", "-S0.5E01.2"])) == ["0.5x1.1", "0.5x2"]
 
 
 def test_dl_and_handlers_share_the_one_match_helper() -> None:

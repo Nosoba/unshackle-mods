@@ -1,3 +1,4 @@
+import math
 import re
 from abc import ABC
 from collections import Counter
@@ -27,7 +28,7 @@ class Episode(Title):
         id_: Any,
         service: type,
         title: str,
-        season: Union[int, str],
+        season: Union[int, float, str],
         number: Union[int, str],
         name: Optional[str] = None,
         year: Optional[Union[int, str]] = None,
@@ -47,10 +48,21 @@ class Episode(Title):
 
         if season != 0 and not season:
             raise ValueError("Episode season must be provided")
-        if isinstance(season, str) and season.isdigit():
-            season = int(season)
+        if isinstance(season, str):
+            if season.isdigit():
+                season = int(season)
+            else:
+                try:
+                    season = float(season)
+                except ValueError:
+                    raise TypeError(f"Expected season to be a number, not {season!r}") from None
+        if isinstance(season, float):
+            if not math.isfinite(season):
+                raise ValueError(f"Episode season must be finite, not {season!r}")
+            if season.is_integer():
+                season = int(season)
         elif not isinstance(season, int):
-            raise TypeError(f"Expected season to be an int, not {season!r}")
+            raise TypeError(f"Expected season to be a number, not {season!r}")
 
         if number != 0 and not number:
             raise ValueError("Episode number must be provided")

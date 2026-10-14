@@ -456,7 +456,7 @@ def perform_download(
             # the CLI splits a comma-separated value before parsing, so a raw string must too
             wanted_raw = re.split(r"\s*[,;]\s*", wanted_raw)
         # the !? keeps a pre-parsed part exclusion from being re-fed through parse_tokens
-        needs_conversion = any(not re.match(r"^!?\d+x\d+(\.\d+)?$", w) for w in wanted_raw)
+        needs_conversion = any(not re.match(r"^!?\d+(?:\.\d+)?x\d+(\.\d+)?$", w) for w in wanted_raw)
         if needs_conversion:
             season_range = SeasonRange()
             params["wanted"] = season_range.parse_tokens(*wanted_raw)

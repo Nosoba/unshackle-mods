@@ -23,9 +23,9 @@ MAX_SCOPE_PARTS = 3
 MAX_TITLE_LENGTH = 100
 
 
-def season_episodes(titles: Iterable[Any]) -> dict[int, set[int]]:
+def season_episodes(titles: Iterable[Any]) -> dict[int | float, set[int]]:
     """The episode numbers of each season in ``titles``, to tell a whole season from part of one."""
-    seasons: dict[int, set[int]] = {}
+    seasons: dict[int | float, set[int]] = {}
     for t in titles:
         if isinstance(t, Episode) and t.number is not None:
             seasons.setdefault(t.season or 0, set()).add(t.number)
@@ -64,7 +64,7 @@ def title_part(titles: Sequence[Title_T]) -> str:
     return sanitize_filename(text, spacer=".", unicode=True)[:MAX_TITLE_LENGTH].strip(" .")
 
 
-def scope_part(titles: Sequence[Title_T], seasons: Mapping[int, Collection[int]]) -> str:
+def scope_part(titles: Sequence[Title_T], seasons: Mapping[int | float, Collection[int]]) -> str:
     """``S01`` for a whole season, ``S01E05-E09`` for a run of episodes, runs joined with ``.``.
 
     A season counts as whole only when every episode the service listed for it is in ``titles``.
@@ -73,7 +73,7 @@ def scope_part(titles: Sequence[Title_T], seasons: Mapping[int, Collection[int]]
     """
     exported = season_episodes(titles)
     parts: list[str] = []
-    whole_run: list[int] = []
+    whole_run: list[int | float] = []
 
     def close_whole_run() -> None:
         if whole_run:
@@ -85,7 +85,9 @@ def scope_part(titles: Sequence[Title_T], seasons: Mapping[int, Collection[int]]
         numbers = sorted(exported[season])
         listed = seasons.get(season)
         if listed and set(listed) <= exported[season]:
-            if whole_run and whole_run[-1] != season - 1:
+            if whole_run and (
+                not isinstance(season, int) or not isinstance(whole_run[-1], int) or whole_run[-1] != season - 1
+            ):
                 close_whole_run()
             whole_run.append(season)
             continue
@@ -161,7 +163,7 @@ def export_name(
     titles: Sequence[Title_T],
     tracks: Iterable[AnyTrack],
     service_tag: str,
-    seasons: Optional[Mapping[int, Collection[int]]] = None,
+    seasons: Optional[Mapping[int | float, Collection[int]]] = None,
 ) -> str:
     """The export file name without ``.json``, from the exported ``titles`` and ``tracks``.
 
@@ -191,9 +193,9 @@ def move_export(current: Path, name: str) -> Path:
 class ExportNamer:
     """The state of one run's export: its titles, tracks, and the current file path."""
 
-    def __init__(self, service_tag: str, seasons: Optional[Mapping[int, Collection[int]]] = None) -> None:
+    def __init__(self, service_tag: str, seasons: Optional[Mapping[int | float, Collection[int]]] = None) -> None:
         self.service_tag = service_tag
-        self.seasons: dict[int, set[int]] = {season: set(numbers) for season, numbers in (seasons or {}).items()}
+        self.seasons: dict[int | float, set[int]] = {season: set(numbers) for season, numbers in (seasons or {}).items()}
         self.titles: dict[str, Title_T] = {}
         self.tracks: dict[str, AnyTrack] = {}
         self.path: Optional[Path] = None

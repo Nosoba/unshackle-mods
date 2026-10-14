@@ -93,6 +93,39 @@ def test_single_episode_token_is_unchanged():
     assert parse("S01E01") == ["1x1"]
 
 
+@pytest.mark.parametrize(
+    "token,expected",
+    [("S0.5E01", ["0.5x1"]), ("S00.50E01.2", ["0.5x1.2"]), ("S01.0E01", ["1x1"])],
+)
+def test_fractional_episode_and_part(token, expected):
+    assert parse(token) == expected
+
+
+def test_fractional_season_spans_episodes():
+    keys = parse("S0.5")
+    assert len(keys) == 1000
+    assert "0.5x0" in keys and "0.5x999" in keys
+    assert "0x5" not in keys
+
+
+def test_fractional_exclusions_distinguish_season_from_part():
+    assert sorted(parse("S0.5E01", "S01E01")) == ["0.5x1", "1x1"]
+    keys = parse("S0.5", "-S0.5E01.2", "-S0.5E02")
+    assert "!0.5x1.2" in keys
+    assert "0.5x1" in keys
+    assert "0.5x2" not in keys
+    assert len(keys) == 1000
+    assert parse("S0.5E01.1", "-S0.5E01") == []
+    assert parse("S0.5E01", "-S0.5") == []
+    assert parse("S0.5E01", "-S0.5E01") == []
+
+
+@pytest.mark.parametrize("token", ["S0.5-S01", "S01-S0.5", "S0.5E01:S0.5E03", "S0.5E01.1-S0.5E01.3", "S01.0E01-S01E03"])
+def test_fractional_ranges_fail_explicitly(token):
+    with pytest.raises(click.UsageError, match="fractional seasons cannot be ranged"):
+        parse(token)
+
+
 def test_bare_season_spans_the_whole_episode_range():
     """A bare S01 reads the one match object with a different default per side."""
     keys = parse("S01")
