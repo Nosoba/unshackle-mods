@@ -425,6 +425,15 @@ def perform_download(
     if params.get("export"):
         params["export"] = bool(params["export"])
 
+    sample_raw = params.get("sample")
+    if sample_raw is not None:
+        from unshackle.core.utils.click_types import SAMPLE_RANGE
+
+        try:
+            params["sample"] = SAMPLE_RANGE.convert(sample_raw, None, None)
+        except click.BadParameter as exc:
+            raise Exception(f"Invalid sample parameter: {exc}")
+
     slow_raw = params.get("slow")
     if slow_raw is not None and not isinstance(slow_raw, tuple):
         if isinstance(slow_raw, bool):
@@ -500,6 +509,7 @@ def perform_download(
         "v_lang": params.get("v_lang", []),
         "a_lang": params.get("a_lang", []),
         "forced_subs": params.get("forced_subs", False),
+        "exact_lang": params.get("exact_lang", False),
     }
     # Hand-built context: record parameter sources so service dl overrides
     # apply to defaults but never clobber client-sent values.
@@ -645,6 +655,8 @@ def perform_download(
                 folder=params.get("folder", False),
                 no_source=params.get("no_source", False),
                 no_mux=params.get("no_mux", False),
+                sample=params.get("sample"),
+                include_sample=params.get("include_sample", False),
                 workers=params.get("workers"),
                 adaptive_workers=params.get("adaptive_workers", False),
                 download_processes=params.get("download_processes", 1),

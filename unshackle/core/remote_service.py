@@ -38,6 +38,7 @@ from unshackle.core.console import console, prompt_user
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
 from unshackle.core.proxies.resolve import is_loopback
+from unshackle.core.session import MAX_BACKOFF
 from unshackle.core.titles import Title_T, Titles_T, remap_titles
 from unshackle.core.titles.episode import Episode, Series
 from unshackle.core.titles.movie import Movie, Movies
@@ -921,7 +922,12 @@ class RemoteService:
         self._session.mount(
             "https://",
             HTTPAdapter(
-                max_retries=Retry(total=5, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504]),
+                max_retries=Retry(
+                    total=5,
+                    backoff_factor=0.2,
+                    status_forcelist=[429, 500, 502, 503, 504],
+                    retry_after_max=MAX_BACKOFF,
+                ),
                 pool_maxsize=64,
                 pool_block=True,
             ),
@@ -1073,8 +1079,9 @@ class RemoteService:
             }
             if params.get("acodec") is not None:
                 dl_params["acodec"] = [c.name for c in params["acodec"]]
-            if "forced_subs" in params:
-                dl_params["forced_subs"] = bool(params["forced_subs"])
+            for key in ("forced_subs", "exact_lang"):
+                if key in params:
+                    dl_params[key] = bool(params[key])
             if dl_params:
                 create_data["dl_params"] = dl_params
 

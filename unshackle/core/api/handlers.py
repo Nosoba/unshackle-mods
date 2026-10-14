@@ -31,6 +31,7 @@ from unshackle.core.constants import AUDIO_CODEC_MAP, DYNAMIC_RANGE_MAP, VIDEO_C
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.proxies.resolve import initialize_proxy_providers, resolve_proxy
 from unshackle.core.services import Services
+from unshackle.core.session import utf8_text
 from unshackle.core.titles import Episode, Movie, Song, Title_T
 from unshackle.core.tracks import Audio, Subtitle, Tracks, Video
 from unshackle.core.utilities import declared_kwargs, kind_only_conflict
@@ -96,6 +97,8 @@ DEFAULT_DOWNLOAD_PARAMS = {
     "folder": False,
     "no_source": False,
     "no_mux": False,
+    "sample": None,
+    "include_sample": False,
     "workers": None,
     "adaptive_workers": False,
     "download_processes": 1,
@@ -158,7 +161,8 @@ def load_full_cdm(service: str, profile: Optional[str], cdm_type: Optional[str] 
                 drm_key = {"wv": "widevine", "widevine": "widevine", "pr": "playready", "playready": "playready"}.get(
                     cdm_type.lower()
                 )
-            cdm_name = lower_keys.get(drm_key or "widevine") or lower_keys.get("playready")
+            first = next(key for key in lower_keys if key in ("widevine", "playready"))
+            cdm_name = lower_keys.get(drm_key or first) or lower_keys.get("playready")
         else:
             cdm_name = cdm_name.get(profile) or cdm_name.get("default") or ci_get(app_config.cdm, "default")
 
@@ -1839,6 +1843,16 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
     except APIError as e:
         return e.message
 
+    if data.get("sample") is not None:
+        from unshackle.core.utils.click_types import SAMPLE_RANGE
+
+        try:
+            SAMPLE_RANGE.convert(data["sample"], None, None)
+        except click.BadParameter:
+            return "sample must be true or a 'START-END' window in seconds, such as '60-120'."
+    if data.get("sample") and data.get("include_sample"):
+        return "sample and include_sample cannot be used together."
+
     # The serve user would create and write any directory a client names; keep it under downloads.
     if data.get("output_dir"):
         root = config.directories.downloads.resolve()
@@ -3272,6 +3286,7 @@ def forwarded_dl_params(data: Dict[str, Any]) -> Dict[str, Any]:
         except click.BadParameter:
             log.warning(f"Ignoring unknown dl_params.acodec value: {sanitize_log(name)}")
     params["forced_subs"] = raw.get("forced_subs") is True
+    params["exact_lang"] = raw.get("exact_lang") is True
     return params
 
 
@@ -3909,7 +3924,8 @@ def resolve_server_cdm(service: str, profile: Optional[str], cdm_type: Optional[
     Checks the server's own CDM config (``config.cdm[service]``) to
     determine the CDM type without loading the full CDM object. This
     makes sure that when you use ``server_cdm: true``, the server's CDM
-    determines device selection (e.g. PlayReady vs Widevine).
+    determines device selection (e.g. PlayReady vs Widevine). An entry with
+    ``widevine`` and ``playready`` gives the DRM system that it lists first.
 
     Falls back to a lightweight stub from *cdm_type* only if the configuration
     has no server CDM for the service.
@@ -3921,7 +3937,8 @@ def resolve_server_cdm(service: str, profile: Optional[str], cdm_type: Optional[
         if isinstance(cdm_name, dict):
             lower_keys = {k.lower(): v for k, v in cdm_name.items()}
             if {"widevine", "playready"} & lower_keys.keys():
-                cdm_name = lower_keys.get("playready") or lower_keys.get("widevine")
+                systems = [lower_keys[key] for key in lower_keys if key in ("widevine", "playready")]
+                cdm_name = next(filter(None, systems), None)
             else:
                 cdm_name = cdm_name.get("default") or next(iter(cdm_name.values()), None)
 
@@ -4319,11 +4336,11 @@ def ensure_track_drm(track: Any, session: Any = None, init_data: Optional[bytes]
             from unshackle.core.manifests import HLS
 
             http = getattr(track, "session", None) or session
-            playlist = m3u8.loads(http.get(track.url).text, uri=track.url) if http else m3u8.load(track.url)
+            playlist = m3u8.loads(utf8_text(http.get(track.url)), uri=track.url) if http else m3u8.load(track.url)
             keys = [k for k in (playlist.keys or []) + (playlist.session_keys or []) if k is not None]
             for key in keys:
                 try:
-                    drm = HLS.get_drm(key)
+                    drm = HLS.get_drm_or_probe(key, playlist, track, probe_session=http)
                     if isinstance(drm, (Widevine, PlayReady)):
                         track.drm = [drm]
                         return
@@ -4799,14 +4816,11 @@ async def session_segment_filter_handler(
 
     def unwanted_segments() -> list[str]:
         import m3u8
-        import requests
 
         response = session.service_instance.session.get(track.url)
         if not getattr(response, "ok", True):
             raise ValueError(f"playlist request failed: {response.status_code}")
-        if isinstance(response, requests.Response):
-            response.encoding = response.encoding or "utf-8"
-        playlist = m3u8.loads(response.text, uri=str(track.url))
+        playlist = m3u8.loads(utf8_text(response), uri=str(track.url))
         return [segment.absolute_uri for segment in playlist.segments if segment_filter(segment)]
 
     try:

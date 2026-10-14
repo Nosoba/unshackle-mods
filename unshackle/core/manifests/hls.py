@@ -12,6 +12,7 @@ import sys
 from functools import partial
 import time
 from contextlib import ExitStack, closing
+from itertools import accumulate
 from pathlib import Path
 from typing import Any, Optional, Union
 from urllib.parse import urljoin, urlparse
@@ -37,7 +38,7 @@ from unshackle.core.drm.segment_decrypt import SegmentDecrypter, can_use
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
 from unshackle.core.manifests.dash import RollingMerge
-from unshackle.core.session import RnetResponse, RnetSession
+from unshackle.core.session import RnetResponse, RnetSession, utf8_text
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
 from unshackle.core.tracks.track import DRM_PREFERENCE_TYPES, assert_fragments_decrypted
 from unshackle.core.utilities import get_extension, is_close_match, log_event, try_ensure_utf8
@@ -81,17 +82,11 @@ class HLS:
 
         res = session.get(url, **args)
 
-        if isinstance(res, requests.Response):
-            if not res.ok:
-                raise requests.ConnectionError("Failed to request the M3U(8) document.", response=res)
-            res.encoding = res.encoding or "utf-8"
-            content = res.text
-        elif isinstance(res, RnetResponse):
-            if not res.ok:
-                raise requests.ConnectionError("Failed to request the M3U(8) document.", response=res)
-            content = res.text
-        else:
+        if not isinstance(res, (requests.Response, RnetResponse)):
             raise TypeError(f"Expected response to be a requests.Response or rnet.Response, not {type(res)}")
+        if not res.ok:
+            raise requests.ConnectionError("Failed to request the M3U(8) document.", response=res)
+        content = utf8_text(res)
 
         master = m3u8.loads(content, uri=url)
 
@@ -408,9 +403,7 @@ class HLS:
             session = Session()
 
         res = session.get(variant_url)
-        if isinstance(res, requests.Response):
-            res.encoding = res.encoding or "utf-8"
-        variant = m3u8.loads(res.text, uri=variant_url)
+        variant = m3u8.loads(utf8_text(res), uri=variant_url)
         if not variant.segments:
             return None
 
@@ -803,17 +796,13 @@ class HLS:
             master = m3u8.load(str(track.from_file))
         else:
             response = session.get(track.url)
-            if isinstance(response, requests.Response) or isinstance(response, RnetResponse):
-                if not response.ok:
-                    log.error(f"Failed to request the invariant M3U8 playlist: {response.status_code}")
-                    sys.exit(1)
-                if isinstance(response, requests.Response):
-                    response.encoding = response.encoding or "utf-8"
-                playlist_text = response.text
-            else:
+            if not isinstance(response, (requests.Response, RnetResponse)):
                 raise TypeError(f"Expected response to be a requests.Response or rnet.Response, not {type(response)}")
+            if not response.ok:
+                log.error(f"Failed to request the invariant M3U8 playlist: {response.status_code}")
+                sys.exit(1)
 
-            master = m3u8.loads(playlist_text, uri=track.url)
+            master = m3u8.loads(utf8_text(response), uri=track.url)
 
         if not master.segments:
             log.error("Track's HLS playlist has no segments, expecting an invariant M3U8 playlist.")
@@ -830,6 +819,12 @@ class HLS:
             )
         hls_data["unwanted_segments"] = [s.absolute_uri for s in unwanted_segments]
 
+        if config.sample:
+            content = [segment for segment in master.segments if segment not in unwanted_segments]
+            starts = list(accumulate((segment.duration or 0 for segment in content[:-1]), initial=0.0))
+            del content[track.sample_slice(starts, window=config.sample)]
+            unwanted_segments += content
+
         # Get session DRM as fallback but prefer media playlist keys for accurate KID matching
         if track.drm:
             session_drm = track.get_drm_for_cdm(cdm)
@@ -844,9 +839,14 @@ class HLS:
             media_playlist_key = HLS.get_supported_key(cdm_media_keys) if cdm_media_keys else None
 
             if media_playlist_key:
-                media_drm = HLS.get_drm(media_playlist_key, session)
+                init_kid = (
+                    None
+                    if media_playlist_key.method == "AES-128"
+                    else HLS.get_track_kid_from_init(master, track, session)
+                )
+                media_drm = HLS.get_drm(media_playlist_key, session, **({"kid": init_kid} if init_kid else {}))
                 if isinstance(media_drm, (Widevine, PlayReady)):
-                    track_kid = HLS.get_track_kid_from_init(master, track, session) or media_drm.kid
+                    track_kid = init_kid or media_drm.kid
                     # Preserve pre-existing keys (e.g. from server_cdm)
                     if track.drm:
                         for existing_drm in track.drm:
@@ -854,7 +854,7 @@ class HLS:
                                 media_drm.content_keys.update(existing_drm.content_keys)
                     track.drm = [media_drm]
                     if DOWNLOAD_ALL_DRM.is_set():
-                        track.drm += HLS.alternate_drm(media_keys, media_drm, session)
+                        track.drm += HLS.alternate_drm(media_keys, media_drm, session, init_kid)
                     try:
                         if not license_widevine:
                             raise ValueError("license_widevine func must be supplied to use DRM")
@@ -910,7 +910,7 @@ class HLS:
                 if key is None or key.method == "AES-128" or key in licensed_keys:
                     continue
                 licensed_keys.append(key)
-                later_drm = HLS.get_drm(key, session)
+                later_drm = HLS.get_drm_or_probe(key, master, track, session, segment.init_section)
                 if isinstance(later_drm, (Widevine, PlayReady)) and license_widevine:
                     license_widevine(later_drm, track_kid=later_drm.kid)
             progress(downloaded="[yellow]SKIPPED")
@@ -941,16 +941,16 @@ class HLS:
 
         range_offset = 0
         for segment in master.segments:
+            if segment.byterange:
+                byte_range = HLS.calculate_byte_range(segment.byterange, range_offset)
+                range_offset = int(byte_range.split("-")[1]) + 1
+            else:
+                byte_range = None
+
             if segment in unwanted_segments:
                 continue
 
             segment_durations.append(int(segment.duration))
-
-            if segment.byterange:
-                byte_range = HLS.calculate_byte_range(segment.byterange, range_offset)
-                range_offset = int(byte_range.split("-")[0])
-            else:
-                byte_range = None
 
             urls.append(
                 {
@@ -1290,22 +1290,18 @@ class HLS:
                 if key is None:
                     encryption_data = None
                 elif not encryption_data or encryption_data[0] != key:
-                    drm = HLS.get_drm(key, session)
-                    if isinstance(drm, (Widevine, PlayReady)):
-                        try:
-                            if map_data:
-                                track_kid = track.get_key_id(map_data[1])
-                            else:
-                                track_kid = None
-                            if not track_kid:
-                                track_kid = drm.kid
+                    try:
+                        init_kid = track.get_key_id(map_data[1]) if map_data and key.method != "AES-128" else None
+                        drm = HLS.get_drm(key, session, **({"kid": init_kid} if init_kid else {}))
+                        if isinstance(drm, (Widevine, PlayReady)):
+                            track_kid = init_kid or drm.kid
                             progress(downloaded="LICENSING")
                             license_widevine(drm, track_kid=track_kid)
                             progress(downloaded="[yellow]LICENSED")
-                        except Exception:  # noqa
-                            DOWNLOAD_CANCELLED.set()  # skip pending track downloads
-                            progress(downloaded="[red]FAILED")
-                            raise
+                    except Exception:  # noqa
+                        DOWNLOAD_CANCELLED.set()  # skip pending track downloads
+                        progress(downloaded="[red]FAILED")
+                        raise
                     if (
                         encryption_data
                         and isinstance(drm, (Widevine, PlayReady))
@@ -1522,8 +1518,7 @@ class HLS:
             if not value and data.uri:
                 if not session:
                     session = Session()
-                res = session.get(urljoin(manifest.base_uri or "", data.uri))
-                value = res.text
+                value = utf8_text(session.get(urljoin(manifest.base_uri or "", data.uri)))
 
             if not value:
                 continue
@@ -1600,6 +1595,7 @@ class HLS:
         keys: list[Union[m3u8.model.SessionKey, m3u8.model.Key]],
         chosen: DRM_T,
         session: Optional[Union[Session, RnetSession]] = None,
+        kid: Optional[UUID] = None,
     ) -> list[DRM_T]:
         """Build the Widevine or PlayReady DRM that the EXT-X-KEY entries offer next to ``chosen``.
 
@@ -1610,7 +1606,7 @@ class HLS:
         if not other_keys:
             return []
         try:
-            return [HLS.get_drm(other_keys[0], session)]
+            return [HLS.get_drm(other_keys[0], session, **({"kid": kid} if kid else {}))]
         except Exception as e:
             logging.getLogger("HLS").warning(f"Could not read the {system} EXT-X-KEY entry: {e}")
             return []
@@ -1620,14 +1616,15 @@ class HLS:
         master: M3U8,
         track: AnyTrack,
         session: Union[Session, RnetSession],
+        init_section: Optional[m3u8.model.InitializationSection] = None,
     ) -> Optional[UUID]:
         """
-        Extract the track's Key ID from its init segment (EXT-X-MAP).
+        Extract the track's Key ID from an init segment (EXT-X-MAP), by default the first in the playlist.
 
         Returns None if no init segment exists or KID extraction fails.
         The caller should fall back to drm.kid from the PSSH if this returns None.
         """
-        map_section = next((seg.init_section for seg in master.segments if seg.init_section), None)
+        map_section = init_section or next((seg.init_section for seg in master.segments if seg.init_section), None)
         if not map_section:
             return None
 
@@ -1641,6 +1638,10 @@ class HLS:
             map_res = session.get(url=map_uri, headers=headers)
             if map_res.ok:
                 return track.get_key_id(map_res.content)
+            logging.getLogger("HLS").warning(
+                f"Could not read the Key ID from the init segment {safe_display_url(map_uri)}: "
+                f"HTTP {map_res.status_code}"
+            )
         # best-effort key-id probe over network + init parse; caller falls back without it
         except Exception as e:
             logging.getLogger("HLS").debug(f"Init map key-id probe failed for {map_uri}: {e!r}")
@@ -1688,6 +1689,7 @@ class HLS:
     def get_drm(
         key: Union[m3u8.model.SessionKey, m3u8.model.Key],
         session: Optional[Union[Session, RnetSession]] = None,
+        kid: Optional[UUID] = None,
     ) -> DRM_T:
         """
         Convert HLS EXT-X-KEY data to an initialized DRM object.
@@ -1696,6 +1698,8 @@ class HLS:
             key: The m3u8 `EXT-X-KEY` object.
             session: Optional HTTP session used to request AES-128 URIs.
                 Useful to set headers, proxies, cookies, and so forth.
+            kid: The Key ID from the init segment. Widevine uses it only when the tag
+                and the PSSH both carry no real Key ID.
 
         Raises a NotImplementedError when unshackle cannot use the DRM system.
         """
@@ -1711,13 +1715,16 @@ class HLS:
             drm = Widevine(pssh=WV_PSSH.new(key_ids=[key.uri.split(",")[-1]], system_id=WV_PSSH.SystemId.Widevine))
         elif key.keyformat and key.keyformat.lower() == WidevineCdm.urn:
             extra_params = dict(key._extra_params)  # noqa
-            # a v0 PSSH carries no KID, leaving the tag's own KEYID as the only source
-            kid = extra_params.pop("keyid", None) or extra_params.pop("kid", None)
-            if isinstance(kid, str):
-                kid = kid.removeprefix("0x").removeprefix("0X")
+            pssh = WV_PSSH(key.uri.split(",")[-1])
+            if kid in Widevine.PLACEHOLDER_KIDS or any(k not in Widevine.PLACEHOLDER_KIDS for k in pssh.key_ids):
+                kid = None
+            # a v0 PSSH can carry no KID: the tag's own KEYID is the first source, the init segment the last
+            tag_kid = extra_params.pop("keyid", None) or extra_params.pop("kid", None)
+            if isinstance(tag_kid, str):
+                tag_kid = tag_kid.removeprefix("0x").removeprefix("0X")
             drm = Widevine(
-                pssh=WV_PSSH(key.uri.split(",")[-1]),
-                kid=kid,
+                pssh=pssh,
+                kid=tag_kid or kid,
                 **extra_params,
             )
         elif key.keyformat and key.keyformat.lower() in {f"urn:uuid:{PR_PSSH.SYSTEM_ID}", "com.microsoft.playready"}:
@@ -1729,6 +1736,28 @@ class HLS:
             raise NotImplementedError(f"The key system is not supported: {key}")
 
         return drm
+
+    @staticmethod
+    def get_drm_or_probe(
+        key: Union[m3u8.model.SessionKey, m3u8.model.Key],
+        master: M3U8,
+        track: AnyTrack,
+        session: Optional[Union[Session, RnetSession]] = None,
+        init_section: Optional[m3u8.model.InitializationSection] = None,
+        probe_session: Any = None,
+    ) -> DRM_T:
+        """
+        Convert HLS EXT-X-KEY data to a DRM object, with the Key ID of the init segment when the key carries none.
+
+        The init segment request uses `probe_session` when the caller has no HTTP session that `get_drm` accepts.
+        """
+        try:
+            return HLS.get_drm(key, session)
+        except Widevine.Exceptions.KIDNotFound:
+            kid = HLS.get_track_kid_from_init(master, track, probe_session or session or Session(), init_section)
+            if not kid:
+                raise
+            return HLS.get_drm(key, session, kid=kid)
 
     @staticmethod
     def get_all_drm(
@@ -1755,6 +1784,10 @@ class HLS:
                 drm_objects.append(drm)
             except NotImplementedError:
                 unsupported_keys.append(key)
+            except Widevine.Exceptions.KIDNotFound:
+                logging.getLogger("HLS").warning(
+                    "Skipped an EXT-X-SESSION-KEY entry that carries no Key ID. The media playlist must supply the key."
+                )
 
         if not drm_objects and unsupported_keys:
             logging.debug(

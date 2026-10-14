@@ -25,6 +25,7 @@ from unshackle.core.remote_service import (
     resolve_proxy_arg,
     segment_uri_filter,
 )
+from unshackle.core.session import utf8_text
 from unshackle.core.titles import Episode, Movies, Series, Title_T, Titles_T, remap_titles
 from unshackle.core.tracks import Audio, Chapter, Chapters, Subtitle, Tracks, Video
 from unshackle.core.tracks.attachment import Attachment
@@ -67,9 +68,10 @@ def hls_playlist_kids(track: Any, session: Optional[requests.Session] = None) ->
     key from its URI, so such a track takes no exported content key. An empty set means that
     the track is encrypted but names no KID that unshackle can read.
     """
+    http = session or requests.Session()
     try:
-        text = (session or requests.Session()).get(str(track.url)).text
-        keys = [k for k in m3u8.loads(text, uri=str(track.url)).keys if k is not None and k.method != "NONE"]
+        playlist = m3u8.loads(utf8_text(http.get(str(track.url))), uri=str(track.url))
+        keys = [k for k in playlist.keys if k is not None and k.method != "NONE"]
     except Exception as e:
         log.warning(f"Cannot read the media playlist of {track.id} for its KIDs: {e!r}")
         return None
@@ -78,7 +80,7 @@ def hls_playlist_kids(track: Any, session: Optional[requests.Session] = None) ->
         if key.method == "AES-128":
             continue
         try:
-            kids.update(real_kids(HLS.get_drm(key)))
+            kids.update(real_kids(HLS.get_drm_or_probe(key, playlist, track, probe_session=http)))
         except Exception as e:
             log.debug(f"Skipping HLS key {key.keyformat or key.method} of {track.id}: {e!r}")
     if kids or any(k.method != "AES-128" for k in keys):

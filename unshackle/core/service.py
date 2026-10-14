@@ -406,9 +406,6 @@ class Service(metaclass=ABCMeta):
 
         return all_tracks
 
-    # Deprecated 5.5.0 shim for service repos still on the old underscored name; drop once they migrate.
-    _get_tracks_for_variants = get_tracks_for_variants
-
     @staticmethod
     def get_session() -> requests.Session:
         """
@@ -434,6 +431,7 @@ class Service(metaclass=ABCMeta):
                     status_forcelist=STATUS_FORCELIST,
                     allowed_methods=RETRY_METHODS,
                     respect_retry_after_header=True,
+                    retry_after_max=MAX_BACKOFF,
                 ),
                 pool_connections=POOL_MAX_SIZE,
                 pool_maxsize=POOL_MAX_SIZE,
