@@ -197,8 +197,12 @@ Each subclass adds its own required fields on top of `id_` and `service`:
 
     A `Song` also takes optional metadata keywords that the tagger and the naming templates
     read: `album_artist`, `release_type`, `total_tracks`, `total_discs`, `genre`,
-    `explicit`, `isrc`, `upc`, `copyright`, `label`, `lyrics`, and `artwork_url`. Read the
-    class for the current list.
+    `explicit`, `isrc`, `upc`, `copyright`, `label`, `lyrics`, `synced_lyrics`,
+    `lyrics_suffix`, and `artwork_url`. Read the class for the current list. Give `lyrics` as
+    plain text: the tagger embeds it as is. With `synced_lyrics` (timed LRC or TTML) and
+    `lyrics_suffix` (`".lrc"`, `".ttml"`), unshackle also saves the timed lyrics beside the
+    final audio file under that suffix.
+    You can set these fields in `get_tracks()` too, and a remote client gets them back.
 
     The tagger also falls back to `Song.data` for fields the constructor did not get, such
     as the composer or a full release date. It reads the top level of that dict and a
@@ -413,6 +417,25 @@ needs:
 You do not open CDM sessions or operate shaka-packager yourself. The `Widevine`/`PlayReady`
 classes drive the CDM handshake and call the decryption backend. Your hook is only the
 "send this challenge, give me back the license" step.
+
+### Decrypting a cbcs file yourself
+
+Some tracks cannot use the framework's decryption: a single cbcs file whose sample entries share
+a zero default KID, or a sample entry whose content key no CDM can license and only a separate
+process can use. For these, set no `drm` on the track and override two methods:
+
+- `decrypts_samples(track)` returns `True` for such a track.
+- `get_sample_decrypter(track, entry)` returns, for the 1-based `stsd` entry, the 16-byte
+  content key or a `cbcs.SampleDecrypter`. A `SampleDecrypter` gets the protected bytes of each sample of
+  one fragment, cut to whole AES blocks, and returns plaintexts of the same lengths. It handles
+  full-sample cbcs only, not pattern encryption.
+
+When the download of the track ends, unshackle calls `unshackle.core.drm.cbcs.decrypt_file`, and
+the progress row shows "Decrypting". Your `on_track_downloaded` runs before this and gets the
+encrypted file. `decrypt_file` writes the plaintext back in place and removes the
+protection boxes, so the muxer reads a clear file. In a remote session `get_sample_decrypter`
+runs on the server: the client sends the samples through the `samples` route, so a decrypter
+that needs a process on the server also works for a remote client.
 
 ### How unshackle chooses a CDM and finds keys
 

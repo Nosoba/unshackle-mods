@@ -28,11 +28,13 @@ from unshackle.core.cacher import Cacher
 from unshackle.core.cdm.detect import cdm_type_stub
 from unshackle.core.config import config
 from unshackle.core.constants import AUDIO_CODEC_MAP, DYNAMIC_RANGE_MAP, VIDEO_CODEC_MAP
+from unshackle.core.drm import cbcs
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.proxies.resolve import initialize_proxy_providers, resolve_proxy
 from unshackle.core.services import Services
 from unshackle.core.session import utf8_text
 from unshackle.core.titles import Episode, Movie, Song, Title_T
+from unshackle.core.titles.music import SONG_FIELDS
 from unshackle.core.tracks import Audio, Subtitle, Tracks, Video
 from unshackle.core.utilities import declared_kwargs, kind_only_conflict
 from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, SUBTITLE_CODEC, VIDEO_CODEC_LIST
@@ -1161,24 +1163,7 @@ def serialize_title(title: Title_T) -> Dict[str, Any]:
         if getattr(title, "daily", None) is not None:
             result["daily"] = title.daily
     if is_song:
-        for field in (
-            "artist",
-            "album",
-            "track",
-            "disc",
-            "album_artist",
-            "release_type",
-            "total_tracks",
-            "total_discs",
-            "genre",
-            "explicit",
-            "isrc",
-            "upc",
-            "copyright",
-            "label",
-            "lyrics",
-            "artwork_url",
-        ):
+        for field in SONG_FIELDS:
             result[field] = getattr(title, field, None)
     if isinstance(title, (Episode, Movie)) and getattr(title, "anime", None) is not None:
         result["anime"] = title.anime
@@ -3843,6 +3828,9 @@ async def session_tracks_handler(
                 "session_cookies": session_cookies,
                 "server_cdm": session.server_cdm,
                 "server_cdm_type": server_cdm_type,
+                "sample_decrypt_tracks": [
+                    str(t.id) for t in [*video_tracks, *audio_tracks] if service_instance.decrypts_samples(t)
+                ],
             }
         )
 
@@ -4833,6 +4821,59 @@ async def session_segment_filter_handler(
         raise APIError(APIErrorCode.SERVICE_ERROR, "Could not run the segment filter for this track") from None
 
     return web.json_response({"unwanted": unwanted})
+
+
+async def session_samples_handler(
+    session_id: str, track_id: str, entry: str, frame: bytes, request: Optional[web.Request] = None
+) -> web.Response:
+    """Run the service's sample decrypter for one `stsd` entry of a track that `decrypts_samples` names.
+
+    An empty `frame` asks how the entry decrypts: its content key, or `decrypter`. A `cbcs.pack_samples`
+    frame of block-aligned ciphertexts gets a frame of their plaintexts back. The decrypter can use a
+    process or an account of the server, so the `server_cdm` grant gates it.
+    """
+    session = await get_validated_session(session_id, request)
+    require_authenticated(session)
+
+    index = int(entry) if entry.isascii() and entry.isdigit() else 0
+    if not track_id or index < 1:
+        raise APIError(APIErrorCode.INVALID_INPUT, "Required: track_id, and entry as a 1-based stsd index")
+    track = session.tracks.get(track_id)
+    if not track:
+        raise APIError(
+            APIErrorCode.TRACK_NOT_FOUND,
+            f"Track not found in session: {track_id}",
+            details={"track_id": track_id, "session_id": session_id},
+        )
+    service = session.service_instance
+    if not service.decrypts_samples(track):
+        raise APIError(APIErrorCode.INVALID_INPUT, f"The service does not decrypt the samples of track {track_id}")
+    if not server_cdm_allowed(request, session.service_tag):
+        raise APIError(
+            APIErrorCode.FORBIDDEN, f"This API key may not decrypt {session.service_tag} samples on the server"
+        )
+
+    def run() -> web.Response:
+        decrypter = service.get_sample_decrypter(track, index)
+        if isinstance(decrypter, (bytes, bytearray)):
+            return web.json_response({"key": bytes(decrypter).hex()})
+        if not frame:
+            return web.json_response({"decrypter": True})
+        try:
+            samples = cbcs.unpack_samples(frame)
+        except ValueError as e:
+            raise APIError(APIErrorCode.INVALID_INPUT, str(e)) from None
+        return web.Response(body=cbcs.pack_samples(decrypter(samples)), content_type="application/octet-stream")
+
+    try:
+        async with session.lock:
+            return await asyncio.to_thread(run)
+    except APIError:
+        raise
+    except (Exception, SystemExit):
+        # `from None`: a debug-mode traceback would otherwise carry the service's exception chain
+        log.exception(f"Error decrypting samples for track {sanitize_log(str(track_id))}")
+        raise APIError(APIErrorCode.SERVICE_ERROR, "Could not decrypt the samples of this track") from None
 
 
 async def session_license_handler(
