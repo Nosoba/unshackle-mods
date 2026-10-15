@@ -184,7 +184,7 @@ class SeasonRange(click.ParamType):
 
     DATE_TOKEN = re.compile(r"^(?P<left>\d{4}-\d{2}-\d{2})(:(?P<right>\d{4}-\d{2}-\d{2}))?$")
     TOKEN = re.compile(
-        r"^(?:S(?P<season>\d+(?:\.\d+)?)(E(?P<episode>\d+)(\.(?P<part>\d+))?)?"
+        r"^(?:S(?P<season>\d+(?:\.\d+)?)(E(?P<episode>\d+)(?P<fraction>\+0\.\d+)?(\.(?P<part>\d+))?)?"
         r"|((?P<disc>\d+)x)?(?P<track>\d+))$",
         re.IGNORECASE,
     )
@@ -203,7 +203,7 @@ class SeasonRange(click.ParamType):
             self.fail(f"Invalid range, a date range cannot span more than {self.MAX_DATE_SPAN} days: {token}")
         return [(left + timedelta(days=i)).isoformat() for i in range(span)]
 
-    def token_sides(self, match: re.Match) -> tuple[int | float, Optional[int], Optional[int]]:
+    def token_sides(self, match: re.Match) -> tuple[int | float, Optional[int | float], Optional[int]]:
         """Read one side of a token as (season, episode, part), episode/part None when absent.
 
         A music disc x track token shares this (season, episode, part) space, disc reading
@@ -216,9 +216,15 @@ class SeasonRange(click.ParamType):
             episode = match.group("episode")
             part = match.group("part")
             season_number = float(season) if "." in season else int(season)
+            fraction = match.group("fraction")
+            episode_number = (
+                float(episode + fraction[2:]) if fraction else int(episode) if episode is not None else None
+            )
             return (
-                int(season_number) if isinstance(season_number, float) and season_number.is_integer() else season_number,
-                int(episode) if episode is not None else None,
+                int(season_number)
+                if isinstance(season_number, float) and season_number.is_integer()
+                else season_number,
+                episode_number,
                 int(part) if part is not None else None,
             )
         disc = match.group("disc")
@@ -229,6 +235,9 @@ class SeasonRange(click.ParamType):
         Parse multiple tokens or ranged tokens as '{s}x{e}' strings.
 
         A fractional season such as S0.5 uses the same episode keys, but cannot be ranged.
+        A fractional episode uses S01E01+0.5 (key '1xE1.5') to avoid
+        confusing it with the existing S01E01.5 (part 5) syntax.
+        Whole-season tokens include fractional episodes; bounded ranges only include integer episodes.
         You address an episode split into separately playable parts as '{s}x{e}.{p}'.
         A part range must stay inside one episode, because how many parts an episode has
         is not knowable here. unshackle cannot remove a part-qualified exclusion from the
@@ -294,6 +303,8 @@ class SeasonRange(click.ParamType):
             to_episode = to_episode_raw if to_episode_raw is not None else self.MAX_EPISODE
             if is_range and any("." in (match.group("season") or "") for match in parsed):
                 self.fail(f"Invalid range, fractional seasons cannot be ranged: {token}")
+            if is_range and any(match.group("fraction") for match in parsed):
+                self.fail(f"Invalid range, fractional episodes cannot be ranged: {token}")
             if from_season > to_season:
                 self.fail(f"Invalid range, left side season cannot be bigger than right side season: {token}")
             if from_season == to_season and from_episode > to_episode:
@@ -308,25 +319,40 @@ class SeasonRange(click.ParamType):
                 if from_part > to_part:
                     self.fail(f"Invalid range, left side part cannot be bigger than right side part: {token}")
                 for p in range(from_part, to_part + 1):
-                    (computed if not exclude else exclusions).append(f"{from_season}x{from_episode}.{p}")
+                    prefix = "E" if isinstance(from_episode, float) else ""
+                    (computed if not exclude else exclusions).append(f"{from_season}x{prefix}{from_episode}.{p}")
                 continue
+            target = exclusions if exclude else computed
+            if isinstance(from_episode, float):
+                target.append(f"{from_season}xE{from_episode}")
+                continue
+            # ponytail: Bounded ranges enumerate integers only; encode fractional bounds if needed.
             if isinstance(from_season, float):
-                (computed if not exclude else exclusions).extend(
-                    f"{from_season}x{e}" for e in range(from_episode, to_episode + 1)
-                )
+                target.extend(f"{from_season}x{e}" for e in range(from_episode, to_episode + 1))
+                if from_episode_raw is None:
+                    target.append(f"{from_season}x*")
                 continue
             for s in range(from_season, to_season + 1):
                 for e in range(
                     from_episode if s == from_season else 0, (self.MAX_EPISODE if s < to_season else to_episode) + 1
                 ):
-                    (computed if not exclude else exclusions).append(f"{s}x{e}")
+                    target.append(f"{s}x{e}")
+                if (s != from_season or from_episode_raw is None) and (s != to_season or to_episode_raw is None):
+                    target.append(f"{s}x*")
         for exclusion in exclusions:
-            if "." in exclusion.partition("x")[2]:
+            tail = exclusion.partition("x")[2]
+            has_wildcard = f"{exclusion.partition('x')[0]}x*" in computed
+            if (tail.startswith("E") and tail.count(".") > 1) or (not tail.startswith("E") and "." in tail):
                 computed.append(f"!{exclusion}")  # base key stays; resolved at match time
             else:
                 # a base exclusion must drop that episode's part keys too, or they still match
                 prefix = f"{exclusion}."
                 computed = [k for k in computed if k != exclusion and not k.startswith(prefix)]
+                if tail == "*":
+                    computed = [k for k in computed if not k.startswith(exclusion[:-1])]
+            if tail.startswith("E") and has_wildcard:
+                computed.append(f"!{exclusion}")  # a season wildcard may still select a fractional episode
+
         return list(set(computed))
 
     def convert(

@@ -5,6 +5,7 @@ import pytest
 from unshackle.core.config import config
 from unshackle.core.export_name import export_name, season_episodes, title_label
 from unshackle.core.titles.episode import Episode, Series
+from unshackle.core.utils.click_types import SeasonRange
 
 
 class StubService:
@@ -54,6 +55,50 @@ def test_fractional_season_export_ranges_and_whole_runs():
     titles = [episode(season) for season in (0.5, 1.5, 2.5)]
     assert export_name(titles, [], "EX", season_episodes(titles)) == "Example.Show.S0.5.S1.5.S2.5-EX"
     assert export_name([episode(1), episode(2)], [], "EX", {1: {1}, 2: {1}}) == "Example.Show.S01-S02-EX"
+
+
+@pytest.mark.parametrize("value", [0.5, "0.5"])
+def test_fractional_episode_names_selection_and_export(value, monkeypatch):
+    monkeypatch.setattr(config, "output_template", {"series": "{title}.{season_episode}-{source}"})
+    ep = episode(1, value)
+    plain = episode(1, 1)
+    parse = SeasonRange().parse_tokens
+
+    assert ep.number == 0.5
+    assert str(ep) == "Example Show S01E00.5"
+    assert ep.build_template_context(StubMediaInfo())["season_episode"] == "S01E00.5"
+    assert ep.get_filename(StubMediaInfo()) == "Example.Show.S01E00.5-StubService"
+    assert title_label(ep) == "S01E00.5"
+    assert [item.number for item in Series([plain, ep])] == [0.5, 1]
+    assert ep.matches_wanted(parse("S01E00+0.5"))
+    assert ep.matches_wanted(parse("S01"))
+    assert not ep.matches_wanted(parse("S01E01"))
+    assert not ep.matches_wanted(parse("S01", "-S01E00+0.5"))
+    assert not ep.matches_wanted(parse("S01E00.5"))  # legacy part 5, not fractional episode
+    assert export_name([ep], [], "EX", season_episodes([plain, ep])) == "Example.Show.S01E00.5-EX"
+
+
+def test_fractional_episode_1_5_is_not_part_five(monkeypatch):
+    monkeypatch.setattr(config, "output_template", {"series": "{title}.{season_episode}-{source}"})
+    ep = episode(1, 1.5)
+    assert str(ep) == "Example Show S01E01.5"
+    assert ep.get_filename(StubMediaInfo()) == "Example.Show.S01E01.5-StubService"
+    assert ep.matches_wanted(SeasonRange().parse_tokens("S01E01+0.5"))
+    assert not ep.matches_wanted(SeasonRange().parse_tokens("S01E01.5"))
+
+
+def test_fractional_episode_part_stays_distinct_from_episode_number():
+    ep = Episode(id_="fraction-part-001", service=StubService, title="Example Show", season=1, number=1.5, part=2)
+    assert ep.matches_wanted(SeasonRange().parse_tokens("S01E01+0.5.2"))
+    assert not ep.matches_wanted(SeasonRange().parse_tokens("S01E01.2"))
+    assert not ep.matches_wanted(SeasonRange().parse_tokens("S01", "-S01E01+0.5.2"))
+    assert ep.matches_wanted(SeasonRange().parse_tokens("S01", "-S01E01.2"))
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), "NaN", "Infinity"])
+def test_nonfinite_episode_rejected(value):
+    with pytest.raises((TypeError, ValueError)):
+        episode(1, value)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), "NaN", "Infinity"])

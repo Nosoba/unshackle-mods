@@ -29,7 +29,7 @@ class Episode(Title):
         service: type,
         title: str,
         season: Union[int, float, str],
-        number: Union[int, str],
+        number: Union[int, float, str],
         name: Optional[str] = None,
         year: Optional[Union[int, str]] = None,
         language: Optional[Union[str, Language]] = None,
@@ -66,10 +66,21 @@ class Episode(Title):
 
         if number != 0 and not number:
             raise ValueError("Episode number must be provided")
-        if isinstance(number, str) and number.isdigit():
-            number = int(number)
+        if isinstance(number, str):
+            if number.isdigit():
+                number = int(number)
+            else:
+                try:
+                    number = float(number)
+                except ValueError:
+                    raise TypeError(f"Expected number to be a number, not {number!r}") from None
+        if isinstance(number, float):
+            if not math.isfinite(number):
+                raise ValueError(f"Episode number must be finite, not {number!r}")
+            if number.is_integer():
+                number = int(number)
         elif not isinstance(number, int):
-            raise TypeError(f"Expected number to be an int, not {number!r}")
+            raise TypeError(f"Expected number to be a number, not {number!r}")
 
         if part is not None:
             if isinstance(part, str) and part.isdigit():
@@ -140,8 +151,10 @@ class Episode(Title):
         takes every part. A dated episode also answers to its ISO air date.
         ``!`` keys are part-qualified exclusions resolved here.
         """
-        base = f"{self.season}x{self.number}"
+        base = f"{self.season}x{self.number}" if isinstance(self.number, int) else f"{self.season}xE{self.number}"
         keys = (base,) if self.part is None else (base, f"{base}.{self.part}")
+        if isinstance(self.number, float):
+            keys = (*keys, f"{self.season}x*")
         if isinstance(self.air_date, date):
             keys = (*keys, self.air_date.isoformat())
         if any(f"!{k}" in wanted for k in keys):
@@ -163,8 +176,8 @@ class Episode(Title):
         context["title"] = self.title.replace("$", "S")
         context["year"] = self.year or ""
         context["season"] = f"S{self.season:02}"
-        context["episode"] = f"E{self.number:02}"
-        context["season_episode"] = f"S{self.season:02}E{self.number:02}"
+        context["episode"] = f"E{self.number:02}" if isinstance(self.number, int) else f"E{self.number:04}"
+        context["season_episode"] = f"{context['season']}{context['episode']}"
         context["episode_name"] = self.name or ""
         context["date"] = ""
         context["part"] = self.part if include_part and self.part is not None else ""
@@ -213,15 +226,10 @@ class Episode(Title):
                 part=self.part_label(),
                 name=self.name or "",
             ).strip()
-        # the console shows the -w selection syntax (S01E01.2), not the filename form
-        return "{title}{year} S{season:02}E{number:02}{part} {name}".format(
-            title=self.title,
-            year=f" {self.year}" if self.year else "",
-            season=self.season,
-            number=self.number,
-            part=self.part_label(),
-            name=self.name or "",
-        ).strip()
+        # the console shows the episode number and any part suffix
+        episode = f"{self.number:02}" if isinstance(self.number, int) else f"{self.number:04}"
+        year = f" {self.year}" if self.year else ""
+        return f"{self.title}{year} S{self.season:02}E{episode}{self.part_label()} {self.name or ''}".strip()
 
     def get_filename(self, media_info: MediaInfo, folder: bool = False, show_service: bool = True) -> str:
         if folder:

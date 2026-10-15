@@ -275,7 +275,9 @@ def title_wanted(candidate: Any, wanted: Collection[str]) -> bool:
     return bool(candidate.matches_wanted(wanted))
 
 
-def latest_episode_keys(titles: Any, latest_episode: bool, latest_episodes: Optional[int]) -> list[tuple[int, int]]:
+def latest_episode_keys(
+    titles: Any, latest_episode: bool, latest_episodes: Optional[int]
+) -> list[tuple[int | float, int | float]]:
     """The (season, number) of each episode ``--latest-episode(s)`` keeps, oldest first.
 
     Counts distinct episodes, not Series entries, so a split episode takes one slot and all its parts download.
@@ -2475,10 +2477,16 @@ class dl:
 
         latest_keys = latest_episode_keys(titles, latest_episode, latest_episodes)
         if latest_keys:
-            picked = ", ".join(f"S{season:02}E{number:02}" for season, number in latest_keys)
+            picked = ", ".join(
+                f"S{season:02}E{number:04}" if isinstance(number, float) else f"S{season:02}E{number:02}"
+                for season, number in latest_keys
+            )
             self.log.info(f"Latest episode mode: Selecting {picked}")
             # replaces -w; a base SxE key selects every part of a split episode
-            wanted = [f"{season}x{number}" for season, number in latest_keys]
+            wanted = [
+                f"{season}x{number}" if isinstance(number, int) else f"{season}xE{number}"
+                for season, number in latest_keys
+            ]
 
         def select_best_audio(
             audio: list[Audio],

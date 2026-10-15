@@ -1129,7 +1129,7 @@ def serialize_title(title: Title_T) -> Dict[str, Any]:
     if is_episode:
         # no part suffix here: remote_service.build_title rebuilds the Episode from this dict, so a
         # suffixed name plus the structural `part` below would render the part twice in the filename
-        name = title.name if title.name else f"Episode {title.number:02d}"
+        name = title.name if title.name else f"Episode {title.number:02}"
     else:
         name = str(title.name) if hasattr(title, "name") else str(title)
 
@@ -1669,7 +1669,8 @@ async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Reques
                         details={"wanted": wanted_param, "service": normalized_service},
                     )
             elif season is not None and episode is not None:
-                wanted = [f"{season}x{episode}{part_key_suffix(part)}"]
+                episode_key = f"E{episode}" if isinstance(episode, float) and not episode.is_integer() else episode
+                wanted = [f"{season}x{episode_key}{part_key_suffix(part)}"]
 
             if wanted:
                 # Filter titles based on wanted episodes, similar to how dl.py does it
@@ -1733,11 +1734,11 @@ async def list_tracks_handler(data: Dict[str, Any], request: Optional[web.Reques
                             log.debug(f"Successfully got tracks for {title.season}x{title.number}")
                         except SystemExit:
                             # Service calls sys.exit() for unavailable episodes - catch and skip
-                            failed_episodes.append(f"S{title.season}E{title.number:02d}{part_key_suffix(title.part)}")
+                            failed_episodes.append(f"S{title.season}E{title.number:02}{part_key_suffix(title.part)}")
                             log.debug(f"Episode {title.season}x{title.number} not available, skipping")
                             continue
                         except (Exception, SystemExit) as e:
-                            failed_episodes.append(f"S{title.season}E{title.number:02d}{part_key_suffix(title.part)}")
+                            failed_episodes.append(f"S{title.season}E{title.number:02}{part_key_suffix(title.part)}")
                             log.debug(f"Error getting tracks for {title.season}x{title.number}: {e}")
                             continue
 

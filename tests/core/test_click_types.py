@@ -93,6 +93,20 @@ def test_single_episode_token_is_unchanged():
     assert parse("S01E01") == ["1x1"]
 
 
+def test_fractional_episode_token_is_distinct_from_part():
+    assert parse("S01E01+0.5") == ["1xE1.5"]
+    assert parse("S01E01.5") == ["1x1.5"]
+    assert parse("S01E01+0.5.2") == ["1xE1.5.2"]
+    assert parse("S01E01+0.5", "-S01E01+0.5") == []
+    assert parse("S01", "-S01") == []
+
+
+@pytest.mark.parametrize("token", ["S01E01+0.5-S01E02", "S01E01-S01E01+0.5"])
+def test_fractional_episode_ranges_fail_explicitly(token):
+    with pytest.raises(click.UsageError, match="fractional episodes cannot be ranged"):
+        parse(token)
+
+
 @pytest.mark.parametrize(
     "token,expected",
     [("S0.5E01", ["0.5x1"]), ("S00.50E01.2", ["0.5x1.2"]), ("S01.0E01", ["1x1"])],
@@ -103,7 +117,8 @@ def test_fractional_episode_and_part(token, expected):
 
 def test_fractional_season_spans_episodes():
     keys = parse("S0.5")
-    assert len(keys) == 1000
+    assert len(keys) == 1001
+    assert "0.5x*" in keys
     assert "0.5x0" in keys and "0.5x999" in keys
     assert "0x5" not in keys
 
@@ -114,7 +129,7 @@ def test_fractional_exclusions_distinguish_season_from_part():
     assert "!0.5x1.2" in keys
     assert "0.5x1" in keys
     assert "0.5x2" not in keys
-    assert len(keys) == 1000
+    assert len(keys) == 1001
     assert parse("S0.5E01.1", "-S0.5E01") == []
     assert parse("S0.5E01", "-S0.5") == []
     assert parse("S0.5E01", "-S0.5E01") == []
@@ -129,7 +144,7 @@ def test_fractional_ranges_fail_explicitly(token):
 def test_bare_season_spans_the_whole_episode_range():
     """A bare S01 reads the one match object with a different default per side."""
     keys = parse("S01")
-    assert len(keys) == 1000
+    assert len(keys) == 1001
     assert "1x0" in keys and "1x999" in keys
 
 
@@ -142,7 +157,7 @@ def test_exclusions_are_unchanged():
     assert not any(k.startswith("3x") for k in keys)
     assert "2x1" not in keys
     assert "2x0" in keys and "2x2" in keys
-    assert len(keys) == 3999  # 5 seasons less all of S03 less 2x1
+    assert len(keys) == 4003  # four seasons' episode keys and their fractional-episode markers, less 2x1
 
 
 @pytest.mark.parametrize("tokens", [("S01E01",), ("S01",), ("S01-S05", "-S03", "-S02E01"), ("S02E03-S02E05",)])

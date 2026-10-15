@@ -6,7 +6,7 @@ from typing import Optional
 
 import pytest
 
-from unshackle.commands.dl import latest_episode_keys
+from unshackle.commands.dl import latest_episode_keys, title_wanted
 from unshackle.core.api.handlers import validate_download_parameters
 from unshackle.core.titles import Movie, Movies, Series
 from unshackle.core.titles.episode import Episode
@@ -39,6 +39,14 @@ def test_the_newest_episodes_are_picked_across_seasons(
     latest_episode: bool, latest_episodes: Optional[int], expected: list[tuple[int, int]]
 ) -> None:
     assert latest_episode_keys(series(), latest_episode, latest_episodes) == expected
+
+
+def test_fractional_episode_takes_its_own_latest_slot() -> None:
+    titles = Series([episode(1, 1), episode(1, 1.5), episode(1, 2)])
+    latest = latest_episode_keys(titles, False, 2)
+    assert latest == [(1, 1.5), (1, 2)]
+    wanted = [f"{season}xE{number}" if isinstance(number, float) else f"{season}x{number}" for season, number in latest]
+    assert [item.number for item in titles if title_wanted(item, wanted)] == [1.5, 2]
 
 
 def test_a_split_episode_takes_one_slot() -> None:

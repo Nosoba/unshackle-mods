@@ -23,9 +23,9 @@ MAX_SCOPE_PARTS = 3
 MAX_TITLE_LENGTH = 100
 
 
-def season_episodes(titles: Iterable[Any]) -> dict[int | float, set[int]]:
+def season_episodes(titles: Iterable[Any]) -> dict[int | float, set[int | float]]:
     """The episode numbers of each season in ``titles``, to tell a whole season from part of one."""
-    seasons: dict[int | float, set[int]] = {}
+    seasons: dict[int | float, set[int | float]] = {}
     for t in titles:
         if isinstance(t, Episode) and t.number is not None:
             seasons.setdefault(t.season or 0, set()).add(t.number)
@@ -39,7 +39,9 @@ def plural(count: int, word: str) -> str:
 def title_label(title: Any) -> str:
     """A short label for one title in a message, e.g. ``S01E05 'Name'`` or ``'Name' (2024)``."""
     if isinstance(title, Episode):
-        label = f"S{title.season or 0:02}E{title.number or 0:02}"
+        number = title.number or 0
+        episode = f"{number:04}" if isinstance(number, float) else f"{number:02}"
+        label = f"S{title.season or 0:02}E{episode}"
         return f"{label} '{title.name}'" if title.name else label
     if isinstance(title, Song):
         return f"'{title.name}' by {title.artist}"
@@ -64,7 +66,7 @@ def title_part(titles: Sequence[Title_T]) -> str:
     return sanitize_filename(text, spacer=".", unicode=True)[:MAX_TITLE_LENGTH].strip(" .")
 
 
-def scope_part(titles: Sequence[Title_T], seasons: Mapping[int | float, Collection[int]]) -> str:
+def scope_part(titles: Sequence[Title_T], seasons: Mapping[int | float, Collection[int | float]]) -> str:
     """``S01`` for a whole season, ``S01E05-E09`` for a run of episodes, runs joined with ``.``.
 
     A season counts as whole only when every episode the service listed for it is in ``titles``.
@@ -94,10 +96,11 @@ def scope_part(titles: Sequence[Title_T], seasons: Mapping[int | float, Collecti
         close_whole_run()
         start = prev = numbers[0]
         for n in [*numbers[1:], None]:
-            if n is not None and n == prev + 1:
+            if n is not None and isinstance(n, int) and isinstance(prev, int) and n == prev + 1:
                 prev = n
                 continue
-            run = f"S{season:02}E{start:02}"
+            start_label = f"{start:04}" if isinstance(start, float) else f"{start:02}"
+            run = f"S{season:02}E{start_label}"
             parts.append(run if start == prev else f"{run}-E{prev:02}")
             if n is not None:
                 start = prev = n
@@ -193,9 +196,11 @@ def move_export(current: Path, name: str) -> Path:
 class ExportNamer:
     """The state of one run's export: its titles, tracks, and the current file path."""
 
-    def __init__(self, service_tag: str, seasons: Optional[Mapping[int | float, Collection[int]]] = None) -> None:
+    def __init__(self, service_tag: str, seasons: Optional[Mapping[int | float, Collection[int | float]]] = None) -> None:
         self.service_tag = service_tag
-        self.seasons: dict[int | float, set[int]] = {season: set(numbers) for season, numbers in (seasons or {}).items()}
+        self.seasons: dict[int | float, set[int | float]] = {
+            season: set(numbers) for season, numbers in (seasons or {}).items()
+        }
         self.titles: dict[str, Title_T] = {}
         self.tracks: dict[str, AnyTrack] = {}
         self.path: Optional[Path] = None
