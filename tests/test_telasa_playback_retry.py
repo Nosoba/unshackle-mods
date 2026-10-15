@@ -2,11 +2,12 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
-from requests import ConnectionError, Timeout
+from requests import ConnectionError, Response, Timeout
 from requests.cookies import RequestsCookieJar
 
+from unshackle.core.manifests import DASH, HLS
 from unshackle.core.tracks import Tracks
 from unshackle.services.TELASA import TELASA
 
@@ -49,8 +50,8 @@ class TestTelasaPlaybackTokenRetry(unittest.TestCase):
         self.service._get_playback_token = Mock(return_value="token")
         self.service.session.post.return_value.json.return_value = {
             "data": {"manifests": [
-                {"protocol": "hls", "items": [{"name": "hd", "url": "https://example.test/video.m3u8"}]},
-                {"protocol": "dash", "items": [{"name": "hd", "url": "https://example.test/video.mpd"}]},
+                {"protocol": "hls", "items": [{"name": "hd", "url": "https://example.test/video_hd.m3u8"}]},
+                {"protocol": "dash", "items": [{"name": "hd", "url": "https://example.test/video_hd.mpd"}]},
             ]}
         }
         dash_from_url.side_effect = ConnectionError("MPD unavailable")
@@ -58,8 +59,8 @@ class TestTelasaPlaybackTokenRetry(unittest.TestCase):
 
         tracks = self.service.get_tracks(self.title)
 
-        dash_from_url.assert_called_once_with("https://example.test/video.mpd", self.service.session)
-        hls_from_url.assert_called_once_with("https://example.test/video.m3u8", self.service.session)
+        dash_from_url.assert_called_once_with("https://example.test/video_fhd.mpd", self.service.session)
+        hls_from_url.assert_called_once_with("https://example.test/video_fhd.m3u8", self.service.session)
         hls_from_url.return_value.to_tracks.assert_called_once_with(language="ja")
         self.assertIsInstance(tracks, Tracks)
 
@@ -69,7 +70,7 @@ class TestTelasaPlaybackTokenRetry(unittest.TestCase):
         self.service._get_playback_token = Mock(return_value="token")
         self.service.session.post.return_value.json.return_value = {
             "data": {"manifests": [
-                {"protocol": "hls", "items": [{"name": "hd", "url": "https://example.test/video.m3u8"}]},
+                {"protocol": "hls", "items": [{"name": "hd", "url": "https://example.test/video_hd.m3u8"}]},
             ]}
         }
         hls_from_url.return_value.to_tracks.return_value = Tracks()
@@ -77,7 +78,42 @@ class TestTelasaPlaybackTokenRetry(unittest.TestCase):
         self.service.get_tracks(self.title)
 
         dash_from_url.assert_not_called()
-        hls_from_url.assert_called_once_with("https://example.test/video.m3u8", self.service.session)
+        hls_from_url.assert_called_once_with("https://example.test/video_fhd.m3u8", self.service.session)
+
+    @patch("unshackle.services.TELASA.DASH.from_url")
+    def test_fhd_403_falls_back_to_hd(self, dash_from_url: Mock) -> None:
+        response = Response()
+        response.status_code = 403
+        self.service.log = Mock()
+        dash_from_url.side_effect = [
+            ConnectionError("FHD unavailable", response=response),
+            Mock(**{"to_tracks.return_value": Tracks()}),
+        ]
+
+        tracks = self.service._load_manifest_tracks(DASH, "https://example.test/video_hd.mpd")
+
+        self.assertIsInstance(tracks, Tracks)
+        self.assertEqual(
+            [call.args[0] for call in dash_from_url.call_args_list],
+            ["https://example.test/video_fhd.mpd", "https://example.test/video_hd.mpd"],
+        )
+
+    @patch("unshackle.services.TELASA.HLS.from_url")
+    def test_hls_fhd_403_falls_back_to_hd(self, hls_from_url: Mock) -> None:
+        response = Response()
+        response.status_code = 403
+        hls_from_url.side_effect = [
+            ConnectionError("FHD unavailable", response=response),
+            Mock(**{"to_tracks.return_value": Tracks()}),
+        ]
+
+        tracks = self.service._load_manifest_tracks(HLS, "https://example.test/video_hd.m3u8")
+
+        self.assertIsInstance(tracks, Tracks)
+        self.assertEqual(
+            [call.args[0] for call in hls_from_url.call_args_list],
+            ["https://example.test/video_fhd.m3u8", "https://example.test/video_hd.m3u8"],
+        )
 
     def test_success_without_retry(self) -> None:
         self.service.session.post.return_value.json.return_value = {

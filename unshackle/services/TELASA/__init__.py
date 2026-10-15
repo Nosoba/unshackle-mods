@@ -582,6 +582,17 @@ class TELASA(Service):
 
         raise AssertionError("Unreachable: playback token retry loop did not terminate")
 
+    def _load_manifest_tracks(self, parser: Any, manifest_url: str) -> Tracks:
+        fhd_url = manifest_url.replace("_hd", "_fhd", 1)
+        try:
+            return parser.from_url(fhd_url, self.session).to_tracks(language="ja")
+        except RequestException as exc:
+            response = getattr(exc, "response", None)
+            if fhd_url == manifest_url or getattr(response, "status_code", None) != 403:
+                raise
+            self.log.warning("Telasa FHD manifest returned 403; loading HD manifest.")
+            return parser.from_url(manifest_url, self.session).to_tracks(language="ja")
+
     def get_tracks(self, title: Title_T) -> Tracks:
         playback_token = self._get_playback_token(title)
 
@@ -606,7 +617,7 @@ class TELASA(Service):
         if manifest:
             try:
                 manifest_url = manifest["items"][0]["url"]
-                tracks.add(DASH.from_url(manifest_url, self.session).to_tracks(language="ja"))
+                tracks.add(self._load_manifest_tracks(DASH, manifest_url))
             except (RequestException, ValueError, KeyError, IndexError, XMLSyntaxError) as exc:
                 self.log.warning(f"Failed to load Telasa DASH manifest; falling back to HLS: {exc}")
                 manifest = None
@@ -615,7 +626,7 @@ class TELASA(Service):
             if not hls_manifest:
                 raise ValueError("TELASA did not return a usable DASH or HLS manifest.")
             manifest_url = hls_manifest["items"][0]["url"]
-            tracks.add(HLS.from_url(manifest_url, self.session).to_tracks(language="ja"))
+            tracks.add(self._load_manifest_tracks(HLS, manifest_url))
 
         for track in tracks:
             track.extra = {"playback_token": playback_token}
