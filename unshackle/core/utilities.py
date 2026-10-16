@@ -226,6 +226,8 @@ def partition_exclusions(tokens: Optional[Sequence[str]]) -> tuple[list[str], li
     """
     includes: list[str] = []
     excludes: list[str] = []
+    if isinstance(tokens, str):
+        tokens = [tokens]
     for raw in tokens or []:
         token = str(raw).strip()
         if not token or token == "-":

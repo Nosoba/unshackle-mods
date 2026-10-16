@@ -1944,6 +1944,14 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
         if isinstance(default, bool) and data.get(key) is not None and not isinstance(data[key], bool):
             return f"{key} must be a boolean"
 
+    # Keep scalar language input from being iterated as characters by dl.
+    for key in ("lang", "v_lang", "a_lang", "s_lang", "forced_s_lang"):
+        value = data.get(key)
+        if isinstance(value, str):
+            data[key] = [part.strip() for part in value.split(",") if part.strip()]
+        elif value is not None and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)):
+            return f"{key} must be an array of language strings"
+
     for key in ("require_audio", "require_video", "require_subs"):
         value = data.get(key)
         if value is not None and (not isinstance(value, list) or not all(isinstance(v, str) for v in value)):

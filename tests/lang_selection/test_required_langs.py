@@ -33,6 +33,12 @@ def test_missing_required_langs(required, available, expected):
     assert missing_required_langs(required, available) == expected
 
 
+def test_scalar_language_is_one_token():
+    from unshackle.core.utilities import partition_exclusions
+
+    assert partition_exclusions("ja") == (["ja"], [])
+
+
 def test_exclusion_token_is_not_a_required_language():
     # '-fr' must not be read as a language named "-fr", which could never match
     assert missing_required_langs(["en", "-fr"], ["en", "ja"]) == []
@@ -91,6 +97,14 @@ def test_api_passes_the_flags_through(key):
     # the REST API bypasses click, so the default and the dl.result param must both exist
     assert DEFAULT_DOWNLOAD_PARAMS[key] == []
     assert key in inspect.signature(dl.result).parameters
+
+
+def test_api_normalizes_scalar_language_options():
+    from unshackle.core.api.handlers import validate_download_parameters
+
+    data = {"lang": "ja", "v_lang": "ja,en", "a_lang": "ja", "s_lang": "all"}
+    assert validate_download_parameters(data) is None
+    assert data == {"lang": ["ja"], "v_lang": ["ja", "en"], "a_lang": ["ja"], "s_lang": ["all"]}
 
 
 def test_api_accepts_the_require_flags():
