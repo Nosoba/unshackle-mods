@@ -515,9 +515,9 @@ class Track:
         self.duration = float(duration) if duration is not None else None
 
         if self.name is None:
-            lang = Language.get(self.language)
+            lang = self.language
             if (lang.language or "").lower() == (lang.territory or "").lower():
-                lang.territory = None
+                lang = lang.update_dict({"territory": None})
             reduced = lang.simplify_script()
             extra_parts = []
             if reduced.script is not None:
