@@ -696,7 +696,7 @@ def perform_download(
     # dl.result() catches a download-worker exception, reports it, but returns normally (exit 0).
     # It sets download_failed in that case, so the job isn't reported as completed with no output.
     if getattr(dl_instance, "download_failed", False):
-        detail = (stdout_capture.getvalue() + stderr_capture.getvalue())[-200:].strip()
+        detail = (stdout_capture.getvalue() + stderr_capture.getvalue())[-800:].strip()
         raise APIError(APIErrorCode.WORKER_ERROR, "download worker failed: " + (detail or "see logs"))
 
     if progress_callback:

@@ -4806,6 +4806,14 @@ class dl:
         if isinstance(e, click.ClickException):
             return [":x: Download Failed...", f"   {e.format_message()}"]
         lines = [":x: Download Failed...", f"   {type(e).__name__}: {e}"]
+        cause = e.__cause__
+        if cause is not None and cause is not e:
+            response = getattr(cause, "response", None)
+            status = getattr(response, "status_code", None)
+            cause_type = type(cause).__name__
+            if isinstance(status, int):
+                cause_type += f" {status}"
+            lines.append(f"   Caused by {cause_type}: {cause}")
         if (returncode := getattr(e, "returncode", None)) is not None:
             lines.append(f"   Binary call failed, Process exit code: {returncode}")
         lines.append("   An unexpected error occurred in one of the download workers.")

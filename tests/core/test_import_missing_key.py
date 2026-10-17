@@ -15,6 +15,7 @@ from uuid import UUID
 
 import click
 import pytest
+from requests import HTTPError
 from pywidevine.pssh import PSSH
 from rich.table import Table
 
@@ -142,6 +143,16 @@ def test_the_retry_after_a_bad_vault_key_ends_in_the_import_error(
     assert calls == ["licence"]
     assert drm.decrypted_with == [{KID: BAD, OTHER: OTHER_KEY}]
     assert not (tmp_path / "video.mp4.enc").exists()
+
+
+def test_worker_failure_reports_http_cause() -> None:
+    response = SimpleNamespace(status_code=403)
+    error = RuntimeError("Max retries exceeded")
+    error.__cause__ = HTTPError("403 Client Error", response=response)
+
+    lines = dl.failure_lines(error)
+
+    assert any("Caused by HTTPError 403: 403 Client Error" in line for line in lines)
 
 
 def test_a_download_stopped_by_a_click_exception_reports_only_its_message() -> None:
