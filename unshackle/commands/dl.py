@@ -58,7 +58,7 @@ from unshackle.core.constants import (
 )
 from unshackle.core.credential import Credential
 from unshackle.core.downloaders import default_max_workers, format_speed, parse_speed_limit, set_speed_limit
-from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine, cbcs, own_kids, verify
+from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine, cbcs, own_kids, real_kids, verify
 from unshackle.core.events import events
 from unshackle.core.export_name import ExportNamer, move_export, plural, season_episodes, title_label
 from unshackle.core.providers.anilist import parse_anilist_ref
@@ -120,6 +120,7 @@ from unshackle.core.utils.click_types import (
     MultipleChoice,
 )
 from unshackle.core.utils.collections import ci_get, merge_dict
+from unshackle.core.utils.hdr10plus import probed_tracks
 from unshackle.core.utils.post_scripts import NO_POST_SCRIPTS, build_context, dispatch, season_context
 from unshackle.core.utils.redact import mask_proxy
 from unshackle.core.utils.selector import select_multiple
@@ -240,10 +241,17 @@ def group_videos_by_variant(videos: list[Video], *, merge: bool) -> list[list[Vi
 
 
 def select_hybrid_bases(videos: Sequence[Video]) -> list[Video]:
-    """The HDR10 or HDR10+ track that is the hybrid base for each height, tallest first."""
+    """The HDR10 or HDR10+ track that is the hybrid base for each height, tallest first.
+
+    Only HEVC tracks qualify, because dovi_tool injects the RPU into an HEVC stream.
+    """
     bases: dict[int, Video] = {}
     for video in sorted(
-        (v for v in videos if v.range in (Video.Range.HDR10P, Video.Range.HDR10)),
+        (
+            v
+            for v in videos
+            if v.range in (Video.Range.HDR10P, Video.Range.HDR10) and v.codec in (Video.Codec.HEVC, None)
+        ),
         key=lambda v: v.height or 0,
         reverse=True,
     ):
@@ -251,17 +259,83 @@ def select_hybrid_bases(videos: Sequence[Video]) -> list[Video]:
     return list(bases.values())
 
 
-def hybrid_source_tracks(base: Video, dv: Video, base_container: Optional[Path] = None) -> list[Video]:
+def hybrid_gate_failure(videos: Sequence[Video], generate_dv: bool) -> Optional[tuple[str, str]]:
+    """The (message, detail) that stops HYBRID for these selected videos, or None when it can go on."""
+    hdr_tracks = [v for v in videos if v.range in (Video.Range.HDR10, Video.Range.HDR10P)]
+    base_tracks = [v for v in hdr_tracks if v.codec in (Video.Codec.HEVC, None)]
+    dv_tracks = [v for v in videos if v.range == Video.Range.DV]
+    has_hdr10p = any(v.range == Video.Range.HDR10P for v in base_tracks)
+    available_ranges = sorted(set(v.range.name for v in videos))
+
+    if not hdr_tracks and not dv_tracks:
+        return (
+            "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but neither is available",
+            f"Available ranges: {', '.join(available_ranges) if available_ranges else 'none'}",
+        )
+    if not hdr_tracks:
+        return (
+            "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but only DV is available",
+            f"Available ranges: {', '.join(available_ranges)}",
+        )
+    if not base_tracks:
+        codecs = sorted(set(v.codec.name for v in hdr_tracks if v.codec))
+        return (
+            "HYBRID mode requires an HEVC HDR10/HDR10+ base, but none is available",
+            f"Available HDR10/HDR10+ codecs: {', '.join(codecs)}",
+        )
+    if not dv_tracks and not (generate_dv and has_hdr10p):
+        msg_detail = f"Available ranges: {', '.join(available_ranges)}"
+        if generate_dv:
+            msg_detail += ". --generate-dv needs an HEVC HDR10+ track, and the service returned none."
+        elif has_hdr10p:
+            msg_detail += ". Add --generate-dv to generate Dolby Vision from HDR10+."
+        return "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but only HDR10 is available", msg_detail
+    return None
+
+
+def hybrid_plan(videos: Sequence[Video], generate_dv: bool) -> tuple[list[Video], Optional[Video]]:
+    """The hybrid bases and the DV track to pair with them.
+
+    With no DV track, only HDR10+ bases qualify, and only with ``--generate-dv``.
+    """
+    dv_tracks = [v for v in videos if v.range == Video.Range.DV]
+    base_pool = [v for v in videos if dv_tracks or (generate_dv and v.range == Video.Range.HDR10P)]
+    matching_dv = min(dv_tracks, key=lambda v: v.height or 0) if dv_tracks else None
+    return select_hybrid_bases(base_pool), matching_dv
+
+
+def hybrid_source_tracks(base: Video, dv: Optional[Video], base_container: Optional[Path] = None) -> list[Video]:
     """Copies of the base and DV tracks for the hybrid step, with the base on its container file.
 
     The hybrid step reads the duration and seeks, and the raw stream from the DV fixup
-    permits neither.
+    permits neither. With no DV track, the hybrid step makes Dolby Vision from the base's HDR10+.
     """
-    tracks = [deepcopy(base), deepcopy(dv)]
+    tracks = [deepcopy(track) for track in (base, dv) if track]
     tracks[0].path = base_container or base.path
     for track in tracks:
         track.needs_duration_fix = True
     return tracks
+
+
+def hybrid_step_error(tracks: list[Video], source: str, output_name: str) -> Optional[str]:
+    """Run the hybrid step for one resolution; the error that failed it, or None.
+
+    A failure here is this resolution's alone: the title goes on with its other resolutions.
+    """
+    try:
+        Hybrid(tracks, source, output_name=output_name)
+    except (ValueError, KeyError, OSError, RuntimeError) as e:
+        return str(e) or type(e).__name__
+    return None
+
+
+def missing_hybrid_error(bases: Sequence[Video], made: int) -> Optional[str]:
+    """Why the title has no hybrid file, or None when at least one was made."""
+    if made:
+        return None
+    if not bases:
+        return "No HEVC HDR10 or HDR10+ track to make a hybrid from"
+    return f"Every hybrid failed ({', '.join(f'{v.height or 0}p' for v in bases)}), so the title has no hybrid file"
 
 
 def title_wanted(candidate: Any, wanted: Collection[str]) -> bool:
@@ -324,9 +398,11 @@ def load_tracks(
     name: Optional[str] = None,
     year: Optional[int] = None,
     language: Optional[Language] = None,
+    workers: Optional[int] = None,
+    on_probe: Optional[Callable[[], None]] = None,
 ) -> None:
     """Load the tracks and chapters of a title, then apply the --enrich name, year and language again."""
-    title.tracks.add(service.get_tracks(title), warn_only=True)
+    title.tracks.add(probed_tracks(service, title, workers=workers, on_probe=on_probe), warn_only=True)
     title.tracks.chapters = service.get_chapters(title)
     apply_enrich(title, name, year, language)
 
@@ -1486,6 +1562,12 @@ class dl:
         help="Path to local subtitle file OR URL (Direct/TVer) to include in download."
     )
     @click.option(
+        "--generate-dv",
+        is_flag=True,
+        default=False,
+        help="With -r HYBRID, make Dolby Vision from the HDR10+ metadata when a title has no Dolby Vision track.",
+    )
+    @click.option(
         "--remote",
         is_flag=True,
         default=False,
@@ -2034,6 +2116,7 @@ class dl:
         postscript: Sequence[str] = (),
         no_postscript: bool = False,
         all_drm: bool = False,
+        generate_dv: bool = False,
         *_: Any,
         **__: Any,
     ) -> None:
@@ -2230,6 +2313,13 @@ class dl:
                 self.log.error("Unable to run hybrid mode: dovi_tool not detected")
                 self.log.error("Please install dovi_tool from https://github.com/quietvoid/dovi_tool")
                 sys.exit(1)
+            if generate_dv:
+                from unshackle.core.binaries import HDR10PlusTool
+
+                if not HDR10PlusTool:
+                    self.log.error("Unable to run --generate-dv: hdr10plus_tool not detected")
+                    self.log.error("Please install hdr10plus_tool from https://github.com/quietvoid/hdr10plus_tool")
+                    sys.exit(1)
 
         if cdm_only is None:
             vaults_only = None
@@ -2696,9 +2786,18 @@ class dl:
                 events.subscribe(events.Types.TRACK_MULTIPLEX, service.on_track_multiplex)
 
             tracks_label = "Getting Remote Tracks..." if self.is_remote else "Getting Tracks..."
-            with console.status(tracks_label, spinner="dots"):
+            tracks_spinner = Spinner("dots", text=tracks_label)
+            with SyncLive(Padding(tracks_spinner, (0, 5)), console=console, refresh_per_second=12.5, transient=True):
                 try:
-                    load_tracks(service, title, name=enrich_title, year=enrich_year, language=enrich_lang)
+                    load_tracks(
+                        service,
+                        title,
+                        name=enrich_title,
+                        year=enrich_year,
+                        language=enrich_lang,
+                        workers=workers,
+                        on_probe=lambda: tracks_spinner.update(text="Probing HDR10 tracks for HDR10+..."),
+                    )
                 except Exception as e:
                     if self.debug_logger:
                         self.debug_logger.log_error(
@@ -3153,31 +3252,12 @@ class dl:
                         title.tracks.videos = selected_videos
 
                     if keep_videos and any(r == Video.Range.HYBRID for r in range_):
-                        base_tracks = [
-                            v for v in title.tracks.videos if v.range in (Video.Range.HDR10, Video.Range.HDR10P)
-                        ]
-                        dv_tracks = [v for v in title.tracks.videos if v.range == Video.Range.DV]
+                        gate_failure = hybrid_gate_failure(title.tracks.videos, generate_dv)
+                        if not gate_failure and not any(v.range == Video.Range.DV for v in title.tracks.videos):
+                            self.log.info("No Dolby Vision track: Dolby Vision will be generated from HDR10+")
 
-                        hybrid_failed = False
-                        if not base_tracks and not dv_tracks:
-                            available_ranges = sorted(set(v.range.name for v in title.tracks.videos))
-                            msg = "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but neither is available"
-                            msg_detail = (
-                                f"Available ranges: {', '.join(available_ranges) if available_ranges else 'none'}"
-                            )
-                            hybrid_failed = True
-                        elif not base_tracks:
-                            available_ranges = sorted(set(v.range.name for v in title.tracks.videos))
-                            msg = "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but only DV is available"
-                            msg_detail = f"Available ranges: {', '.join(available_ranges)}"
-                            hybrid_failed = True
-                        elif not dv_tracks:
-                            available_ranges = sorted(set(v.range.name for v in title.tracks.videos))
-                            msg = "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but only HDR10 is available"
-                            msg_detail = f"Available ranges: {', '.join(available_ranges)}"
-                            hybrid_failed = True
-
-                        if hybrid_failed:
+                        if gate_failure:
+                            msg, msg_detail = gate_failure
                             other_ranges = [r for r in range_ if r != Video.Range.HYBRID]
                             if best_available and other_ranges:
                                 self.log.warning(msg)
@@ -4015,16 +4095,15 @@ class dl:
                                     standalone_groups: list[list[Optional[Video]]] = [
                                         list(g) for g in group_videos_by_variant(standalone_videos, merge=merge_video)
                                     ]
-                                    dv_tracks = [v for v in title.tracks.videos if v.range == Video.Range.DV]
-                                    hybrid_bases = select_hybrid_bases(title.tracks.videos) if dv_tracks else []
+                                    hybrid_bases, matching_dv = hybrid_plan(title.tracks.videos, generate_dv)
                                     hybrid_base_ids.update(v.id for v in hybrid_bases)
+                                    hybrids_made = 0
 
                                     for group in sorted(standalone_groups, key=group_file_size, reverse=True):
                                         mux_video_group(group)
 
                                     for hdr10_track in hybrid_bases:
                                         resolution = hdr10_track.height or 0
-                                        matching_dv = min(dv_tracks, key=lambda v: v.height)
                                         container = container_paths.get(hdr10_track.id)
                                         resolution_tracks = hybrid_source_tracks(hdr10_track, matching_dv, container)
 
@@ -4037,7 +4116,12 @@ class dl:
                                                 "--sample cut the HDR10 and Dolby Vision tracks at different "
                                                 "points, so a hybrid of them would not line up."
                                             )
-                                        Hybrid(resolution_tracks, self.service, output_name=hybrid_filename)
+                                        step_error = hybrid_step_error(resolution_tracks, self.service, hybrid_filename)
+                                        if step_error:
+                                            # the other files of the title are already queued for muxing
+                                            self.log.error(f"Hybrid {resolution}p failed, skipping it: {step_error}")
+                                            continue
+                                        hybrids_made += 1
 
                                         if container:
                                             try:
@@ -4059,6 +4143,10 @@ class dl:
                                         task_tracks.videos = [hybrid_track]
 
                                         enqueue_mux_tasks(task_description, task_tracks, hybrid=True)
+
+                                    no_hybrid = missing_hybrid_error(hybrid_bases, hybrids_made)
+                                    if no_hybrid:
+                                        raise click.ClickException(no_hybrid)
 
                                     console.print()
                                 else:
@@ -4163,6 +4251,7 @@ class dl:
                             "RPU_L5.bin",
                             "RPU_L6.bin",
                             "L5.json",
+                            "HDR10Plus.json",
                         ):
                             leftover_path = config.directories.temp / leftover
                             try:
@@ -5001,13 +5090,21 @@ class dl:
         poisoned row; the server key waits as the next candidate. A server CDM key is trusted
         like a local CDM key: it goes to the run cache and the vaults, and a retry after a
         flagged vault key takes it before any vault. A server vault key is unproven, so it
-        waits in ``Vaults.candidates`` and gets the same check when its turn comes.
+        waits in ``Vaults.candidates`` and gets the same check when its turn comes. Only the KIDs
+        the DRM names are looked up, each once, so sibling keys add no remote vault requests.
         """
         server_vault_keys = getattr(self._remote_service, "server_vault_keys", {})
+        looked_up: dict[UUID, tuple[Optional[str], Any]] = {}
         for track in title.tracks:
             for drm in getattr(track, "drm", None) or []:
-                for kid, server_key in list(getattr(drm, "content_keys", {}).items()):
-                    vault_key, vault = self.vaults.get_key(kid)
+                content_keys = getattr(drm, "content_keys", {})
+                named = set(real_kids(drm) or content_keys)
+                for kid, server_key in list(content_keys.items()):
+                    if kid not in named:
+                        continue
+                    if kid not in looked_up:
+                        looked_up[kid] = self.vaults.get_key(kid)
+                    vault_key, vault = looked_up[kid]
                     if not vault_key or vault_key == server_key:
                         continue
                     drm.content_keys[kid] = vault_key
@@ -5025,10 +5122,10 @@ class dl:
         """Cache the keys a batch licence or an import put on the tracks.
 
         Both fill track.drm before any prepare_drm call, so this is the only point where those
-        keys can still reach the local vaults.
+        keys can still reach the local vaults. A content key a local vault already holds is not pushed again.
         """
         server_vault_keys = getattr(getattr(self, "_remote_service", None), "server_vault_keys", {})
-        keys = {
+        resolved = {
             kid: key
             for track in title.tracks
             for drm in (getattr(track, "drm", None) or [])
@@ -5037,6 +5134,7 @@ class dl:
             and server_vault_keys.get(kid) != key
             and self.vaults.sources.get(kid, (None,))[0] != key
         }
+        keys = {kid: key for kid, key in resolved.items() if not self.vaults.held_locally(kid, key)}
         if keys:
             self.LICENSE_KEY_CACHE.update(keys)
             self.flush_vault_writes([partial(self.cache_keys_to_vaults, keys)])
@@ -5237,6 +5335,8 @@ class dl:
                     return not drm.content_keys or bool(track_kid and track_kid not in drm.content_keys)
 
                 if missing_track_key():
+                    from unshackle.core.remote_service import RemoteError
+
                     try:
                         licence(
                             drm_system="playready" if drm.__class__.__name__ == "PlayReady" else "widevine",
@@ -5244,7 +5344,7 @@ class dl:
                         )
                     except click.ClickException:
                         raise
-                    except Exception as e:
+                    except (Exception, RemoteError) as e:
                         self.log.debug(f"Server CDM licence with an empty challenge failed: {e!r}")
 
                 server_vault_keys = {} if cdm_only else getattr(svc_for_cdm, "server_vault_keys", {})

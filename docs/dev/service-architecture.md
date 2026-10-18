@@ -114,7 +114,7 @@ up the objects your methods rely on:
 |---|---|
 | `self.config` | The per-service config slice (see [Request and HTTP session objects](#request-and-http-session-objects)). |
 | `self.log` | A `logging.Logger` named after your class. |
-| `self.session` | A ready-to-use HTTP session (headers, retries, and proxy applied). |
+| `self.session` | A ready-to-use HTTP session (headers, retries, and proxy applied). Send every request through it: with a proxy active, a request from service code that does not go through the proxy logs a warning. A separate HTTP session that goes direct on purpose sets `proxy_exempt = True`. |
 | `self.cache` | A generic key/value `Cacher` namespaced to the service. |
 | `self.title_cache` | A region- and account-aware `TitleCacher`. |
 | `self.cache_dir` | `config.directories.cache / <ServiceName>`. |
@@ -133,8 +133,10 @@ See [Proxies and VPN](../guide/proxies-and-vpn.md).
 !!! note "`TrackRequest`"
     `self.track_request` is a small dataclass built from the CLI: `codecs`
     (from `--vcodec`, empty means "accept any"), `ranges` (from `--range`, default
-    `[Video.Range.SDR]`), and `best_available`. Use it in `get_tracks` to decide which
-    variants to fetch.
+    `[Video.Range.SDR]`), `best_available`, and `generate_dv` (from `--generate-dv`).
+    Use it in `get_tracks` to decide which variants to fetch. A service that fetches
+    the HYBRID variants itself must also fetch HDR10P when `generate_dv` is set and
+    the title has no DV track, because the conversion needs an HEVC HDR10+ base.
 
 ## Titles and the `Title` hierarchy
 

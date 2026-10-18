@@ -17,6 +17,7 @@ import re
 import shlex
 import sys
 import time
+from collections import deque
 from datetime import date as date_
 from enum import Enum
 from http.cookiejar import CookieJar
@@ -35,10 +36,10 @@ from rich.padding import Padding
 from rich.rule import Rule
 
 from unshackle.core.config import config
-from unshackle.core.console import console, prompt_user
+from unshackle.core.console import console, prompt_user, show_notice
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
-from unshackle.core.drm import cbcs
+from unshackle.core.drm import cbcs, real_kids
 from unshackle.core.proxies.resolve import is_loopback
 from unshackle.core.session import MAX_BACKOFF
 from unshackle.core.titles import Title_T, Titles_T, remap_titles
@@ -48,6 +49,7 @@ from unshackle.core.titles.music import SONG_FIELDS, Album, Song
 from unshackle.core.tracks import Audio, Chapter, Chapters, Subtitle, Tracks, Video
 from unshackle.core.tracks.attachment import Attachment
 from unshackle.core.tracks.track import Track
+from unshackle.core.utils import run_proxy
 from unshackle.core.utils.collections import ci_get
 from unshackle.core.utils.redact import redact_path, redact_text, safe_display_url
 from unshackle.core.vault import Vault
@@ -63,6 +65,26 @@ def redact_secrets(text: str, data: Optional[Dict[str, Any]] = None) -> str:
     """Mask URL userinfo and any request-payload secrets before unshackle writes the text to the log."""
     secrets = [v for k in SENSITIVE_DATA_KEYS if isinstance(v := (data or {}).get(k), str) and v]
     return redact_text(text, secrets) or ""
+
+
+class RemoteError(SystemExit):
+    """A remote call that failed: logged, then exits a CLI run like ``SystemExit(1)``.
+
+    A serve relaying for a REST client catches it instead and answers with ``message``; ``kind`` is the
+    remote server's error code, or CONNECT / TIMEOUT / AUTH when the session could not be reached or opened.
+    (Not ``code``: SystemExit's ``code`` is the exit status.)
+    """
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(1)
+        self.message = message
+        self.kind = kind
+        log.error(message)
+
+    @property
+    def session_broke(self) -> bool:
+        """Whether the remote session itself is gone, not just this one call."""
+        return self.kind in ("SESSION_NOT_FOUND", "CONNECT", "TIMEOUT")
 
 
 class RemoteClient:
@@ -122,28 +144,32 @@ class RemoteClient:
         payload: Dict[str, Any] = (
             {"json": data} if body is None else {"data": body, "headers": {"Content-Type": "application/octet-stream"}}
         )
+        gateway_retried = False
         while True:
             try:
                 with self.in_flight(endpoint):
                     resp = getattr(self.session, method)(url, timeout=self.timeout, **payload)
             except requests.ConnectionError as e:
                 if isinstance(e.args[0] if e.args else None, urllib3.exceptions.ReadTimeoutError):
-                    log.error(
-                        f"Request to remote server timed out after {self.timeout}s: {endpoint}. "
-                        "Raise 'timeout' for this server in remote_services."
-                    )
-                    raise SystemExit(1)
+                    raise self.timed_out(endpoint) from None
                 server_url = safe_display_url(self.server_url)
-                log.error(f"Could not connect to remote server at {server_url}. Is it running? (unshackle serve)")
-                raise SystemExit(1)
+                raise RemoteError(
+                    f"Could not connect to remote server at {server_url}. Is it running? (unshackle serve)", "CONNECT"
+                ) from None
             except requests.Timeout:
-                log.error(
-                    f"Request to remote server timed out after {self.timeout}s: {endpoint}. "
-                    "Raise 'timeout' for this server in remote_services."
-                )
-                raise SystemExit(1)
+                raise self.timed_out(endpoint) from None
             # servers differ on which header carries the key, so retry the rest before giving up
             if resp.status_code == 401 and self.next_auth_header():
+                continue
+            # a proxy HTML page, not the server's JSON, means a dropped tunnel stream, which one retry gets past
+            if (
+                resp.status_code in (502, 503, 504)
+                and not gateway_retried
+                and "json" not in resp.headers.get("Content-Type", "")
+            ):
+                gateway_retried = True
+                log.debug(f"HTTP {resp.status_code} from the proxy in front of the server on {endpoint}, retrying once")
+                time.sleep(1)
                 continue
             break
         if resp.status_code < 400 and "octet-stream" in resp.headers.get("Content-Type", ""):
@@ -165,9 +191,15 @@ class RemoteClient:
             if optional:
                 log.debug(f"Optional endpoint {endpoint} unavailable [{error_code}]: {error_msg}")
                 return {}
-            log.error(f"Server error [{error_code}]: {error_msg}")
-            raise SystemExit(1)
+            raise RemoteError(f"Server error [{error_code}]: {error_msg}", error_code)
         return detail
+
+    def timed_out(self, endpoint: str) -> RemoteError:
+        return RemoteError(
+            f"Request to remote server timed out after {self.timeout}s: {endpoint}. "
+            "Raise 'timeout' for this server in remote_services.",
+            "TIMEOUT",
+        )
 
     def post(self, endpoint: str, data: Dict[str, Any], expect: tuple[str, ...] = ()) -> Dict[str, Any]:
         return self.request("post", endpoint, data, expect=expect)
@@ -303,7 +335,8 @@ def reconstruct_drm(drm_list: Optional[list]) -> list:
                 from unshackle.core.drm import Widevine
 
                 wv_pssh = WidevinePSSH(pssh_str)
-                result.append(Widevine(pssh=wv_pssh))
+                kids = drm_info.get("kids")
+                result.append(Widevine(pssh=wv_pssh, kid=kids[0] if kids and not wv_pssh.key_ids else None))
             elif drm_type == "playready":
                 import base64 as b64
 
@@ -730,6 +763,94 @@ def resolve_server(server_name: Optional[str]) -> tuple[str, str, dict]:
     raise click.ClickException(f"Multiple remote services configured. Use --server to select one: {available}")
 
 
+REMOTE_LIST_TTL = 300.0
+REMOTE_LIST_FAILURE_TTL = 30.0
+_remote_lists: Dict[Optional[str], tuple[float, Optional[list[dict]]]] = {}
+_remote_list_locks: Dict[Optional[str], Lock] = {}
+
+
+def remote_client(server_name: Optional[str]) -> RemoteClient:
+    """A RemoteClient for one ``remote_services`` server, with its auth headers and timeout."""
+    url, api_key, services_config = resolve_server(server_name)
+    return RemoteClient(url, api_key, services_config.get("_auth_headers"), services_config.get("_timeout"))
+
+
+def remote_service_list(server_name: Optional[str]) -> Optional[list[dict]]:
+    """The services a ``remote_services`` server offers, cached for ``REMOTE_LIST_TTL``; None when it is unreachable.
+
+    A failure is cached for ``REMOTE_LIST_FAILURE_TTL``, so a server that is down does not stall every caller
+    for its timeout, and a blip does not hide its services for long. One caller fetches; the rest wait for it.
+    """
+
+    def cached() -> Optional[tuple[float, Optional[list[dict]]]]:
+        hit = _remote_lists.get(server_name)
+        ttl = REMOTE_LIST_FAILURE_TTL if hit and hit[1] is None else REMOTE_LIST_TTL
+        return hit if hit and time.monotonic() - hit[0] < ttl else None
+
+    if hit := cached():
+        return hit[1]
+    with _remote_list_locks.setdefault(server_name, Lock()):
+        if hit := cached():
+            return hit[1]
+        services: Optional[list[dict]] = None
+        try:
+            services = remote_client(server_name).get("/api/services").get("services") or []
+        except (Exception, SystemExit) as e:
+            log.warning(f"Could not list the services of remote server '{server_name}': {e}")
+        _remote_lists[server_name] = (time.monotonic(), services)
+        return services
+
+
+def reset_remote_lists() -> None:
+    """Forget every cached remote service list, for a config reload."""
+    _remote_lists.clear()
+
+
+def find_remote_service(services: list[dict], name: str) -> Optional[dict]:
+    """The remote service ``name`` means: a tag in any case first, then an alias, as local get_tag resolves one."""
+    lowered = name.lower()
+    return next((svc for svc in services if str(svc.get("tag", "")).lower() == lowered), None) or next(
+        (svc for svc in services if lowered in (str(a).lower() for a in svc.get("aliases") or [])), None
+    )
+
+
+def remote_service_params(info: dict, data: Dict[str, Any]) -> Dict[str, Any]:
+    """The service options to send: ``data["service_params"]``, else the ``data`` keys naming a cli option.
+
+    Only the remote service's cli option names pass, either way: RemoteService merges them into the
+    session-create body, where a key such as ``service`` or ``proxy`` would override the checked value.
+    """
+    names = {p.get("name") for p in info.get("cli_params") or [] if p.get("kind") == "option"}
+    names -= {"title", "service", "title_id", "profile", "proxy", "no_proxy"}
+    source = data.get("service_params") if isinstance(data.get("service_params"), dict) else data
+    return {k: v for k, v in source.items() if k in names and v is not None and v is not False}
+
+
+def make_remote_service(
+    ctx: click.Context,
+    server_name: Optional[str],
+    service_tag: str,
+    title_id: str,
+    data: Dict[str, Any],
+    apply_overrides: bool = True,
+) -> "RemoteService":
+    """A RemoteService for one ``remote_services`` server, set up the way ``dl --remote`` sets one up.
+
+    ``apply_overrides`` False keeps the per-service ``remote_services.<name>.services`` overrides out of this
+    process's global config.
+    """
+    url, api_key, services_config = resolve_server(server_name)
+    # resolve_server hands back the live config dict; concurrent requests for other tags must not share it
+    services_config = dict(services_config)
+    if not apply_overrides:
+        services_config.pop(service_tag, None)
+    info = next((s for s in remote_service_list(server_name) or [] if s.get("tag") == service_tag), {})
+    services_config["_server_accounts"] = info.get("server_accounts")
+    services_config["_client_config"] = info.get("client_config")
+    params = remote_service_params(info, data)
+    return RemoteService(ctx, service_tag, title_id, url, api_key, services_config, service_params=params)
+
+
 def load_credentials_for_transport(service_tag: str, profile: Optional[str]) -> Optional[Dict[str, str]]:
     from unshackle.commands.dl import dl
 
@@ -766,7 +887,7 @@ def resolve_proxy_arg(proxy_arg: Optional[str]) -> Optional[str]:
         raise click.ClickException(str(e))
 
 
-def resolve_remote_proxy_arg(proxy_arg: str) -> Optional[str]:
+def resolve_remote_proxy_arg(proxy_arg: str, providers: Optional[list] = None) -> Optional[str]:
     """
     Get the proxy URI to send to a server for a --proxy value.
 
@@ -777,7 +898,8 @@ def resolve_remote_proxy_arg(proxy_arg: str) -> Optional[str]:
     from unshackle.core.proxies.resolve import find_provider, initialize_proxy_providers, resolve_proxy
 
     try:
-        providers = initialize_proxy_providers()
+        # the providers dl or a serve already loaded, which a serve leaves empty for a key without server_proxy
+        providers = initialize_proxy_providers() if providers is None else providers
         provider, _, query = proxy_arg.partition(":")
         if provider.lower() == "controld" and query:
             controld = find_provider(providers, "controld")
@@ -942,6 +1064,10 @@ class RemoteService:
         self._segment_filters: Dict[str, Callable[[Any], bool]] = {}
         self._sample_decrypt_tracks: set[str] = set()
         self._log_seq = 0
+        self._recent_logs: deque[str] = deque(maxlen=3)
+        self._input_bridge: Any = None  # a serve relaying for a REST client sets one, as it does for a Service
+        # what a login waiting on the user (a pair code, an approval link) last showed; None otherwise
+        self.auth_notice: Optional[str] = None
         self._log_drain_lock = Lock()
         self._keepalive_stop = Event()
 
@@ -1046,11 +1172,12 @@ class RemoteService:
             except Exception:
                 pass
 
+        providers = getattr(self.ctx.obj, "proxy_providers", None)
         if not no_proxy and not proxy and self._server_accounts and not self._server_accounts.get("global"):
             regions = [str(r).lower() for r in self._server_accounts.get("regions") or []]
             if regions and client_region and client_region not in regions:
                 try:
-                    create_data["proxy"] = resolve_remote_proxy_arg(regions[0])
+                    create_data["proxy"] = resolve_remote_proxy_arg(regions[0], providers)
                     create_data["proxy_region"] = regions[0]
                     self.log.info(f"Using a '{regions[0]}' proxy to match a server account ({', '.join(regions)})")
                 except click.ClickException:
@@ -1060,7 +1187,7 @@ class RemoteService:
                         "rejects the remote session"
                     )
         elif not no_proxy and proxy:
-            resolved_proxy = resolve_remote_proxy_arg(proxy)
+            resolved_proxy = resolve_remote_proxy_arg(proxy, providers)
             if resolved_proxy:
                 create_data["proxy"] = resolved_proxy
                 query = (self.ctx.parent.params.get("proxy_query") if self.ctx.parent else None) or proxy
@@ -1073,6 +1200,7 @@ class RemoteService:
         local_proxy = None if no_proxy else (proxy or create_data.get("proxy"))
         if local_proxy:
             self._session.proxies["all"] = local_proxy
+            run_proxy.pin(self._session)
 
         if not no_proxy and not proxy and client_region:
             create_data["client_region"] = client_region
@@ -1096,6 +1224,8 @@ class RemoteService:
                 create_data["quality"] = list(quality)
             if self.ctx.parent.params.get("best_available"):
                 create_data["best_available"] = True
+            if self.ctx.parent.params.get("generate_dv"):
+                create_data["generate_dv"] = True
             # Services pick the manifests to fetch from these. They go in their own
             # object: flat, a service option with the same name would take them (or override them).
             # An empty list is sent as-is, because only an absent key falls back to the dl default.
@@ -1154,7 +1284,9 @@ class RemoteService:
         from unshackle.core import __code_hash__, __version__
 
         secrets = [v for v in (create_data.get("credentials") or {}).values() if isinstance(v, str) and len(v) >= 4]
-        argv = (redact_path(redact_text(shlex.join(sys.argv[1:]), secrets)) or "")[:3000]
+        # a serve relaying for a REST client names itself; its own argv is just the serve command
+        client_argv = self.ctx.parent.params.get("client_argv") if self.ctx.parent else None
+        argv = (redact_path(redact_text(client_argv or shlex.join(sys.argv[1:]), secrets)) or "")[:3000]
         create_data["client"] = {
             "version": __version__,
             "code_hash": __code_hash__ or None,
@@ -1271,6 +1403,7 @@ class RemoteService:
             for record in resp.get("logs", []):
                 level = level_names.get(str(record.get("level", "INFO")), logging.INFO)
                 self.log.log(level, str(record.get("message", "")))
+                self._recent_logs.append(str(record.get("message", "")).strip())
             self._log_seq = int(resp.get("last_seq", self._log_seq))
 
     def poll_auth_completion(self, poll_interval: float = 2.0, timeout: float = 600.0) -> None:
@@ -1285,20 +1418,28 @@ class RemoteService:
             self.poll_auth(deadline, poll_interval)
         finally:
             self.close_cdm_sessions()
+            if self.auth_notice is not None:
+                self.auth_notice = None
+                show_notice(None)
 
     def poll_auth(self, deadline: float, poll_interval: float) -> None:
         while time.monotonic() < deadline:
             resp = self.client.get(f"/api/session/{self._session_id}/prompt")
             status = resp.get("status")
+            seen = self._log_seq
             self.drain_server_logs()
 
             if status == "authenticated":
                 return
 
+            if status == "authenticating" and self._log_seq == seen and self._recent_logs:
+                notice = "\n".join(self._recent_logs)
+                if notice != self.auth_notice:
+                    self.auth_notice = notice
+                    show_notice(notice)
+
             if status == "failed":
-                error = resp.get("error", "Authentication failed on server")
-                log.error(f"Remote auth failed: {error}")
-                raise SystemExit(1)
+                raise RemoteError(f"Remote auth failed: {resp.get('error', 'Authentication failed on server')}", "AUTH")
 
             if status == "pending_input" and isinstance(resp.get("cdm_call"), dict):
                 self.answer_cdm_call(resp["cdm_call"], self._cdm_sessions)
@@ -1306,11 +1447,11 @@ class RemoteService:
 
             if status == "pending_input":
                 prompt = resp.get("prompt", "Enter input: ")
+                bridge = self._input_bridge
                 try:
-                    user_response = prompt_user(prompt)
+                    user_response = bridge.request_input(prompt) if bridge else prompt_user(prompt)
                 except EOFError:
-                    log.error("Remote auth needs interactive input but stdin is closed")
-                    raise SystemExit(1) from None
+                    raise RemoteError("Remote auth needs interactive input but stdin is closed", "AUTH") from None
                 self.client.post(
                     f"/api/session/{self._session_id}/prompt",
                     {"response": user_response},
@@ -1319,8 +1460,7 @@ class RemoteService:
 
             time.sleep(poll_interval)
 
-        log.error("Remote authentication timed out")
-        raise SystemExit(1)
+        raise RemoteError("Remote authentication timed out", "AUTH")
 
     def answer_cdm_call(self, call: Dict[str, Any], sessions: Dict[str, bytes]) -> None:
         """Run one of the server's CDM calls on this machine's device and post the answer."""
@@ -1542,9 +1682,9 @@ class RemoteService:
                         self.log.warning(f"Server CDM returned no content keys for track {track.id}")
                     continue
 
-                kid_list = list(track_keys.keys())
+                named = {kid.hex for drm in track.drm or [] for kid in real_kids(drm)} & track_keys.keys()
                 track_drm_type = drm_types_by_track.get(str(track.id), server_drm_type)
-                drm_obj = self.create_drm_stub(track_drm_type, kid_list)
+                drm_obj = self.create_drm_stub(track_drm_type, sorted(named) or list(track_keys))
                 for kid_hex, key_hex in track_keys.items():
                     drm_obj.content_keys[UUID(hex=kid_hex)] = key_hex
                 track.drm = [drm_obj]
@@ -1741,7 +1881,7 @@ class RemoteService:
                                 for kid_hex, key_hex in keys.items():
                                     drm_obj.content_keys[UUID(hex=kid_hex)] = key_hex
                         return challenge
-                except Exception as e:
+                except (Exception, RemoteError) as e:
                     self.log.warning("server_cdm license failed: %s", e)
             else:
                 self.log.warning(f"Track {track.id} has no PSSH to send to the server CDM")
@@ -1782,6 +1922,8 @@ class RemoteService:
         pass
 
     def close(self) -> None:
+        # a long-lived serve opens many of these; the atexit hook would keep every one alive
+        atexit.unregister(self.close)
         self._keepalive_stop.set()
         session_id, self._session_id = self._session_id, None
         if session_id:

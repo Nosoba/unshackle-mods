@@ -42,6 +42,7 @@ from unshackle.core.session import RnetResponse, RnetSession, utf8_text
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
 from unshackle.core.tracks.track import DRM_PREFERENCE_TYPES, assert_fragments_decrypted
 from unshackle.core.utilities import get_extension, is_close_match, log_event, try_ensure_utf8
+from unshackle.core.utils import run_proxy
 from unshackle.core.utils.redact import safe_display_url
 from unshackle.core.utils.subprocess import log_tool_run
 
@@ -64,7 +65,7 @@ class HLS:
             raise ValueError("Expected the M3U(8) manifest to be a Variant Playlist.")
 
         self.manifest = manifest
-        self.session = session or Session()
+        self.session = session or run_proxy.fallback_session()
         self.url = url
         self.raw_text = raw_text
 
@@ -76,7 +77,7 @@ class HLS:
             raise TypeError(f"Expected url to be a {str}, not {url!r}")
 
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
         elif not isinstance(session, (Session, RnetSession)):
             raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {session!r}")
 
@@ -250,8 +251,8 @@ class HLS:
             )
             # DV-composite track: primary codec is plain HEVC but SUPPLEMENTAL-CODECS advertises
             # a DV codec. Range stays whatever VIDEO-RANGE signaled (HDR10/HLG/SDR); DVFixup will
-            # restore DV signaling post-download. Services that know their encoder embeds HDR10+
-            # SEI must override `range` themselves.
+            # restore DV signaling post-download. HDR10+ SEI in an HDR10 track is found later by the
+            # core HDR10+ probe.
             dv_compatible_bitstream = primary_track_type is Video and not primary_has_dv and supp_dv_codec is not None
             
             track_duration = None
@@ -400,7 +401,7 @@ class HLS:
         an SPS out of the first segment for plain TS variants.
         """
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
 
         res = session.get(variant_url)
         variant = m3u8.loads(utf8_text(res), uri=variant_url)
@@ -1517,7 +1518,7 @@ class HLS:
             value = getattr(data, "value", None)
             if not value and data.uri:
                 if not session:
-                    session = Session()
+                    session = run_proxy.fallback_session()
                 value = utf8_text(session.get(urljoin(manifest.base_uri or "", data.uri)))
 
             if not value:
@@ -1706,7 +1707,7 @@ class HLS:
         if not isinstance(session, (Session, RnetSession, type(None))):
             raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {type(session)}")
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
 
         # TODO: Add support for 'SAMPLE-AES', 'AES-CTR', 'AES-CBC', 'ClearKey'
         if key.method == "AES-128":
@@ -1754,7 +1755,9 @@ class HLS:
         try:
             return HLS.get_drm(key, session)
         except Widevine.Exceptions.KIDNotFound:
-            kid = HLS.get_track_kid_from_init(master, track, probe_session or session or Session(), init_section)
+            kid = HLS.get_track_kid_from_init(
+                master, track, probe_session or session or run_proxy.fallback_session(), init_section
+            )
             if not kid:
                 raise
             return HLS.get_drm(key, session, kid=kid)
