@@ -73,7 +73,7 @@ from unshackle.core.proxies.resolve import (
     split_proxy_query,
 )
 from unshackle.core.service import Service, grow_session_pool
-from unshackle.core.services import Services
+from unshackle.core.services import ROUTING_PARAMS, Services
 from unshackle.core.temp import with_task_temp
 from unshackle.core.title_cacher import get_account_hash
 from unshackle.core.titles import Movie, Movies, Series, Song, Title_T
@@ -83,6 +83,7 @@ from unshackle.core.tracks.attachment import Attachment
 from unshackle.core.tracks.dv_fixup import apply_dv_fixup
 from unshackle.core.tracks.hybrid import Hybrid
 from unshackle.core.tracks.track import assert_fragments_decrypted, has_encrypted_sample_entry
+from unshackle.core.tracks.tracks import at_resolution
 from unshackle.core.utilities import (
     apply_original_language,
     as_requested,
@@ -261,6 +262,8 @@ def select_hybrid_bases(videos: Sequence[Video]) -> list[Video]:
 
 def hybrid_gate_failure(videos: Sequence[Video], generate_dv: bool) -> Optional[tuple[str, str]]:
     """The (message, detail) that stops HYBRID for these selected videos, or None when it can go on."""
+    if any(v.native_hybrid for v in videos):
+        return None
     hdr_tracks = [v for v in videos if v.range in (Video.Range.HDR10, Video.Range.HDR10P)]
     base_tracks = [v for v in hdr_tracks if v.codec in (Video.Codec.HEVC, None)]
     dv_tracks = [v for v in videos if v.range == Video.Range.DV]
@@ -296,10 +299,16 @@ def hybrid_gate_failure(videos: Sequence[Video], generate_dv: bool) -> Optional[
 def hybrid_plan(videos: Sequence[Video], generate_dv: bool) -> tuple[list[Video], Optional[Video]]:
     """The hybrid bases and the DV track to pair with them.
 
-    With no DV track, only HDR10+ bases qualify, and only with ``--generate-dv``.
+    With no DV track, only HDR10+ bases qualify, and only with ``--generate-dv``. A resolution with a
+    finished hybrid (``native_hybrid``) gets no base: that track is its hybrid.
     """
     dv_tracks = [v for v in videos if v.range == Video.Range.DV]
-    base_pool = [v for v in videos if dv_tracks or (generate_dv and v.range == Video.Range.HDR10P)]
+    native_heights = {v.height for v in videos if v.native_hybrid}
+    base_pool = [
+        v
+        for v in videos
+        if v.height not in native_heights and (dv_tracks or (generate_dv and v.range == Video.Range.HDR10P))
+    ]
     matching_dv = min(dv_tracks, key=lambda v: v.height or 0) if dv_tracks else None
     return select_hybrid_bases(base_pool), matching_dv
 
@@ -481,9 +490,13 @@ def cut_music_sample(title: Any, window: tuple[int, int], log: logging.Logger) -
 
 def apply_service_dl_overrides(ctx: click.Context, service_dl_config: dict[str, Any], log: logging.Logger) -> None:
     """Apply ``services.<TAG>.dl`` config onto ``ctx.params``. Explicit CLI/env values win.
-    The config replaces defaults and global ``dl:`` default_map values."""
+    The config replaces defaults and global ``dl:`` default_map values.
+    ``remote`` and ``server`` are skipped: they pick the code that runs, so ``Services.resolve_command`` sets
+    them before the service loads, and an API job takes them from its request."""
     params_by_name = {param.name: param for param in ctx.command.params if param.name}
     for name, value in normalize_dl_config(service_dl_config).items():
+        if name in ROUTING_PARAMS:
+            continue
         param = params_by_name.get(name)
         if param is None:
             log.warning(f"Ignoring unknown dl option '{name}' in service config")
@@ -1568,11 +1581,10 @@ class dl:
         help="With -r HYBRID, make Dolby Vision from the HDR10+ metadata when a title has no Dolby Vision track.",
     )
     @click.option(
-        "--remote",
-        is_flag=True,
+        "--remote/--local",
         default=False,
         is_eager=True,
-        help="Use a remote unshackle server instead of local service code.",
+        help="Use a remote unshackle server instead of local service code. --local overrides a remote: true config.",
     )
     @click.option(
         "--server",
@@ -1634,7 +1646,7 @@ class dl:
 
         self.service = Services.get_tag(ctx.invoked_subcommand)
         self.vault_service = Services.get_vault_tag(self.service)
-        apply_service_dl_overrides(ctx, config.services.get(self.service, {}).get("dl", {}), self.log)
+        apply_service_dl_overrides(ctx, (ci_get(config.services, self.service) or {}).get("dl") or {}, self.log)
 
         # Refresh locals Click bound before the overrides ran.
         no_proxy = ctx.params.get("no_proxy", no_proxy)
@@ -1812,9 +1824,9 @@ class dl:
                         )
                 except KeyError:
                     pass
-            merge_dict(config.services.get(self.service), self.service_config)
+            merge_dict(ci_get(config.services, self.service), self.service_config)
 
-        service_config = config.services.get(self.service, {})
+        service_config = ci_get(config.services, self.service, {})
         if service_config:
             reserved_keys = {
                 "profiles",
@@ -3009,10 +3021,13 @@ class dl:
                     if keep_videos and range_:
                         # Special handling for HYBRID - don't filter, keep all HDR10 and DV tracks
                         if Video.Range.HYBRID not in range_:
+                            dv_has_hdr10p = any(x.hdr10plus for x in title.tracks.videos)
                             title.tracks.select_video(lambda x: x.range in range_)
                             missing_ranges = [r for r in range_ if not any(x.range == r for x in title.tracks.videos)]
                             for color_range in missing_ranges:
                                 self.log.warning(f"Skipping {color_range.name} video tracks as none are available.")
+                            if Video.Range.HDR10P in missing_ranges and dv_has_hdr10p:
+                                self.log.warning("A DV track carries HDR10+: use -r DV or -r HYBRID.")
                             if not title.tracks.videos:
                                 self.log.error(f"There's no {', '.join(r.name for r in range_)} Video Track...")
                                 sys.exit(1)
@@ -3124,7 +3139,7 @@ class dl:
                                 effective_quality = []
                             else:
                                 hybrid_filter = title.tracks.select_hybrid(
-                                    hybrid_candidate_tracks, quality, worst=worst
+                                    hybrid_candidate_tracks, quality, worst=worst, generate_dv=generate_dv
                                 )
                                 hybrid_selected = list(filter(hybrid_filter, hybrid_candidate_tracks))
 
@@ -3179,20 +3194,19 @@ class dl:
                             title.tracks.videos, non_hybrid_ranges
                         )
 
-                        if not effective_quality:
+                        hybrid_quality = effective_quality
+                        if not hybrid_quality:
                             best_resolution = max((v.height for v in hybrid_candidate_tracks), default=None)
-                            if best_resolution:
-                                hybrid_filter = title.tracks.select_hybrid(
-                                    hybrid_candidate_tracks, [best_resolution], worst=worst
-                                )
-                                hybrid_selected = list(filter(hybrid_filter, hybrid_candidate_tracks))
-                            else:
-                                hybrid_selected = []
-                        else:
+                            hybrid_quality = [best_resolution] if best_resolution else []
+                        hybrid_selected = []
+                        if hybrid_quality:
                             hybrid_filter = title.tracks.select_hybrid(
-                                hybrid_candidate_tracks, effective_quality, worst=worst
+                                hybrid_candidate_tracks, hybrid_quality, worst=worst, generate_dv=generate_dv
                             )
                             hybrid_selected = list(filter(hybrid_filter, hybrid_candidate_tracks))
+                            for res in hybrid_quality:
+                                if not any(at_resolution(v, res) for v in hybrid_selected):
+                                    self.log.warning(f"Skipping {res}p: nothing at that resolution can make a hybrid")
 
                         non_hybrid_selected: list[Video] = []
                         if non_hybrid_ranges and non_hybrid_tracks:
@@ -3253,7 +3267,9 @@ class dl:
 
                     if keep_videos and any(r == Video.Range.HYBRID for r in range_):
                         gate_failure = hybrid_gate_failure(title.tracks.videos, generate_dv)
-                        if not gate_failure and not any(v.range == Video.Range.DV for v in title.tracks.videos):
+                        if not gate_failure and not any(
+                            v.range == Video.Range.DV or v.native_hybrid for v in title.tracks.videos
+                        ):
                             self.log.info("No Dolby Vision track: Dolby Vision will be generated from HDR10+")
 
                         if gate_failure:
@@ -4098,6 +4114,11 @@ class dl:
                                     hybrid_bases, matching_dv = hybrid_plan(title.tracks.videos, generate_dv)
                                     hybrid_base_ids.update(v.id for v in hybrid_bases)
                                     hybrids_made = 0
+                                    for video in (v for v in original_videos if v.native_hybrid):
+                                        self.log.info(
+                                            f"The {video.height}p {video.range_label} track is already the hybrid"
+                                        )
+                                        hybrids_made += 1
 
                                     for group in sorted(standalone_groups, key=group_file_size, reverse=True):
                                         mux_video_group(group)

@@ -86,6 +86,11 @@ MANUAL_TRANSLATIONS = {
 }
 
 
+def at_resolution(video: Video, res: int) -> bool:
+    """Whether a track has this height, or this height from a 16:9 width (a letterboxed encode)."""
+    return video.height == res or bool(video.width and int(video.width * 9 / 16) == res)
+
+
 class Tracks:
     """
     Video, Audio, Subtitle, Chapter, and Attachment Track Store.
@@ -482,12 +487,34 @@ class Tracks:
 
         A track that the caller also selected as an explicit deliverable (same track in both
         selections) stays unflagged, and the standalone mux loop muxes it alongside the hybrid.
+        A ``native_hybrid`` track is the hybrid itself, so it stays unflagged too.
         """
         for video in hybrid_selected:
-            if video not in non_hybrid_selected:
+            if video not in non_hybrid_selected and not video.native_hybrid:
                 video.hybrid_base_only = True
 
-    def select_hybrid(self, tracks, quality, worst: bool = False):
+    def select_hybrid(self, tracks, quality, worst: bool = False, generate_dv: bool = False):
+        """A filter for the hybrid ingredients of each resolution. It sets ``native_hybrid`` on every track.
+
+        A track that already carries DV and an HDR10 or HDR10+ base (DV+HDR10P, HDR10+DV, HDR10P+DV) is a finished
+        hybrid, so its resolution takes that track and no base. One that carries HDR10+ comes first. The other
+        resolutions get a base only when a DV track can give it an RPU, or with ``generate_dv``.
+        """
+        pick = min if worst else max
+        natives = {}
+        for res in quality:
+            candidates = [v for v in tracks if v.finished_hybrid and at_resolution(v, res)]
+            if candidates:
+                with_hdr10plus = [v for v in candidates if v.carries_hdr10plus]
+                natives[res] = pick(with_hdr10plus or candidates, key=lambda v: v.bitrate or 0)
+        for video in tracks:
+            video.native_hybrid = any(video is v for v in natives.values())
+        dv_tracks = [v for v in tracks if v.range == Video.Range.DV]
+        if natives and not dv_tracks and not generate_dv:
+            quality = []  # no DV track to take an RPU from
+        else:
+            quality = [res for res in quality if res not in natives]
+
         # Prefer HDR10+ over HDR10 as the base layer (preserves dynamic metadata).
         # Only an HEVC base qualifies, because dovi_tool injects the RPU into an HEVC stream.
         base_ranges = (Video.Range.HDR10P, Video.Range.HDR10)
@@ -498,24 +525,22 @@ class Tracks:
                 for v in tracks
                 if v.range == range_type
                 and v.codec in (Video.Codec.HEVC, None)
-                and (v.height in quality or (v.width and int(v.width * 9 / 16) in quality))
+                and any(at_resolution(v, res) for res in quality)
             ]
             if base_tracks:
                 break
 
-        pick = min if worst else max
         base_selected = []
         for res in quality:
-            candidates = [v for v in base_tracks if v.height == res or (v.width and int(v.width * 9 / 16) == res)]
+            candidates = [v for v in base_tracks if at_resolution(v, res)]
             if candidates:
                 chosen = pick(candidates, key=lambda v: v.bitrate)
                 base_selected.append(chosen)
 
-        dv_tracks = [v for v in tracks if v.range == Video.Range.DV]
-        lowest_dv = min(dv_tracks, key=lambda v: v.height) if dv_tracks else None
+        lowest_dv = min(dv_tracks, key=lambda v: v.height) if dv_tracks and (base_selected or not natives) else None
 
         def select(x):
-            if x in base_selected:
+            if x in base_selected or x.native_hybrid:
                 return True
             if lowest_dv and x is lowest_dv:
                 return True

@@ -176,6 +176,14 @@ def test_match_track_by_attributes_keeps_range_and_bitrate_apart() -> None:
     assert match_track(remote, [sdr, hdr]) is hdr
 
 
+def test_match_track_by_attributes_matches_probed_hdr10p_to_local_hdr10() -> None:
+    common = {"codec": "HEVC", "width": 3840, "height": 2160, "language": "en", "bitrate": 15000000}
+    sdr = deserialize_video({**common, "id": "a", "range": "SDR"})
+    hdr10 = deserialize_video({**common, "id": "b", "range": "HDR10"})
+    remote = deserialize_video({**common, "id": "z", "range": "HDR10P"})
+    assert match_track(remote, [sdr, hdr10]) is hdr10
+
+
 def test_match_track_no_candidates_returns_none() -> None:
     remote = deserialize_video({"id": "X", "codec": "AVC", "width": 1, "height": 1})
     assert match_track(remote, []) is None
@@ -320,7 +328,7 @@ def test_load_cache_files_wiring(tmp_path, monkeypatch) -> None:
 
 
 def test_load_cache_files_forwards_nested_keys(tmp_path, monkeypatch) -> None:
-    """A service that keeps its cache in subfolders (NF: session_web/<sha1>.json) must have
+    """A service that keeps its cache in subfolders (session_web/<sha1>.json) must have
     those files forwarded under the Cacher key, and the credential filter must still apply
     to the basename of a nested file."""
     import base64

@@ -233,6 +233,7 @@ class Video(Track):
         scan_type: Optional[Video.ScanType] = None,
         closed_captions: Optional[list[dict[str, Any]]] = None,
         dv_compatible_bitstream: bool = False,
+        hdr10plus: bool = False,
         **kwargs: Any,
     ) -> None:
         """
@@ -251,6 +252,7 @@ class Video(Track):
             fps: A number, float, or string representing the frames/s of the video.
                 Strings may represent numbers, floats, or a fraction (num/den).
                 All strings will be cast to either a number or float.
+            hdr10plus: The DV track also carries HDR10+ metadata. The HDR10+ probe sets it.
 
         Note: If codec, bitrate, width, height, or fps is not specified, unshackle can
         skip some checks or assume a value. Give as much information as possible.
@@ -299,7 +301,9 @@ class Video(Track):
         self.closed_captions: list[dict[str, Any]] = closed_captions or []
         self.needs_duration_fix = False
         self.dv_compatible_bitstream = dv_compatible_bitstream
+        self.hdr10plus = hdr10plus
         self.hybrid_base_only = False
+        self.native_hybrid = False
 
     def to_dict(self) -> dict[str, Any]:
         data = super().to_dict()
@@ -313,6 +317,7 @@ class Video(Track):
                 "fps": str(self.fps) if self.fps else None,
                 "scan_type": self.scan_type.name if self.scan_type else None,
                 "dv_compatible_bitstream": self.dv_compatible_bitstream,
+                "hdr10plus": self.hdr10plus,
             }
         )
         return data
@@ -330,7 +335,48 @@ class Video(Track):
             fps=data.get("fps"),
             scan_type=Video.ScanType[data["scan_type"]] if data.get("scan_type") else None,
             dv_compatible_bitstream=data.get("dv_compatible_bitstream", False),
+            hdr10plus=data.get("hdr10plus", False),
         )
+
+    @staticmethod
+    def dv_fourccs(codecs: Optional[str]) -> set[str]:
+        """The Dolby Vision fourccs in a codecs list (comma or space separated, ``/brand`` suffixes allowed)."""
+        fourccs = {token.split("/")[0].split(".")[0] for token in re.split(r"[\s,]+", (codecs or "").lower())}
+        return fourccs & {"dva1", "dvav", "dvhe", "dvh1"}
+
+    @staticmethod
+    def has_dv_codec(codecs: Optional[str]) -> bool:
+        """Whether a codecs list names a Dolby Vision codec."""
+        return bool(Video.dv_fourccs(codecs))
+
+    @staticmethod
+    def is_dv_composite(
+        codec: Optional[Video.Codec], codecs: Optional[str], supplemental_codecs: Optional[str]
+    ) -> bool:
+        """Whether an HEVC track names DV only in its supplemental codecs: DV profile 8 on an HDR10, SDR or HLG base."""
+        return (
+            codec == Video.Codec.HEVC
+            and not Video.has_dv_codec(codecs)
+            and bool(Video.dv_fourccs(supplemental_codecs) & {"dvh1", "dvhe"})
+        )
+
+    @property
+    def carries_hdr10plus(self) -> bool:
+        """Whether the track carries HDR10+, as its range or, on a DV track, found by the HDR10+ probe."""
+        return self.hdr10plus or self.range == Video.Range.HDR10P
+
+    @property
+    def finished_hybrid(self) -> bool:
+        """Whether the track already carries DV and an HDR10 or HDR10+ base, so ``-r HYBRID`` needs no build."""
+        if self.range == Video.Range.DV:
+            return self.hdr10plus
+        return self.dv_compatible_bitstream and self.range in (Video.Range.HDR10, Video.Range.HDR10P)
+
+    @property
+    def range_label(self) -> str:
+        """The range that ``-r`` selects the track by, then any second format it carries: HDR10+DV, DV+HDR10P."""
+        label = self.range.name + ("+HDR10P" if self.hdr10plus else "")
+        return f"{label}+DV" if self.dv_compatible_bitstream and self.range != Video.Range.DV else label
 
     def __str__(self) -> str:
         bitrate_str = None
@@ -343,7 +389,7 @@ class Video(Track):
                 bool,
                 [
                     "VID",
-                    "[" + (", ".join(filter(bool, [self.codec.value if self.codec else None, self.range.name]))) + "]",
+                    "[" + (", ".join(filter(bool, [self.codec.value if self.codec else None, self.range_label]))) + "]",
                     str(self.language),
                     ", ".join(
                         filter(

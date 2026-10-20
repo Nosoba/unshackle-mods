@@ -233,6 +233,7 @@ class DASH:
                         # mimeType likely specifies the subtitle codec better than `codecs`
                         codecs = mime_type.split("/")[1]
 
+                    video_args: dict[str, Any] = {}
                     if content_type == "video":
                         track_type = Video
                         track_codec = Video.Codec.from_codecs(codecs)
@@ -255,6 +256,9 @@ class DASH:
                             fps=track_fps or None,
                             scan_type=scan_type,
                             duration=period_duration_sec,
+                        )
+                        video_args["dv_compatible_bitstream"] = Video.is_dv_composite(
+                            track_codec, codecs, get("supplementalCodecs")
                         )
                     elif content_type == "audio":
                         track_type = Audio
@@ -331,6 +335,7 @@ class DASH:
                                 }
                             },
                             **track_args,
+                            **video_args,
                         )
                     )
 
@@ -1166,11 +1171,7 @@ class DASH:
     def get_video_range(
         codecs: str, all_supplemental_props: list[Element], all_essential_props: list[Element]
     ) -> Video.Range:
-        # TODO: Detect Dolby Vision composite streams in DASH manifests (DV RPU embedded but
-        # primary codec is plain hvc1, signaled via a separate AdaptationSet/Representation
-        # with DV codec strings or DolbyVisionConfigurationBox). When found, mark the track
-        # with dv_compatible_bitstream=True so DVFixup runs pre-mux. No DASH samples seen yet.
-        if codecs.startswith(("dva1", "dvav", "dvhe", "dvh1")):
+        if Video.has_dv_codec(codecs):
             return Video.Range.DV
 
         return Video.Range.from_cicp(
