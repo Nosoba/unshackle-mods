@@ -22,11 +22,12 @@ a query to a real proxy URL: [basic static proxies](#basic-static-proxies),
 
 ## The `--proxy` flag
 
-Four options on the `dl` command control proxying at download time:
+Five options on the `dl` command control proxying at download time:
 
 | Option | Effect |
 |---|---|
 | `--proxy` | The proxy to use. Either an explicit URI, or a query that unshackle resolves against your configured providers. |
+| `--local-proxy` | With `--remote`, send the server's service requests through your machine's own connection. Works with no other proxy option. See [Send the server's requests through your machine](#send-the-servers-requests-through-your-machine). |
 | `--no-proxy` | Force **all** proxy use off. No providers are initialised and no proxy query is resolved. |
 | `--no-proxy-download` | Use the proxy for the manifest, licence, and authentication, but bypass it for the **downloads** themselves. |
 | `--proxy-download` | Use `--proxy` for the manifest, licence, and authentication, and a different proxy for the **downloads**. Takes the same forms as `--proxy`. |
@@ -204,6 +205,75 @@ sees your own IP, but the service does not.
 A `socks5://` proxy makes the DNS lookup of each host on your machine and gives no warning.
 Use `socks5h://` to make the proxy do the DNS lookups too.
 
+### Send the server's requests through your machine
+
+With `--remote`, the server sends the service requests, and they leave from the server's own
+connection. Add `--local-proxy` to send them through your machine's connection instead:
+
+```shell
+unshackle dl --remote --local-proxy EXAMPLE 81234567
+```
+
+A VPN app that covers your whole machine then also covers the server's requests, so the
+service sees your VPN's IP address. `--local-proxy` needs `--remote` (or a service with
+`remote: true`), and it works with no other proxy option: unshackle stops if you also give
+`--proxy`, `--no-proxy`, `--proxy-download` or `--no-proxy-download`. A proxy option from the `dl`
+config defaults does not count: `--local-proxy` turns it off for the run.
+
+A `--proxy` on `localhost` or a loopback address, such as the local port of a VPN app, stops a
+`--remote` run with `That proxy is on your machine, so --remote cannot use it`. Connect the VPN
+app for the whole machine, then use `--local-proxy` without `--proxy`.
+
+#### Test it first
+
+`unshackle tunnel-test` checks the route before a real run. Add `--server <name>` to test a
+server other than the default one:
+
+```shell
+unshackle tunnel-test
+```
+
+It does three steps, and it stops at the first one that fails:
+
+1. It looks up the IP address that your machine exits from.
+2. It opens a tunnel to the server.
+3. It makes the server look up its exit IP address through the tunnel. That address must be
+   the same as in step 1, or in the same country when one lookup used IPv4 and the other IPv6.
+   It fails when the lookup left from the server's own address. It also shows how long one
+   lookup takes.
+
+#### How the tunnel works
+
+1. The client opens a WebSocket on the server, on the same host and port as the other
+   remote session requests. Only a client opens a tunnel. The server never connects to
+   a host for a client, so a tunnel gives no access to the server's network.
+2. The server gives the service a SOCKS5 proxy on its loopback address, with a username and
+   password for that tunnel only. Another API key cannot use it.
+3. The server sends each connection that the service opens through the tunnel. The client
+   connects to the host and relays the bytes.
+
+The client logs `The server sends its requests through your connection on this machine`. You
+do not configure ports: the server picks a free one, and your
+machine opens none, because the client opens the connection to the server. A NAT router, a
+firewall, or a Cloudflare tunnel in front of the server does not stop it.
+
+The service traffic stays encrypted from the server to the service, so the client relays only
+encrypted bytes. The client refuses to connect to `localhost`, and to a host name or IP address
+that resolves only to a loopback, private or link-local address, so the server cannot reach
+your local network.
+
+!!! note "Each request crosses the tunnel twice"
+    A request from the server goes to your machine and then to the service, so it takes
+    longer than a request that the server sends directly. The segments do not go through the
+    tunnel: the client downloads them as before.
+
+A service that uses a server account does not work with `--local-proxy`, because the server
+logs in with its own account. If the tunnel drops, the client connects again, and a new request
+from the server waits up to 10 seconds for it. A request that was in progress when the tunnel
+dropped fails. The server closes a tunnel when its client has not connected for 60 seconds, and
+the client then stops with `The tunnel to the server closed`. An API key can have 4 tunnels
+open at once.
+
 ## Basic (static proxies)
 
 The `Basic` proxy provider is pure static configuration, with no accounts and no network
@@ -288,7 +358,8 @@ run. Give `profile` and `resolver` only to use a profile that you made yourself 
 [How unshackle chooses a profile](#how-unshackle-chooses-a-profile)).
 
 The returned proxy is HTTP on loopback,
-`http://127.0.0.1:{port}`. The locations themselves are read from Control D at startup
+`http://127.0.0.1:{port}`. The log shows the location and a masked resolver ID, for example
+`Using ControlD Proxy (YUL - Montreal): abcd***@dns.controld.com`. The locations themselves are read from Control D at startup
 (107 of them across 68 countries, at the time of writing), so there is nothing to list:
 
 | Query | Meaning |
@@ -391,11 +462,18 @@ it next needs them.
 
 ### Troubleshooting Control D
 
+When the forwarder cannot connect to a host, it answers `502 Bad Gateway` and gives the reason in brackets.
+Python-Requests shows it as `Tunnel connection failed: 502 Bad Gateway (<reason>)`. The forwarder also logs
+each reason once as a warning, `Could not reach <host>:<port>: <reason>`, because some HTTP clients do not
+show the reason.
+
 | Symptom | Cause and fix |
 |---|---|
 | `Proxy check failed`, because the exit IP is your own IP. | The profile does not redirect. Make sure that the plan includes traffic redirection (*Full Control*, not *Some Control*). After a region change, wait for the TTL of the previous answer to end. |
-| A `502 Bad Gateway` for one host. With `-d`, the log shows `Control D returned no A record for …`. | Control D gave no IPv4 address for that host. |
-| A `502 Bad Gateway` for one host only. With `-d`, the log shows `Refused …, an address that Control D cannot redirect`. | The request names the host by IP address. The forwarder refuses it. See the note on IPv4 above. |
+| `502 Bad Gateway (Control D returned no A record for …)` | Control D gave no IPv4 address for that host. |
+| `502 Bad Gateway (an IP address skips Control D's DNS …)` | The request names the host by IP address. The forwarder refuses it. See the note on IPv4 above. |
+| `502 Bad Gateway (Control D sent … to …, which did not answer: …)` | Control D gave an address for the host, but the connection to that address failed. This is usually a temporary fault on Control D's network. Try again, or use `--no-proxy-download` to download without the proxy. |
+| `502 Bad Gateway (Control D DNS timed out)`, `(Control D DNS could not be reached …)` or `(Control D DNS answered HTTP …)` | unshackle got no answer from Control D's DNS at `dns.controld.com`. Check the network connection of this machine. |
 | An HTTP `401` or `403` from `api.controld.com`. | The token is a *Read* token, or its *Allowed IPs* do not include this machine. Use a *Write* token. |
 | `Control D needs both a profile and a resolver` or `Control D needs max_profiles of 1 or more` at startup. | The `controld` config is not valid. Give `profile` and `resolver` together, and a `max_profiles` of 1 or more. Every run fails until you correct it, also a run that does not use Control D. |
 | `Could not read Control D's locations`. | unshackle could not get the location list. It tries again at the next Control D query. |

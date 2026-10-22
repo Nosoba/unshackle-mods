@@ -50,6 +50,7 @@ from unshackle.core.titles.music import SONG_FIELDS, Album, Song
 from unshackle.core.tracks import Audio, Chapter, Chapters, Subtitle, Tracks, Video
 from unshackle.core.tracks.attachment import Attachment
 from unshackle.core.tracks.track import Track
+from unshackle.core.tunnel import TunnelClient
 from unshackle.core.utils import run_proxy
 from unshackle.core.utils.collections import ci_get
 from unshackle.core.utils.redact import redact_path, redact_text, safe_display_url
@@ -104,6 +105,7 @@ class RemoteClient:
         self.auth_headers = list(auth_headers) if auth_headers else list(DEFAULT_AUTH_HEADERS)
         self._auth_header_index = 0
         self._session: Optional[requests.Session] = None
+        self.tunnel: Optional[TunnelClient] = None
         # wraps every request, so the service's CDM calls get answered while the server runs its code
         self.in_flight: Callable[[str], contextlib.AbstractContextManager[Any]] = lambda _: contextlib.nullcontext()
 
@@ -192,6 +194,12 @@ class RemoteClient:
             if optional:
                 log.debug(f"Optional endpoint {endpoint} unavailable [{error_code}]: {error_msg}")
                 return {}
+            if self.tunnel and self.tunnel.lost:
+                raise RemoteError(
+                    "The tunnel to the server closed, so the server can no longer send its requests through this "
+                    "machine. Run the command again.",
+                    "TUNNEL_CLOSED",
+                )
             raise RemoteError(f"Server error [{error_code}]: {error_msg}", error_code)
         return detail
 
@@ -920,6 +928,24 @@ def resolve_remote_proxy_arg(proxy_arg: str, providers: Optional[list] = None) -
         raise click.ClickException(str(e))
 
 
+def start_tunnel(client: RemoteClient) -> TunnelClient:
+    """Open a tunnel that sends the server's requests out through this machine's own connection."""
+    headers = {k: str(v) for k, v in client.session.headers.items() if k.lower() != "connection"}
+    tunnel = TunnelClient(client.server_url, headers)
+    try:
+        tunnel.start()
+    except ConnectionError as e:
+        raise click.ClickException(f"--local-proxy needs a tunnel to the server. {e}")
+    client.tunnel = tunnel
+    return tunnel
+
+
+def server_proxy_arg(params: Dict[str, Any]) -> str:
+    """The --proxy value to resolve for a server: the one typed when it resolved to a proxy on this machine."""
+    proxy = params["proxy"]
+    return (params.get("proxy_arg") or proxy) if is_loopback(proxy) else proxy
+
+
 _CACHE_HEX_ID_RE = re.compile(r"[0-9a-f]{32,}", re.IGNORECASE)
 
 
@@ -1158,10 +1184,17 @@ class RemoteService:
             data.update(self.client_login(profile))
         if params.get("no_proxy"):
             data["no_proxy"] = True
+        elif params.get("local_proxy"):
+            data["proxy"] = self.tunnel()
         elif params.get("proxy"):
-            data["proxy"] = resolve_remote_proxy_arg(params["proxy"], getattr(self.ctx.obj, "proxy_providers", None))
+            providers = getattr(self.ctx.obj, "proxy_providers", None)
+            data["proxy"] = resolve_remote_proxy_arg(server_proxy_arg(params), providers)
             self.require_reachable_proxy(data["proxy"])
-        response = self.client.post("/api/search", data)
+        try:
+            response = self.client.post("/api/search", data)
+        finally:
+            if self.client.tunnel:  # a search is one request, so its tunnel ends with it
+                self.client.tunnel.stop()
         self.save_returned_cache(response.get("cache") or {}, profile)
         for result in response.get("results") or []:
             yield SearchResult(
@@ -1182,7 +1215,22 @@ class RemoteService:
     def require_reachable_proxy(self, proxy: Optional[str]) -> None:
         """Refuse a proxy on this machine when the server is elsewhere: the server cannot reach it."""
         if proxy and is_loopback(proxy) and not is_loopback(self.client.server_url):
-            raise click.ClickException("That proxy is on your machine, so --remote cannot use it.")
+            raise click.ClickException(
+                "That proxy is on your machine, so --remote cannot use it. "
+                "To send the server's requests through this machine's connection, use --local-proxy without --proxy."
+            )
+
+    def tunnel(self) -> str:
+        """The ``tunnel:<id>`` proxy to send the server for ``--local-proxy``, opening the tunnel the first time."""
+        if self._server_accounts is not None:
+            raise click.ClickException(
+                f"The server logs in to {self.service_tag} with its own account, so --local-proxy does not work with it."
+            )
+        tunnel = self.client.tunnel
+        if tunnel is None:
+            tunnel = start_tunnel(self.client)
+            self.log.info("The server sends its requests through your connection on this machine")
+        return f"tunnel:{tunnel.id}"
 
     def authenticate(self, cookies: Optional[CookieJar] = None, credential: Optional[Credential] = None) -> None:
         self.credential = credential
@@ -1212,7 +1260,10 @@ class RemoteService:
                 pass
 
         providers = getattr(self.ctx.obj, "proxy_providers", None)
-        if not no_proxy and not proxy and self._server_accounts and not self._server_accounts.get("global"):
+        local = bool(self.ctx.parent and self.ctx.parent.params.get("local_proxy"))
+        if local:
+            create_data["proxy"] = self.tunnel()
+        elif not no_proxy and not proxy and self._server_accounts and not self._server_accounts.get("global"):
             regions = [str(r).lower() for r in self._server_accounts.get("regions") or []]
             if regions and client_region and client_region not in regions:
                 try:
@@ -1226,7 +1277,7 @@ class RemoteService:
                         "rejects the remote session"
                     )
         elif not no_proxy and proxy:
-            resolved_proxy = resolve_remote_proxy_arg(proxy, providers)
+            resolved_proxy = resolve_remote_proxy_arg(server_proxy_arg(self.ctx.parent.params), providers)
             if resolved_proxy:
                 create_data["proxy"] = resolved_proxy
                 query = (self.ctx.parent.params.get("proxy_query") if self.ctx.parent else None) or proxy
@@ -1234,7 +1285,7 @@ class RemoteService:
                 if country:
                     create_data["proxy_region"] = country.group(1).lower()
         self.require_reachable_proxy(create_data.get("proxy"))
-        local_proxy = None if no_proxy else (proxy or create_data.get("proxy"))
+        local_proxy = None if no_proxy or local else (proxy or create_data.get("proxy"))
         if local_proxy:
             self._session.proxies["all"] = local_proxy
             run_proxy.pin(self._session)
@@ -1327,7 +1378,12 @@ class RemoteService:
             "argv": argv,
         }
 
-        result = self.client.post("/api/session/create", create_data)
+        try:
+            result = self.client.post("/api/session/create", create_data)
+        except BaseException:
+            if local and self.client.tunnel:  # no session, so close() never runs: free the tunnel now
+                self.client.tunnel.stop()
+            raise
         self._session_id = result["session_id"]
         atexit.register(self.close)
         # an older server omits the field, and the tracks response settles it
@@ -1968,6 +2024,8 @@ class RemoteService:
                 pass
             except Exception as e:
                 self.log.warning(f"Failed to clean up remote session: {e}")
+        if self.client.tunnel:
+            self.client.tunnel.stop()
 
     def save_returned_cache(self, cache_data: Dict[str, str], profile: Optional[str] = None) -> None:
         """Save cache files returned by the server to the local cache directory.
@@ -1977,12 +2035,13 @@ class RemoteService:
         can forward them back, skipping interactive auth. The same filter that
         :meth:`load_cache_files` applies drops a file that belongs to another
         credential or profile, so it cannot overwrite that profile's local file.
+        The client also refuses a file that names a type other than a datetime.
         """
         if not cache_data:
             return
 
         from unshackle.core.api.compression import safe_inflate
-        from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key
+        from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key, safe_cache_payload
 
         if len(cache_data) > MAX_SESSION_CACHE_KEYS:
             self.log.warning(f"Ignoring {len(cache_data)} cache files from server: more than {MAX_SESSION_CACHE_KEYS}")
@@ -2003,6 +2062,11 @@ class RemoteService:
                 continue
             try:
                 decompressed = safe_inflate(base64.b64decode(content))
+                if not safe_cache_payload(decompressed.decode("utf-8")):
+                    self.log.warning(
+                        f"Rejecting cache file '{safe_name}' from the server: it holds a type a peer may not send"
+                    )
+                    continue
                 # Not with_suffix: that would turn the key "keys.v2" into "keys.json".
                 target = cache_dir / f"{safe_name}.json"
                 target.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import html
 import logging
 import math
@@ -33,6 +34,7 @@ from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
 from unshackle.core.session import MAX_BACKOFF, RnetSession, utf8_text
+from unshackle.core.temp import restore_segments, stash_segments
 from unshackle.core.tracks import resume
 from unshackle.core.utilities import get_boxes, log_event, try_ensure_utf8
 from unshackle.core.utils import run_proxy
@@ -799,11 +801,23 @@ class Track:
                 if keep_segments:
                     if save_dir.exists():
                         for partial in save_dir.rglob("*.!dev"):
+                            partial.with_name(partial.name.removesuffix(".!dev")).unlink(missing_ok=True)
                             partial.unlink(missing_ok=True)
                 else:
                     if save_dir.exists():
                         shutil.rmtree(save_dir)
                     resume.clear_sidecar(save_dir)
+
+        def abandon() -> None:
+            """Clean up a failed or cancelled download and stash its segments when resume is on.
+
+            The downloader does not wait for its workers on failure, so on Windows one can still hold a
+            .!dev file open (WinError 32). A cleanup error must not replace the download's own error.
+            """
+            with contextlib.suppress(OSError):
+                cleanup()
+            if keep_segments:
+                stash_segments(save_dir)
 
         if not DOWNLOAD_LICENCE_ONLY.is_set():
             if config.directories.temp.is_file():
@@ -813,6 +827,8 @@ class Track:
 
             # completed segments are reusable once the parser proves the segmentation
             # unchanged (resume sidecar); partial .!dev files never survive a run boundary
+            if keep_segments:
+                restore_segments(save_dir)
             cleanup()
 
         try:
@@ -962,15 +978,12 @@ class Track:
                     progress(downloaded="[red]FAILED")
                     raise
         except DownloadCancelled:
-            try:
-                cleanup()
-            except OSError:
-                pass
+            abandon()
             progress(downloaded="[yellow]SKIPPED")
             return
         except (Exception, KeyboardInterrupt):
             if not DOWNLOAD_LICENCE_ONLY.is_set():
-                cleanup()
+                abandon()
             raise
 
         if DOWNLOAD_CANCELLED.is_set():

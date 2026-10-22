@@ -65,10 +65,12 @@ from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.providers.tvdb import SEASON_TYPES, parse_int
 from unshackle.core.proxies.resolve import (
     REGION,
+    describe_explicit_proxy,
     describe_proxy,
     is_loopback,
     load_proxy_providers,
     pick_proxy,
+    require_alone_local_proxy,
     resolve_proxy,
     split_proxy_query,
 )
@@ -1278,6 +1280,12 @@ class dl:
         help="Proxy URI to use. If a 2-letter country is provided, it will try to get a proxy from the config.",
     )
     @click.option(
+        "--local-proxy",
+        is_flag=True,
+        default=False,
+        help="With --remote, the server sends its service requests out through this machine's own connection (and any VPN on it). Works with no other proxy option.",
+    )
+    @click.option(
         "--tag",
         type=str,
         default=None,
@@ -1961,6 +1969,10 @@ class dl:
                 if cdm_info:
                     log_event("load_cdm", level="INFO", service=self.service, context={"cdm": cdm_info})
 
+        if ctx.params.get("local_proxy"):
+            require_alone_local_proxy(ctx)
+            proxy, no_proxy = ctx.params.get("proxy"), bool(ctx.params.get("no_proxy"))
+
         # A server on this machine can reach a local proxy, so only a server elsewhere is guarded
         self.remote_needs_public_proxy = self.is_remote and not is_loopback(server_url(ctx.params.get("server")))
 
@@ -1976,6 +1988,7 @@ class dl:
                 with console.status("Loading Proxy Providers...", spinner="dots"):
                     self.proxy_providers = load_proxy_providers()
 
+            ctx.params["proxy_arg"] = proxy
             if proxy and proxy.startswith("controld://"):
                 proxy = ctx.params["proxy"] = resolve_proxy(proxy, [])
             if proxy:
@@ -2006,12 +2019,9 @@ class dl:
                     ctx.params["proxy_query"] = proxy_query
                     ctx.params["proxy_provider"] = requested_provider
                 else:
-                    self.log.info(f"Using explicit Proxy: {mask_proxy(ctx.params['proxy'])}")
+                    self.log.info(describe_explicit_proxy(ctx.params["proxy"]))
                     ctx.params["proxy_query"] = None
                     ctx.params["proxy_provider"] = None
-
-            if self.remote_needs_public_proxy and ctx.params.get("proxy") and is_loopback(ctx.params["proxy"]):
-                raise click.UsageError("That proxy is on your machine, so --remote cannot use it.")
 
         ctx.obj = ContextData(
             config=self.service_config,
@@ -6073,11 +6083,18 @@ class dl:
     @staticmethod
     def load_cookie_file(cookie_file: Path) -> MozillaCookieJar:
         """Load a Netscape cookie file with every expiry blanked, so no layer drops an expired cookie."""
-        cookie_jar = MozillaCookieJar(cookie_file)
-        cookie_data = html.unescape(cookie_file.read_text("utf-8-sig")).splitlines(keepends=False)
+        cookie_jar = dl.parse_cookie_text(cookie_file.read_text("utf-8-sig"), str(cookie_file))
+        cookie_jar.filename = str(cookie_file)
+        return cookie_jar
+
+    @staticmethod
+    def parse_cookie_text(text: str, source: str) -> MozillaCookieJar:
+        """Parse Netscape cookie text the way :meth:`load_cookie_file` does; ``source`` names it in errors."""
+        cookie_jar = MozillaCookieJar()
+        cookie_data = html.unescape(text).splitlines(keepends=False)
         head = next((line.lstrip() for line in cookie_data if line.strip()), "")
         if head[:1] in ("[", "{"):
-            raise ValueError(f"{cookie_file} is a JSON export; export it again in Netscape format")
+            raise ValueError(f"{source} is a JSON export; export it again in Netscape format")
         for i, line in enumerate(cookie_data):
             body = line.lstrip()
             prefix = "#HttpOnly_" if body.startswith("#HttpOnly_") else ""
@@ -6088,14 +6105,14 @@ class dl:
             if len(line_data) == 6:
                 line_data.append("")
             if len(line_data) != 7:
-                raise ValueError(f"{cookie_file} line {i + 1} is not a Netscape cookie row: {line!r}")
+                raise ValueError(f"{source} line {i + 1} is not a Netscape cookie row: {line!r}")
             line_data[4] = ""
             line_data[1] = str(line_data[0].startswith(".")).upper()
             cookie_data[i] = prefix + "\t".join(line_data)
         cookie_data.insert(0, "# Netscape HTTP Cookie File")
-        cookie_jar._really_load(StringIO("\n".join(cookie_data)), str(cookie_file), True, True)  # type: ignore[attr-defined]
+        cookie_jar._really_load(StringIO("\n".join(cookie_data)), source, True, True)  # type: ignore[attr-defined]
         if not len(cookie_jar):
-            raise ValueError(f"{cookie_file} holds no cookies; export it again in Netscape format")
+            raise ValueError(f"{source} holds no cookies; export it again in Netscape format")
         return cookie_jar
 
     @staticmethod

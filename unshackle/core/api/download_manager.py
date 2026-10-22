@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from unshackle.core.api.events import bus, publish_service_event
 from unshackle.core.api.sanitize import sanitize_log
-from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, VIDEO_CODEC_LIST
+from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, QUALITY_LIST, VIDEO_CODEC_LIST
 from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_path, redact_text
 
 log = logging.getLogger("download_manager")
@@ -351,6 +352,11 @@ def normalize_sub_format(sub_format_raw: str) -> Any:
     return mapped[0] if mapped else None
 
 
+def client_sent_keys(params: Dict[str, Any]) -> set[str]:
+    """Pop the server's ``client_keys`` stamp; a job without one counts every parameter as client-sent."""
+    return set(params.pop("client_keys", params))
+
+
 def perform_download(
     job_id: str,
     service: str,
@@ -400,6 +406,8 @@ def perform_download(
         if params.pop(banned, None) is not None:
             log.warning(f"Ignoring '{banned}' in API download parameters; post-scripts are config-only")
 
+    client_keys = client_sent_keys(params)
+
     vcodec_raw = params.get("vcodec")
     if vcodec_raw:
         params["vcodec"] = VIDEO_CODEC_LIST.convert(vcodec_raw)
@@ -408,6 +416,8 @@ def perform_download(
 
     if params.get("acodec"):
         params["acodec"] = AUDIO_CODEC_LIST.convert(params["acodec"])
+
+    params["quality"] = QUALITY_LIST.convert(params["quality"]) if params.get("quality") else []
 
     range_raw = params.get("range")
     if range_raw:
@@ -484,6 +494,7 @@ def perform_download(
         "proxy_download": params.get("proxy_download"),
         "profile": params.get("profile"),
         "cdm_name": params.get("cdm"),
+        "cdm_only": params.get("cdm_only"),
         "all_drm": params.get("all_drm", False),
         "repack": params.get("repack", False),
         "tag": params.get("tag"),
@@ -524,7 +535,7 @@ def perform_download(
     for param_name in ctx.params:
         source_key = "range" if param_name == "range_" else param_name
         ctx.set_parameter_source(
-            param_name, ParameterSource.COMMANDLINE if source_key in params else ParameterSource.DEFAULT
+            param_name, ParameterSource.COMMANDLINE if source_key in client_keys else ParameterSource.DEFAULT
         )
 
     dl_instance = dl(
@@ -744,6 +755,9 @@ class DownloadQueueManager:
 
     def create_job(self, service: str, title_id: str, owner_key: Optional[str] = None, **parameters) -> DownloadJob:
         """Make a new download job and add it to the queue."""
+        from unshackle.core.api.session_store import refuse_while_draining
+
+        refuse_while_draining()
         job_id = str(uuid.uuid4())
         job = DownloadJob(
             job_id=job_id,
@@ -1064,6 +1078,15 @@ class DownloadQueueManager:
             log.error(f"Download failed for job {job.job_id}: {e}")
             raise
 
+    def worker_speed_limit(self) -> Optional[float]:
+        """Return one job worker's share of the locked global speed limit, or None when unset."""
+        requests_downloader = importlib.import_module("unshackle.core.downloaders.requests")
+
+        limiter = requests_downloader.speed_limiter
+        if not (requests_downloader.speed_limit_locked and limiter):
+            return None
+        return limiter.rate / max(1, self.max_concurrent_downloads)
+
     async def run_download_async(self, job: DownloadJob) -> List[str]:
         """Invoke a job worker subprocess to do the download."""
 
@@ -1072,6 +1095,7 @@ class DownloadQueueManager:
             "service": job.service,
             "title_id": job.title_id,
             "parameters": job.parameters,
+            "speed_limit": self.worker_speed_limit(),
         }
 
         payload_fd, payload_path = tempfile.mkstemp(prefix=f"unshackle_job_{job.job_id}_", suffix="_payload.json")

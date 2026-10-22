@@ -22,6 +22,8 @@ from unshackle.core.api.handlers import (
     clear_finished_download_jobs_handler,
     clear_temp_handler,
     dashboard_cdm_logs_handler,
+    dashboard_drain_start_handler,
+    dashboard_drain_stop_handler,
     dashboard_events_handler,
     dashboard_health_handler,
     dashboard_jobs_handler,
@@ -66,9 +68,15 @@ from unshackle.core.api.handlers import (
     session_segments_handler,
     session_titles_handler,
     session_tracks_handler,
+    tunnel_check_handler,
+    tunnel_handler,
 )
+from unshackle.core.api.sanitize import sanitize_log
 from unshackle.core.drm import cbcs
 from unshackle.core.services import Services
+from unshackle.core.tunnel import CHECK_ROUTE as TUNNEL_CHECK_ROUTE
+from unshackle.core.tunnel import ROUTE as TUNNEL_ROUTE
+from unshackle.core.tunnel import close_tunnels
 from unshackle.core.update_checker import UpdateChecker
 from unshackle.core.utils.redact import redact_path
 
@@ -86,6 +94,24 @@ async def cors_middleware(
 
     response.headers.update(CORS_HEADERS)
 
+    return response
+
+
+@web.middleware
+async def no_5xx_middleware(
+    request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]
+) -> web.StreamResponse:
+    """Answer an uncaught exception or any unsent 5xx (a CDM subapplication's own) as a 422; see errors.py."""
+    try:
+        response = await handler(request)
+    except Exception as e:
+        if isinstance(e, web.HTTPException) and e.status < 500:
+            raise
+        # the exception text can hold a caller's key, so the answer gets a generic message
+        log.exception(f"Unhandled error in {sanitize_log(request.path)}")
+        response = build_error_response(APIError(APIErrorCode.INTERNAL_ERROR, "Internal server error"))
+    if response.status >= 500 and not response.prepared:
+        response.set_status(APIError.default_http_status(APIErrorCode.INTERNAL_ERROR))
     return response
 
 
@@ -147,6 +173,7 @@ def heartbeat(handler: Handler) -> Handler:
             log.exception(f"Error in {request.path}")
             result = handle_api_exception(e, debug_mode=debug_mode)
         response["late_status"] = result.status
+        response["error"] = result.get("error")
         body = result.body if isinstance(result, web.Response) else None
         await response.write(bytes(body) if isinstance(body, (bytes, bytearray)) else b"{}")
         await response.write_eof()
@@ -285,7 +312,7 @@ async def services(request: web.Request) -> web.Response:
                         type: string
                         nullable: true
                         description: Full service documentation
-      '500':
+      '422':
         description: Server error
         content:
           application/json:
@@ -484,7 +511,7 @@ async def search(request: web.Request) -> web.Response:
                 description: Profile to use for credentials and cookies (default - None)
               proxy:
                 type: string
-                description: Full proxy URI, a Control D resolver as controld://<resolver>@dns.controld.com, or a country code when the API key has server_proxy (default - None)
+                description: Full proxy URI, a Control D resolver as controld://<resolver>@dns.controld.com, or a country code when the API key has server_proxy, or tunnel:<id> for a tunnel the same API key opened on /api/tunnel (default - None)
               no_proxy:
                 type: boolean
                 description: Force disable all proxy use (default - false)
@@ -692,7 +719,7 @@ async def list_titles(request: web.Request) -> web.Response:
                 timestamp:
                   type: string
                   format: date-time
-      '500':
+      '422':
         description: Server error
         content:
           application/json:
@@ -1223,7 +1250,7 @@ async def download_jobs(request: web.Request) -> web.Response:
                         type: number
       '400':
         description: Invalid query parameters
-      '500':
+      '422':
         description: Server error
     """
     # Extract query parameters
@@ -1255,7 +1282,7 @@ async def download_job_detail(request: web.Request) -> web.Response:
         description: Download job details
       '404':
         description: Job not found
-      '500':
+      '422':
         description: Server error
     """
     job_id = request.match_info["job_id"]
@@ -1295,7 +1322,7 @@ async def download_job_events(request: web.Request) -> web.StreamResponse:
               type: string
       '404':
         description: Job not found
-      '500':
+      '422':
         description: Server error
     """
     job_id = request.match_info["job_id"]
@@ -1324,7 +1351,7 @@ async def cancel_download_job(request: web.Request) -> web.Response:
         description: The server cannot cancel the job
       '404':
         description: Job not found
-      '500':
+      '422':
         description: Server error
     """
     job_id = request.match_info["job_id"]
@@ -1349,7 +1376,7 @@ async def clear_finished_download_jobs(request: web.Request) -> web.Response:
                 removed:
                   type: integer
                   description: Number of jobs removed
-      '500':
+      '422':
         description: Server error
     """
     return await clear_finished_download_jobs_handler(request)
@@ -1386,7 +1413,7 @@ async def retry_download_job(request: web.Request) -> web.Response:
         description: Job not found
       '409':
         description: Job is not in a terminal state
-      '500':
+      '422':
         description: Server error
     """
     job_id = request.match_info["job_id"]
@@ -1423,7 +1450,7 @@ async def prioritize_download_job(request: web.Request) -> web.Response:
         description: Job not found
       '409':
         description: Job is not queued
-      '500':
+      '422':
         description: Server error
     """
     job_id = request.match_info["job_id"]
@@ -1511,7 +1538,7 @@ async def profiles(request: web.Request) -> web.Response:
                     type: array
                     items:
                       type: string
-      '500':
+      '422':
         description: Server error
     """
     return await profiles_handler(request)
@@ -1579,7 +1606,7 @@ async def server_config(request: web.Request) -> web.Response:
                       items:
                         type: string
                       description: Available service tags (allowlist-filtered)
-      '500':
+      '422':
         description: Server error
     """
     return await server_config_handler(request)
@@ -1650,7 +1677,7 @@ async def download_history(request: web.Request) -> web.Response:
                   type: integer
       '400':
         description: Invalid query parameters
-      '500':
+      '422':
         description: Server error
     """
     query_params = {"limit": request.query.get("limit"), "service": request.query.get("service")}
@@ -1675,7 +1702,7 @@ async def delete_history(request: web.Request) -> web.Response:
         description: History entry removed
       '404':
         description: History entry not found
-      '500':
+      '422':
         description: Server error
     """
     return await delete_history_handler(request.match_info["job_id"], request)
@@ -1700,7 +1727,7 @@ async def maintenance_clear_cache(request: web.Request) -> web.Response:
                   type: boolean
                 freed_bytes:
                   type: integer
-      '500':
+      '422':
         description: Server error
     """
     return await clear_cache_handler(request)
@@ -1725,7 +1752,7 @@ async def maintenance_clear_temp(request: web.Request) -> web.Response:
                   type: boolean
                 freed_bytes:
                   type: integer
-      '500':
+      '422':
         description: Server error
     """
     return await clear_temp_handler(request)
@@ -1777,7 +1804,7 @@ async def maintenance_refresh_services(request: web.Request) -> web.Response:
                         description: Services whose new code failed to import
                         items:
                           type: string
-      '500':
+      '422':
         description: Server error
     """
     return await refresh_services_handler(request)
@@ -1812,7 +1839,7 @@ async def env_check(request: web.Request) -> web.Response:
                         nullable: true
                       required:
                         type: boolean
-      '500':
+      '422':
         description: Server error
     """
     return await env_check_handler(request)
@@ -1847,6 +1874,7 @@ async def session_create(request: web.Request) -> web.Response:
                 type: string
               proxy:
                 type: string
+                description: As on /api/search, including tunnel:<id> for a --local-proxy client
               no_proxy:
                 type: boolean
               profile:
@@ -1994,6 +2022,57 @@ async def session_create(request: web.Request) -> web.Response:
         return handle_api_exception(
             e, context={"operation": "session_create"}, debug_mode=request.app.get("debug_api", False)
         )
+
+
+@api_handler
+async def tunnel(request: web.Request) -> web.StreamResponse:
+    """
+    Open a --local-proxy tunnel.
+    ---
+    summary: Open tunnel
+    description: >-
+      A WebSocket that a --remote client holds open. The server sends the requests of a remote session
+      created with proxy tunnel:<id> through it, and the client makes them from its own connection.
+      The first message is {"id": <tunnel id>}.
+    parameters:
+      - name: id
+        in: query
+        required: false
+        description: Reattach to this tunnel after a drop
+        schema:
+          type: string
+    responses:
+      '101':
+        description: WebSocket open
+      '404':
+        description: No open tunnel with this id for this API key
+      '429':
+        description: The API key has the maximum number of tunnels open
+    """
+    return await tunnel_handler(request)
+
+
+@api_handler
+async def tunnel_check(request: web.Request) -> web.Response:
+    """
+    Look up the exit IP through a tunnel.
+    ---
+    summary: Check tunnel
+    parameters:
+      - name: id
+        in: query
+        required: true
+        schema:
+          type: string
+    responses:
+      '200':
+        description: The exit IP and country through the tunnel, and the lookup time in ms
+      '404':
+        description: No open tunnel with this id for this API key
+      '424':
+        description: No IP lookup got through the tunnel, or the requests left from the server itself
+    """
+    return await tunnel_check_handler(request)
 
 
 @api_handler
@@ -2581,8 +2660,8 @@ async def dashboard_status(request: web.Request) -> web.Response:
     ---
     summary: Dashboard server status
     description: >
-      Version, uptime, bind address, mode, request counters per API key, and counts of
-      services, remote sessions and jobs. Every /api/dashboard/ route needs
+      Version, uptime, bind address, mode, request counters per API key, error counts by
+      service and error code, and counts of services, remote sessions and jobs. Every /api/dashboard/ route needs
       `serve.dashboard.key` in X-Secret-Key; a user key never passes, and the routes do not
       exist without a dashboard key.
     tags: [Dashboard]
@@ -2593,6 +2672,44 @@ async def dashboard_status(request: web.Request) -> web.Response:
         description: Dashboard key missing or invalid
     """
     return await dashboard_status_handler(request)
+
+
+@api_handler
+async def dashboard_drain_start(request: web.Request) -> web.Response:
+    """
+    Dashboard: start a drain before a restart.
+    ---
+    summary: Dashboard drain start
+    description: >
+      Refuses every new remote session, download job and job retry with `SERVER_DRAINING` (409)
+      until the server restarts or the operator cancels the drain. Open remote sessions continue, and
+      each one gets a warning in its service log. Poll `/api/dashboard/status` until `sessions`
+      and the active jobs reach 0, then restart. A second call changes nothing.
+    tags: [Dashboard]
+    responses:
+      '200':
+        description: The status body, with `draining` true
+      '401':
+        description: Dashboard key missing or invalid
+    """
+    return await dashboard_drain_start_handler(request)
+
+
+@api_handler
+async def dashboard_drain_stop(request: web.Request) -> web.Response:
+    """
+    Dashboard: cancel a drain.
+    ---
+    summary: Dashboard drain cancel
+    description: The server accepts new remote sessions and download jobs again.
+    tags: [Dashboard]
+    responses:
+      '200':
+        description: The status body, with `draining` false
+      '401':
+        description: Dashboard key missing or invalid
+    """
+    return await dashboard_drain_stop_handler(request)
 
 
 @api_handler
@@ -3259,6 +3376,8 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("GET", "/api/remote/logins", remote_logins, False),
     ("POST", "/api/remote/logins/{login_id}/input", remote_login_input, False),
     ("POST", "/api/session/create", session_create, True),
+    ("GET", TUNNEL_ROUTE, tunnel, True),
+    ("GET", TUNNEL_CHECK_ROUTE, tunnel_check, True),
     ("GET", "/api/session/{session_id}/titles", session_titles, True),
     ("POST", "/api/session/{session_id}/tracks", session_tracks, True),
     ("POST", "/api/session/{session_id}/segments", session_segments, True),
@@ -3275,6 +3394,8 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
 
 DASHBOARD_ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("GET", DASHBOARD_PREFIX + "status", dashboard_status, True),
+    ("POST", DASHBOARD_PREFIX + "drain", dashboard_drain_start, True),
+    ("DELETE", DASHBOARD_PREFIX + "drain", dashboard_drain_stop, True),
     ("GET", DASHBOARD_PREFIX + "sessions", dashboard_sessions, True),
     ("GET", DASHBOARD_PREFIX + "jobs", dashboard_jobs, True),
     ("GET", DASHBOARD_PREFIX + "logs", dashboard_logs, True),
@@ -3303,6 +3424,7 @@ def setup_routes(
         if remote_only and not remote:
             continue
         add[method](path, handler)
+    app.on_shutdown.append(close_tunnels)
 
 
 def setup_swagger(app: web.Application, dashboard: bool = False) -> None:

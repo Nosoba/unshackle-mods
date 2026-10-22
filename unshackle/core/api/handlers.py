@@ -3,9 +3,7 @@ import base64
 import enum
 import json
 import logging
-import os
 import re
-import tempfile
 import threading
 import time
 import uuid
@@ -15,7 +13,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date as date_
 from functools import partial
-from http.cookiejar import CookieJar, MozillaCookieJar
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, cast
 
@@ -25,7 +23,7 @@ from aiohttp import web
 from unshackle.core.api.compression import safe_inflate
 from unshackle.core.api.errors import APIError, APIErrorCode, categorize_exception, handle_api_exception
 from unshackle.core.api.input_bridge import AuthStatus, InputBridge, StatelessInputBridge
-from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key, sanitize_log
+from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key, safe_cache_payload, sanitize_log
 from unshackle.core.api.session_log import SessionLogBuffer, SessionLogMirror, capture_service_logs
 from unshackle.core.api.session_store import SessionStore
 from unshackle.core.cacher import Cacher
@@ -40,8 +38,9 @@ from unshackle.core.session import utf8_text
 from unshackle.core.titles import Episode, Movie, Song, Title_T
 from unshackle.core.titles.music import SONG_FIELDS
 from unshackle.core.tracks import Audio, Subtitle, Tracks, Video
+from unshackle.core.tunnel import HEARTBEAT, MAX_MESSAGE, MAX_TUNNELS, TUNNELS, Tunnel, tunnel_proxy
 from unshackle.core.utilities import declared_kwargs, kind_only_conflict, original_tag
-from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, SUBTITLE_CODEC, VIDEO_CODEC_LIST
+from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, QUALITY_LIST, SUBTITLE_CODEC, VIDEO_CODEC_LIST
 from unshackle.core.utils.collections import ci_get
 from unshackle.core.utils.hdr10plus import probed_tracks
 from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_all, redact_secrets, redact_text
@@ -322,9 +321,9 @@ def write_client_cache(cache_data: Any, cache_tag: str) -> None:
     """Write a client-sent ``cache`` map into the cache directory ``cache_tag``.
 
     Each cache key is a file path relative to that directory, and each value is the file as
-    base64 of zlib-compressed bytes. The function skips an unsafe key or a file it cannot write,
-    and raises INVALID_INPUT for a map that is not an object, has too many entries, or holds a
-    value that is not a string.
+    base64 of zlib-compressed bytes. The function skips an unsafe key, a file that names a type
+    other than a datetime, or a file it cannot write, and raises INVALID_INPUT for a map that is
+    not an object, has too many entries, or holds a value that is not a string.
     """
     if not isinstance(cache_data, dict) or len(cache_data) > MAX_SESSION_CACHE_KEYS:
         raise APIError(APIErrorCode.INVALID_INPUT, f"cache must hold at most {MAX_SESSION_CACHE_KEYS} entries")
@@ -338,6 +337,9 @@ def write_client_cache(cache_data: Any, cache_tag: str) -> None:
         if not isinstance(content, str):
             raise APIError(APIErrorCode.INVALID_INPUT, "cache values must be base64 strings")
         decompressed = safe_inflate(base64.b64decode(content)).decode("utf-8")
+        if not safe_cache_payload(decompressed):
+            log.warning(f"Rejecting session cache file {sanitize_log(key)}: it holds a type a peer may not send")
+            continue
         target = cache_dir / f"{safe_name}.json"
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1150,24 +1152,18 @@ def server_account_cookies(service: str, profile: Optional[str]) -> Any:
 def load_client_cookies(cookie_text: Any) -> Optional[CookieJar]:
     """Read the cookie jar a client sent with its request, or None when it sent none.
 
-    The client sends a Netscape cookie file compressed and base64 encoded, and
-    ``MozillaCookieJar`` reads from a path only, so the text goes through a temp file.
+    The client sends a Netscape cookie file compressed and base64 encoded. It is parsed
+    the way local ``dl`` parses a cookie file, so a file that works locally also works
+    over ``--remote``.
     """
+    from unshackle.commands.dl import dl
+
     if not cookie_text or not isinstance(cookie_text, str):
         return None
 
     try:
-        cookie_str = safe_inflate(base64.b64decode(cookie_text)).decode("utf-8")
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(cookie_str)
-            tmp_path = f.name
-        try:
-            jar = MozillaCookieJar(tmp_path)
-            jar.load(ignore_discard=True, ignore_expires=True)
-            return jar
-        finally:
-            with suppress(OSError):
-                os.unlink(tmp_path)
+        cookie_str = safe_inflate(base64.b64decode(cookie_text)).decode("utf-8-sig")
+        return dl.parse_cookie_text(cookie_str, "client cookies")
     except (ValueError, zlib.error, OSError) as e:
         raise APIError(APIErrorCode.INVALID_INPUT, f"cookies is not a compressed Netscape cookie file: {e}")
 
@@ -2232,13 +2228,20 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
         if not isinstance(data["abitrate"], int) or data["abitrate"] <= 0:
             return "abitrate must be a positive integer"
 
-    if "vbitrate_range" in data and data["vbitrate_range"] is not None:
-        if not isinstance(data["vbitrate_range"], str) or "-" not in data["vbitrate_range"]:
-            return "vbitrate_range must be a string in 'MIN-MAX' format (e.g., '6000-7000')"
+    for prefix, example in (("v", "6000-7000"), ("a", "128-256")):
+        value = data.get(f"{prefix}bitrate_range")
+        if value and data.get(f"{prefix}bitrate") is not None:
+            return f"Cannot use both {prefix}bitrate and {prefix}bitrate_range"
+        if value is not None and (not isinstance(value, str) or not re.fullmatch(r"\s*\d+\s*-\s*\d+\s*", value)):
+            return f"{prefix}bitrate_range must be a string in 'MIN-MAX' format (e.g., '{example}')"
 
-    if "abitrate_range" in data and data["abitrate_range"] is not None:
-        if not isinstance(data["abitrate_range"], str) or "-" not in data["abitrate_range"]:
-            return "abitrate_range must be a string in 'MIN-MAX' format (e.g., '128-256')"
+    if data.get("quality") is not None:
+        try:
+            heights = QUALITY_LIST.convert(data["quality"])
+        except click.BadParameter as e:
+            return f"Invalid quality: {e.message}"
+        if any(height <= 0 for height in heights):
+            return "quality heights must be above 0"
 
     if "channels" in data and data["channels"] is not None:
         if not isinstance(data["channels"], (int, float)) or data["channels"] <= 0:
@@ -2391,6 +2394,12 @@ def enforce_download_gates(params: Dict[str, Any], request: Optional[web.Request
     if params.get("proxy_download") is not None and not isinstance(params["proxy_download"], str):
         raise APIError(APIErrorCode.INVALID_INPUT, "proxy_download must be a string.")
 
+    if any(str(params.get(key) or "").startswith("tunnel:") for key in ("proxy", "proxy_download")):
+        raise APIError(
+            APIErrorCode.INVALID_PROXY,
+            "A download job cannot use a tunnel: proxy, because a tunnel belongs to one --remote client run.",
+        )
+
     if not server_proxy_allowed(request):
         resolve_handler_proxy(params, params.get("service") or "", request)
         if params.get("proxy_download"):
@@ -2418,6 +2427,24 @@ def enforce_download_gates(params: Dict[str, Any], request: Optional[web.Request
                 APIErrorCode.FORBIDDEN,
                 "Per-request credentials are not permitted for API downloads.",
             )
+
+
+def service_dl_defaults(service: str) -> Dict[str, Any]:
+    """The ``services.<TAG>.dl`` values that name an API download parameter, keyed as the API names them."""
+    from unshackle.commands.dl import DL_OPTION_ALIASES
+    from unshackle.core.services import ROUTING_PARAMS
+
+    api_names = {click_name: api_name for api_name, click_name in DL_OPTION_ALIASES.items()}
+    result: Dict[str, Any] = {}
+    for key, value in ((ci_get(config.services, service) or {}).get("dl") or {}).items():
+        key = api_names.get(key, key)
+        if value is None or key in ROUTING_PARAMS:
+            continue
+        if key not in DEFAULT_DOWNLOAD_PARAMS:
+            log.debug("Ignoring services.%s.dl key %r: not an API download parameter", service, key)
+            continue
+        result[key] = value
+    return result
 
 
 async def download_handler(data: Dict[str, Any], request: Optional[web.Request] = None) -> web.Response:
@@ -2464,10 +2491,13 @@ async def download_handler(data: Dict[str, Any], request: Optional[web.Request] 
         serve_overrides = {
             k: v for k, v in (config.serve or {}).items() if k in DEFAULT_DOWNLOAD_PARAMS and v is not None
         }
+        # A relayed job gets no local service overrides, so none of its keys may count as defaults.
+        service_dl = {} if server else service_dl_defaults(normalized_service)
         params_with_defaults = {
             **DEFAULT_DOWNLOAD_PARAMS,
             **serve_overrides,
             **service_specific_defaults,
+            **service_dl,
             **filtered_params,
         }
         await asyncio.to_thread(enforce_download_gates, {**params_with_defaults, "service": service_tag}, request)
@@ -2477,6 +2507,7 @@ async def download_handler(data: Dict[str, Any], request: Optional[web.Request] 
         # The download worker reads this to decide whether dl may load the server's proxy
         # providers. Always stamped server-side so a client-sent value cannot grant it.
         params_with_defaults["server_proxy"] = server_proxy_allowed(request)
+        params_with_defaults["client_keys"] = sorted(params_with_defaults if server else filtered_params)
         job = manager.create_job(normalized_service, title_id, owner_key=caller_key(request), **params_with_defaults)
 
         return web.json_response(
@@ -2702,8 +2733,25 @@ async def dashboard_status_handler(request: web.Request) -> web.Response:
             "max_sessions": store.max_sessions,
             "session_ttl": store.ttl,
             "jobs": dict(jobs),
+            "draining": store.draining,
         }
     )
+
+
+async def dashboard_drain_start_handler(request: web.Request) -> web.Response:
+    """Start a drain before a restart; answer with the status body."""
+    from unshackle.core.api.session_store import get_session_store
+
+    get_session_store().start_drain()
+    return await dashboard_status_handler(request)
+
+
+async def dashboard_drain_stop_handler(request: web.Request) -> web.Response:
+    """Cancel the drain; answer with the status body."""
+    from unshackle.core.api.session_store import get_session_store
+
+    get_session_store().stop_drain()
+    return await dashboard_status_handler(request)
 
 
 async def dashboard_sessions_handler(request: web.Request) -> web.Response:
@@ -3843,8 +3891,9 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
     remote session on the server with the authenticated service instance, fetches all
     titles and tracks, and returns everything the client needs for track selection.
     """
-    from unshackle.core.api.session_store import get_session_store
+    from unshackle.core.api.session_store import get_session_store, refuse_while_draining
 
+    refuse_while_draining()
     service_tag = data.get("service")
     title_id = data.get("title_id")
     profile = client_profile(data)
@@ -3920,7 +3969,7 @@ async def session_create_handler(data: Dict[str, Any], request: Optional[web.Req
 
         cache_data = data.get("cache", {})
         if cache_data and session_cache_tag:
-            write_client_cache(cache_data, session_cache_tag)
+            await asyncio.to_thread(write_client_cache, cache_data, session_cache_tag)
 
         service_instance._input_bridge = bridge
 
@@ -4520,7 +4569,7 @@ def resolve_handler_proxy(
 
     if (
         proxy_param
-        and re.match(r"^(https?://|socks|controld://)", str(proxy_param))
+        and re.match(r"^(https?://|socks|controld://|tunnel:)", str(proxy_param))
         and server_account_for(request, normalized_service)
     ):
         raise APIError(
@@ -4528,6 +4577,17 @@ def resolve_handler_proxy(
             "A server-account service does not accept a client proxy URI. Pass a country code or nothing.",
             details={"service": normalized_service},
         )
+
+    if isinstance(proxy_param, str) and proxy_param.startswith("tunnel:") and not no_proxy:
+        proxy_param = tunnel_proxy(
+            proxy_param.removeprefix("tunnel:"), request_secret_key(request) if request else None
+        )
+        if not proxy_param:
+            raise APIError(
+                APIErrorCode.INVALID_PROXY,
+                "The tunnel for this proxy is not open. Run the command again.",
+                details={"service": normalized_service},
+            )
 
     if allowed and not no_proxy:
         proxy_providers = initialize_proxy_providers()
@@ -5116,7 +5176,7 @@ def handle_proxy_license(
         )
 
     # A service raises when the upstream licence server rejects the challenge.
-    # Surface it as a structured licence error, not an uncaught 500 the edge turns into a 502.
+    # Surface it as a structured licence error, not an uncaught 500.
     try:
         if drm_type == "widevine" and certificate:
             license_blob = service.get_widevine_service_certificate(
@@ -5630,3 +5690,48 @@ async def session_delete_handler(session_id: str, request: Optional[web.Request]
     if cache_data:
         response["cache"] = cache_data
     return web.json_response(response)
+
+
+async def tunnel_handler(request: web.Request) -> web.StreamResponse:
+    """Open a ``--local-proxy`` tunnel, or reattach to the caller's tunnel named by ``?id=``."""
+    owner = request_secret_key(request)
+    tunnel_id = request.query.get("id")
+    tunnel = TUNNELS.get(tunnel_id) if tunnel_id else None
+    if tunnel_id and (not tunnel or tunnel.owner != owner):
+        raise APIError(APIErrorCode.NOT_FOUND, "No open tunnel has this id.")
+    if not tunnel and sum(t.owner == owner for t in TUNNELS.values()) >= MAX_TUNNELS:
+        raise APIError(APIErrorCode.RATE_LIMITED, f"An API key can have {MAX_TUNNELS} tunnels open at once.")
+    ws = web.WebSocketResponse(heartbeat=HEARTBEAT, max_msg_size=MAX_MESSAGE)
+    await ws.prepare(request)  # a request that is not a WebSocket upgrade fails here, before a tunnel exists
+    if not tunnel:
+        tunnel = Tunnel(owner)
+        await tunnel.start()
+    await tunnel.serve(ws)
+    return ws
+
+
+async def tunnel_check_handler(request: web.Request) -> web.Response:
+    """Look up the exit IP through the caller's tunnel ``?id=``, so the client can confirm the route before a real run."""
+    import requests
+
+    from unshackle.core.utils.ip_info import verify_proxy_exit
+
+    proxy = tunnel_proxy(request.query.get("id", ""), request_secret_key(request))
+    if not proxy:
+        raise APIError(APIErrorCode.NOT_FOUND, "No open tunnel has this id.")
+    with requests.Session() as session:
+        session.proxies = {"all": proxy}
+        session.trust_env = False
+        started = time.perf_counter()
+        try:
+            info = await asyncio.to_thread(verify_proxy_exit, session)
+        except ConnectionError as e:
+            raise APIError(APIErrorCode.INVALID_PROXY, str(e), http_status=424)
+    if not info:
+        raise APIError(
+            APIErrorCode.INVALID_PROXY,
+            "The server could not look up an IP address through the tunnel.",
+            http_status=424,
+        )
+    ms = round((time.perf_counter() - started) * 1000)
+    return web.json_response({"ip": info.get("ip"), "country": info.get("country"), "ms": ms})
