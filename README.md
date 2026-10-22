@@ -16,7 +16,18 @@
 
 ---
 
-A modular archival tool for movies, TV, and music. Fork of [Devine](https://github.com/devine-dl/devine/) with DASH/HLS/ISM parsing, Widevine & PlayReady DRM, and a REST API.
+A fork of [unshackle](https://github.com/unshackle-dl/unshackle) (originally based on [Devine](https://github.com/devine-dl/devine/)). The upstream project provides modular movie, TV, and music archival, DASH/HLS/ISM parsing, Widevine and PlayReady support, and a REST API.
+
+## What this fork adds
+
+- **TELASA support:** playback selection prefers FHD and can fall back from DASH to HLS.
+- **More precise episode selection:** fractional seasons and episodes, plus separately playable episode parts.
+- **Optional Japanese title replacements:** add `source|replacement` entries to your user config's `config_romaji.txt` to customize title names.
+- **External subtitles:** include a local subtitle file or supported URL with the CLI's `--dl-sub` option. This option is not available through the REST API.
+- **Output improvements:** shorter service source tags in filenames, improved track duration and muxed metadata, and export filenames.
+- **API and download diagnostics:** stateless list/search requests fail clearly when a service requires interactive authentication; download errors retain their underlying HTTP cause.
+
+See the [CLI reference](docs/guide/cli-reference.md) and [output and naming guide](docs/guide/output-and-naming.md) for more options.
 
 <p align="center">
   <a href="https://asciinema.org/a/ldMiqYFFTgPAOxW7">
@@ -29,8 +40,8 @@ A modular archival tool for movies, TV, and music. Fork of [Devine](https://gith
 The recommended way is a git clone with the install script. The script installs `uv` and unshackle, then runs `unshackle setup` to download the external tools and write a first config.
 
 ```shell
-git clone https://github.com/unshackle-dl/unshackle.git
-cd unshackle
+git clone https://github.com/Nosoba/unshackle-mods.git
+cd unshackle-mods
 sh install.sh                 # Windows: .\install.bat
 uv run unshackle env check
 ```
@@ -38,7 +49,7 @@ uv run unshackle env check
 In a clone, run every command as `uv run unshackle ...`.
 
 > [!NOTE]
-> Advanced: `uv tool install git+https://github.com/unshackle-dl/unshackle.git` installs unshackle into the tool folder of `uv`, not a folder that you choose. `unshackle setup` then puts the tools, config, and data in your user data and config directories. See [Installation](https://docs.unshackle.dev/getting-started/installation/) for details.
+> Advanced: `uv tool install git+https://github.com/Nosoba/unshackle-mods.git` installs unshackle into the tool folder of `uv`, not a folder that you choose. `unshackle setup` then puts the tools, config, and data in your user data and config directories. See [Installation](https://docs.unshackle.dev/getting-started/installation/) for details.
 
 ### Requirements
 
