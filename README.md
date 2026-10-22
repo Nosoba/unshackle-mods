@@ -20,7 +20,6 @@ A fork of [unshackle](https://github.com/unshackle-dl/unshackle) (originally bas
 
 ## What this fork adds
 
-- **TELASA support:** playback selection prefers FHD and can fall back from DASH to HLS.
 - **More precise episode selection:** fractional seasons and episodes, plus separately playable episode parts.
 - **Optional Japanese title replacements:** add `source|replacement` entries to your user config's `config_romaji.txt` to customize title names.
 - **External subtitles:** include a local subtitle file or supported URL with the CLI's `--dl-sub` option. This option is not available through the REST API.
