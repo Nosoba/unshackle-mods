@@ -32,6 +32,14 @@ def test_gradient_text_applies_endpoint_colours() -> None:
     assert last_span.style.color.triplet == Color.parse("#0000ff").triplet
 
 
+def test_gradient_text_resets_explicit_colours_for_each_line() -> None:
+    text = gradient_text("AB\nAB", colors=("#ff0000", "#0000ff"))
+
+    assert text.plain == "AB\nAB"
+    assert next(span for span in text.spans if span.start == 3).style.color.triplet == Color.parse("#ff0000").triplet
+    assert next(span for span in text.spans if span.start == 4).style.color.triplet == Color.parse("#0000ff").triplet
+
+
 def test_gradient_text_preserves_whitespace_without_colour_stop() -> None:
     text = gradient_text("A B", colors=("#ff0000", "#0000ff"))
 
