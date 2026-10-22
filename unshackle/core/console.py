@@ -2,6 +2,7 @@ import codecs
 import io
 import logging
 import math
+import random
 import shutil
 import sys
 import unicodedata
@@ -465,41 +466,41 @@ def gradient_text(
 ) -> Text:
     """Create truecolor gradient text using the active CLI palette.
 
-    Newlines and whitespace do not advance the colour stops, keeping multiline
-    banners visually aligned. Rich automatically down-samples the colours for
-    terminals without truecolor support.
+    Each line gets its own colour stops and interpolation. Without explicit
+    colours, stops are sampled from the active theme. Rich down-samples colours
+    for terminals without truecolor support.
     """
-    palette = (
-        (primary_scheme["pink"], primary_scheme["cyan"], primary_scheme["blue"])
-        if colors is None
-        else tuple(colors)
-    )
-    if not palette:
+    palette = tuple(colors) if colors is not None else ()
+    if colors is not None and not palette:
         raise ValueError("At least one gradient color is required")
     base_style = Style.parse(style) if isinstance(style, str) else (style or Style())
     if len(palette) == 1:
         return Text(text, style=base_style + Style(color=palette[0]))
 
-    stops = []
-    for color in palette:
-        triplet = Color.parse(color).triplet
-        if triplet is None:
-            raise ValueError(f"Gradient color has no RGB value: {color!r}")
-        stops.append(triplet)
-
-    visible = sum(not char.isspace() for char in text)
     result = Text()
-    position = 0
-    for char in text:
-        if char.isspace():
-            result.append(char, base_style)
-            continue
-        progress = position / max(visible - 1, 1)
-        scaled = progress * (len(stops) - 1)
-        index = min(int(scaled), len(stops) - 2)
-        color = Color.from_triplet(blend_rgb(stops[index], stops[index + 1], scaled - index))
-        result.append(char, base_style + Style(color=color))
-        position += 1
+    for line in text.splitlines(keepends=True):
+        line_colors = palette or random.sample(
+            [primary_scheme[key] for key in ("pink", "red", "yellow", "green", "cyan", "blue")], 3
+        )
+        stops = []
+        for color in line_colors:
+            triplet = Color.parse(color).triplet
+            if triplet is None:
+                raise ValueError(f"Gradient color has no RGB value: {color!r}")
+            stops.append(triplet)
+
+        visible = sum(not char.isspace() for char in line)
+        position = 0
+        for char in line:
+            if char.isspace():
+                result.append(char, base_style)
+                continue
+            progress = position / max(visible - 1, 1)
+            scaled = progress * (len(stops) - 1)
+            index = min(int(scaled), len(stops) - 2)
+            color = Color.from_triplet(blend_rgb(stops[index], stops[index + 1], scaled - index))
+            result.append(char, base_style + Style(color=color))
+            position += 1
     return result
 
 

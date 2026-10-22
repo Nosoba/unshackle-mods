@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from io import StringIO
+from unittest.mock import patch
 
 import pytest
 
@@ -31,12 +32,36 @@ def test_gradient_text_applies_endpoint_colours() -> None:
     assert last_span.style.color.triplet == Color.parse("#0000ff").triplet
 
 
+def test_gradient_text_resets_explicit_colours_for_each_line() -> None:
+    text = gradient_text("AB\nAB", colors=("#ff0000", "#0000ff"))
+
+    assert text.plain == "AB\nAB"
+    assert next(span for span in text.spans if span.start == 3).style.color.triplet == Color.parse("#ff0000").triplet
+    assert next(span for span in text.spans if span.start == 4).style.color.triplet == Color.parse("#0000ff").triplet
+
+
 def test_gradient_text_preserves_whitespace_without_colour_stop() -> None:
     text = gradient_text("A B", colors=("#ff0000", "#0000ff"))
 
     assert text.plain == "A B"
     # Rich only emits spans for styled characters; the space stays unstyled.
     assert not any(span.start <= 1 < span.end for span in text.spans)
+
+
+def test_gradient_text_randomizes_each_line_with_active_palette() -> None:
+    from unshackle.core.console import primary_scheme
+
+    with patch("unshackle.core.console.random.sample", side_effect=[
+        [primary_scheme["pink"], primary_scheme["cyan"], primary_scheme["blue"]],
+        [primary_scheme["green"], primary_scheme["yellow"], primary_scheme["red"]],
+    ]) as sample:
+        text = gradient_text("ABC\nABC")
+
+    assert sample.call_count == 2
+    assert text.plain == "ABC\nABC"
+    assert text.spans[0].style.color.triplet == Color.parse(primary_scheme["pink"]).triplet
+    assert next(span for span in text.spans if span.start == 4).style.color.triplet == Color.parse(primary_scheme["green"]).triplet
+    assert not any(span.start <= 3 < span.end for span in text.spans)
 
 
 def test_gradient_text_renders_on_standard_colour_terminal() -> None:
