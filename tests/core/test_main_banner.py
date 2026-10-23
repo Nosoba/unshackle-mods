@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import io
 import sys
+from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 from unshackle.core import __version__
 from unshackle.core.__main__ import main, print_banner
+from unshackle.core.commands import Commands
 from unshackle.core.config import config
 from unshackle.core.console import force_utf8_streams
 
@@ -23,6 +25,13 @@ def test_help_prints_the_banner_once(monkeypatch: pytest.MonkeyPatch, args: list
     assert result.exit_code == 0, result.output
     assert result.output.count(f"v {__version__}") == 1
     assert "Usage:" in result.output
+
+
+def test_entrypoint_keeps_literal_search_wildcards() -> None:
+    with patch.object(Commands, "main") as run:
+        main.main()
+
+    assert run.call_args.kwargs["windows_expand_args"] is False
 
 
 def test_banner_prints_to_a_legacy_code_page_stream(monkeypatch: pytest.MonkeyPatch) -> None:

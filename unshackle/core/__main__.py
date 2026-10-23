@@ -2,6 +2,7 @@ import atexit
 import logging
 import sys
 from datetime import datetime
+from typing import Any
 
 import click
 import urllib3
@@ -49,6 +50,10 @@ def print_banner() -> None:
 
 class Main(Commands):
     """The top-level group. Its help shows the banner, because its callback does not run for --help."""
+
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("windows_expand_args", False)
+        return super().main(*args, **kwargs)
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
         print_banner()
