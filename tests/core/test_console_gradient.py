@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from io import StringIO
+from unittest.mock import patch
 
 import pytest
 
@@ -37,6 +38,38 @@ def test_gradient_text_preserves_whitespace_without_colour_stop() -> None:
     assert text.plain == "A B"
     # Rich only emits spans for styled characters; the space stays unstyled.
     assert not any(span.start <= 1 < span.end for span in text.spans)
+
+
+def test_upstream_theme_disables_random_gradient(monkeypatch: pytest.MonkeyPatch) -> None:
+    import unshackle.core.console as console_module
+    from unshackle.core.themes import DEFAULT_THEME, resolve_palette
+
+    assert DEFAULT_THEME == "mods"
+    assert resolve_palette("mods") == resolve_palette("catppuccin-mocha")
+    monkeypatch.setattr(console_module, "mods_theme", False)
+    with patch("unshackle.core.console.random.sample", side_effect=AssertionError("unexpected gradient")):
+        assert gradient_text("Plain theme").plain == "Plain theme"
+        transformed = console_module.ComfyLogRenderer(show_time=False, show_path=False)
+        output = StringIO()
+        terminal = ComfyConsole(file=output, force_terminal=True)
+        terminal.print(transformed(terminal, ("Plain log",)))
+        assert "Plain log" in _plain(output.getvalue())
+
+
+def test_gradient_text_randomizes_each_line_with_active_palette() -> None:
+    from unshackle.core.console import primary_scheme
+
+    with patch("unshackle.core.console.random.sample", side_effect=[
+        [primary_scheme["pink"], primary_scheme["cyan"], primary_scheme["blue"]],
+        [primary_scheme["green"], primary_scheme["yellow"], primary_scheme["red"]],
+    ]) as sample:
+        text = gradient_text("ABC\nABC")
+
+    assert sample.call_count == 2
+    assert text.plain == "ABC\nABC"
+    assert text.spans[0].style.color.triplet == Color.parse(primary_scheme["pink"]).triplet
+    assert next(span for span in text.spans if span.start == 4).style.color.triplet == Color.parse(primary_scheme["green"]).triplet
+    assert not any(span.start <= 3 < span.end for span in text.spans)
 
 
 def test_gradient_text_renders_on_standard_colour_terminal() -> None:

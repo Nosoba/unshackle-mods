@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from rich_click import RichHelpConfiguration
 
-DEFAULT_THEME = "catppuccin-mocha"
+DEFAULT_THEME = "mods"
 
 PALETTES: dict[str, dict[str, str]] = {
     # Colors based on "CatppuccinMocha" from Gogh themes
@@ -169,10 +169,13 @@ PALETTES: dict[str, dict[str, str]] = {
     },
 }
 
+# Preserve the fork's original Catppuccin colours as a selectable theme.
+PALETTES["mods"] = dict(PALETTES["catppuccin-mocha"])
+
 ALIASES = {
     "default": DEFAULT_THEME,
-    "catppuccin": DEFAULT_THEME,
-    "mocha": DEFAULT_THEME,
+    "catppuccin": "catppuccin-mocha",
+    "mocha": "catppuccin-mocha",
     "onedark": "one-dark",
     "tokyonight": "tokyo-night",
     "solarized": "solarized-dark",

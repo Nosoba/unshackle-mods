@@ -72,7 +72,10 @@ class ComfyLogRenderer(LogRender):
         if self.show_level:
             row.append(level)
 
-        row.append(Renderables(tuple(_gradient_log_message(r) for r in renderables)))
+        row.append(
+            Renderables(tuple(_gradient_log_message(r) for r in renderables))
+            if mods_theme else Renderables(renderables)
+        )
         if self.show_path and path:
             path_text = Text()
             path_text.append(path, style=f"link file://{link_path}" if link_path else "")
@@ -327,8 +330,9 @@ class ComfyConsole(Console):
                 live.start()
 
 
-primary_scheme: dict[str, str] = resolve_palette(config.theme) or {}
-if not primary_scheme:
+primary_scheme = resolve_palette(config.theme)
+mods_theme = primary_scheme is None or str(config.theme).strip().lower() in ("default", "mods")
+if primary_scheme is None:
     logging.getLogger("console").warning(
         "Unknown theme %r, falling back to %s (available: %s)",
         config.theme,
@@ -490,6 +494,8 @@ def gradient_text(
         if colors is None
         else tuple(colors)
     )
+    if colors is None and not mods_theme:
+        return Text(text, style=style or "text")
     if not palette:
         raise ValueError("At least one gradient color is required")
     base_style = Style.parse(style) if isinstance(style, str) else (style or Style())
