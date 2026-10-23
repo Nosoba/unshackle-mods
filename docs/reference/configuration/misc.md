@@ -145,7 +145,7 @@ calls.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `theme` | str | `catppuccin-mocha` | Named colour theme for all CLI output: banner, logs, progress bars, and help screens. One of `catppuccin-mocha` (aliases `default`, `catppuccin`, `mocha`), `dracula`, `nord`, `gruvbox`, `one-dark` (alias `onedark`), `tokyo-night` (alias `tokyonight`), `monokai`, `flexoki`, `solarized-dark` (alias `solarized`). Case-insensitive; underscores work in place of hyphens. Unknown names fall back to the default with a warning. Preview them all with `unshackle env theme`. |
+| `theme` | str | `mods` | Named colour theme for CLI output. `mods` (also `default`) keeps this fork's Catppuccin colours with a random gradient per line in the banner, log messages, and track labels. Other themes use their solid palette colours: `catppuccin-mocha` (aliases `catppuccin`, `mocha`), `dracula`, `nord`, `gruvbox`, `one-dark` (alias `onedark`), `tokyo-night` (alias `tokyonight`), `monokai`, `flexoki`, `solarized-dark` (alias `solarized`). Case-insensitive; underscores work in place of hyphens. Unknown names fall back to the default with a warning. Preview them all with `unshackle env theme`. |
 
 ---
 

@@ -257,12 +257,13 @@ def theme() -> None:
 
     from unshackle.core.themes import ALIASES, DEFAULT_THEME, PALETTES, resolve_palette
 
-    active = resolve_palette(config.theme) or PALETTES[DEFAULT_THEME]
+    key = str(config.theme or "").strip().lower().replace("_", "-")
+    active_name = ALIASES.get(key, key) if resolve_palette(config.theme) else DEFAULT_THEME
     for name, palette in PALETTES.items():
         text, text2, gray, guide = palette["text"], palette["text2"], palette["gray"], palette["bright_black"]
 
         header = Text(name, style=palette["pink"])
-        if palette == active:
+        if name == active_name:
             header.append("  (active)", style=palette["green"])
         aliases = sorted(alias for alias, target in ALIASES.items() if target == name)
         if aliases:

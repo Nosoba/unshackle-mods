@@ -48,6 +48,22 @@ def test_gradient_text_preserves_whitespace_without_colour_stop() -> None:
     assert not any(span.start <= 1 < span.end for span in text.spans)
 
 
+def test_upstream_theme_disables_random_gradient(monkeypatch: pytest.MonkeyPatch) -> None:
+    import unshackle.core.console as console_module
+    from unshackle.core.themes import DEFAULT_THEME, resolve_palette
+
+    assert DEFAULT_THEME == "mods"
+    assert resolve_palette("mods") == resolve_palette("catppuccin-mocha")
+    monkeypatch.setattr(console_module, "mods_theme", False)
+    with patch("unshackle.core.console.random.sample", side_effect=AssertionError("unexpected gradient")):
+        assert gradient_text("Plain theme").plain == "Plain theme"
+        transformed = console_module.ComfyLogRenderer(show_time=False, show_path=False)
+        output = StringIO()
+        terminal = ComfyConsole(file=output, force_terminal=True)
+        terminal.print(transformed(terminal, ("Plain log",)))
+        assert "Plain log" in _plain(output.getvalue())
+
+
 def test_gradient_text_randomizes_each_line_with_active_palette() -> None:
     from unshackle.core.console import primary_scheme
 

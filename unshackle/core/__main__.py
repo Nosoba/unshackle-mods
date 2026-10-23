@@ -8,12 +8,13 @@ import urllib3
 from rich import traceback
 from rich.console import Group
 from rich.padding import Padding
+from rich.text import Text
 from urllib3.exceptions import InsecureRequestWarning
 
 from unshackle.core import __code_hash__, __version__
 from unshackle.core.commands import Commands
 from unshackle.core.config import config
-from unshackle.core.console import ComfyRichHandler, console, gradient_text
+from unshackle.core.console import ComfyRichHandler, console, gradient_text, mods_theme
 from unshackle.core.constants import context_settings
 from unshackle.core.update_checker import UpdateChecker
 from unshackle.core.utilities import close_debug_logger, init_debug_logger
@@ -21,21 +22,22 @@ from unshackle.core.utilities import close_debug_logger, init_debug_logger
 
 def print_banner() -> None:
     """Print the ASCII banner with the version line."""
+    banner = gradient_text if mods_theme else Text
     console.print(
         Padding(
             Group(
-                gradient_text(
+                banner(
                     r"▄• ▄▌ ▐ ▄ .▄▄ ·  ▄ .▄ ▄▄▄·  ▄▄· ▄ •▄ ▄▄▌  ▄▄▄ ." + "\n"
                     r"█▪██▌•█▌▐█▐█ ▀. ██▪▐█▐█ ▀█ ▐█ ▌▪█▌▄▌▪██•  ▀▄.▀·" + "\n"
                     r"█▌▐█▌▐█▐▐▌▄▀▀▀█▄██▀▐█▄█▀▀█ ██ ▄▄▐▀▀▄·██▪  ▐▀▀▪▄" + "\n"
                     r"▐█▄█▌██▐█▌▐█▄▪▐███▌▐▀▐█ ▪▐▌▐███▌▐█.█▌▐█▌▐▌▐█▄▄▌" + "\n"
                     r" ▀▀▀ ▀▀ █▪ ▀▀▀▀ ▀▀▀ · ▀  ▀ ·▀▀▀ ·▀  ▀.▀▀▀  ▀▀▀ ",
-                    style="bold",
+                    style="bold" if mods_theme else "ascii.art",
                 ),
-                gradient_text(
+                banner(
                     f"v {__version__}{f' ({__code_hash__})' if __code_hash__ else ''}"
                     f" - © 2025-{datetime.now().year} github.com/unshackle-dl/unshackle",
-                    style="bold",
+                    style="bold" if mods_theme else "text",
                 ),
             ),
             (1, 11, 1, 10),
