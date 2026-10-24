@@ -34,7 +34,7 @@ from unshackle.core.drm import cbcs
 from unshackle.core.providers.anilist import parse_anilist_ref
 from unshackle.core.proxies.resolve import initialize_proxy_providers, resolve_proxy
 from unshackle.core.services import Services
-from unshackle.core.session import utf8_text
+from unshackle.core.session import RnetSession, utf8_text
 from unshackle.core.titles import Episode, Movie, Song, Title_T
 from unshackle.core.titles.music import SONG_FIELDS
 from unshackle.core.tracks import Audio, Subtitle, Tracks, Video
@@ -275,8 +275,7 @@ def instantiate_service(
             for k in cli_param_names & transport_keys & set(data):
                 if k not in ("service", "title_id", "proxy", "no_proxy") and data.get(k) is not None:
                     log.warning(
-                        f"Ignoring flat '{sanitize_log(k)}' as a service option (it names a transport field); "
-                        "update the client to send service options under 'service_params'"
+                        f"Ignoring flat '{sanitize_log(k)}' as a service option, send it under 'service_params'"
                     )
     return parent_ctx.invoke(service_module.cli, title=title, **extras)
 
@@ -1059,8 +1058,7 @@ def choose_session_cdm(
     if data.get("cdm_type"):
         return False, cap
     raise capped_error(
-        f"The server CDM licenses {service} up to {cap}p for this API key. "
-        f"Set up a local CDM to license {wanted}p with your own device, or pass -q {cap}.",
+        f"The server CDM licenses {service} up to {cap}p for this API key, {wanted}p needs a local CDM",
         cap,
     )
 
@@ -1210,8 +1208,7 @@ def next_server_profile(service: str, region: Optional[str]) -> Optional[str]:
         regions = ", ".join(covered.get("regions") or []) or "none"
         raise APIError(
             APIErrorCode.INVALID_INPUT,
-            f"No server account for {service} in region '{region or 'unknown'}'. "
-            f"Its accounts cover: {regions}. Pass --proxy with one of those country codes.",
+            f"No server account for {service} in region '{region or 'unknown'}', accounts cover: {regions}",
             details={"service": service, "region": region, "regions": covered.get("regions") or []},
         )
     key = f"{service}:{','.join(p or '' for p in pool)}"
@@ -2169,7 +2166,7 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
     """
     for banned in ("postscript", "post_script", "post_scripts"):
         if data.get(banned):
-            return f"'{banned}' is not accepted over the API. Define post_scripts in unshackle.yaml."
+            return f"'{banned}' is not accepted over the API, only from unshackle.yaml"
 
     # The worker reads cookies/{service}/{profile}.txt, so a profile must not be able to name a path.
     try:
@@ -2276,10 +2273,7 @@ def validate_download_parameters(data: Dict[str, Any]) -> Optional[str]:
 
     supplied_ids = [name for name in ("tmdb_id", "imdb_id", "tvdb_id") if data.get(name)]
     if len(supplied_ids) > 1:
-        return (
-            f"Cannot use multiple external IDs: {', '.join(supplied_ids)}. "
-            "Give one ID and unshackle resolves the others from it."
-        )
+        return f"Cannot use multiple external IDs: {', '.join(supplied_ids)}; give one ID"
 
     exclusive_flags = []
     if data.get("video_only"):
@@ -2357,7 +2351,7 @@ def enforce_download_gates(params: Dict[str, Any], request: Optional[web.Request
     if not server_cdm_allowed(request, params.get("service")):
         raise APIError(
             APIErrorCode.FORBIDDEN,
-            "Download jobs license with the server CDM, which is not enabled for this key on this service.",
+            "Download jobs license with the server CDM, which is not enabled for this API key on this service",
         )
     cap = server_cdm_max_height(request, params.get("service"))
     if cap is not None:
@@ -2367,27 +2361,16 @@ def enforce_download_gates(params: Dict[str, Any], request: Optional[web.Request
             """The job's own value for this parameter, or the ``serve:`` dl default that the job falls back to."""
             return params[key] if key in params else serve_defaults.get(key)
 
+        capped = f"Download jobs license with the server CDM, up to {cap}p for this API key"
         wanted = requested_height(effective("quality"))
         if wanted is None or wanted > cap:
-            raise capped_error(
-                f"Download jobs license with the server CDM, which covers up to {cap}p for this API key. "
-                f"Pass a quality of {cap} or lower.",
-                cap,
-            )
+            raise capped_error(f"{capped}: pass a quality", cap)
         if effective("best_available"):
-            raise capped_error(
-                f"Download jobs license with the server CDM, which covers up to {cap}p for this API key. "
-                "Turn off best_available, because it can fall back to a track above that height.",
-                cap,
-            )
+            raise capped_error(f"{capped}: drop best_available", cap)
         ranges = effective("range") or []
         ranges = [ranges] if isinstance(ranges, str) else ranges
         if any(str(getattr(r, "value", r)).upper() == "HYBRID" for r in ranges):
-            raise capped_error(
-                f"Download jobs license with the server CDM, which covers up to {cap}p for this API key. "
-                "Remove HYBRID from range, because it always keeps the lowest DV track, whatever the quality.",
-                cap,
-            )
+            raise capped_error(f"{capped}: drop HYBRID", cap)
 
     if params.get("proxy_download") is not None and not isinstance(params["proxy_download"], str):
         raise APIError(APIErrorCode.INVALID_INPUT, "proxy_download must be a string.")
@@ -4085,8 +4068,8 @@ async def session_titles_handler(session_id: str, request: Optional[web.Request]
         )
 
 
-def client_session_auth(session: Any) -> tuple[Dict[str, str], Dict[str, str]]:
-    """The service session headers and cookies a remote client may receive.
+def client_session_auth(session: Any) -> tuple[Dict[str, str], list[Dict[str, Any]]]:
+    """The service session headers and cookies (name, value, domain, path, secure) a remote client may receive.
 
     A client whose own login succeeded gets them back. For a server account the cookie jar
     stays on the server and the server drops the auth-bearing headers, so the client cannot
@@ -4095,16 +4078,29 @@ def client_session_auth(session: Any) -> tuple[Dict[str, str], Dict[str, str]]:
     """
     svc_session = session.service_instance.session
     headers = dict(svc_session.headers) if hasattr(svc_session, "headers") and svc_session.headers else {}
-    cookies: Dict[str, str] = {}
-    if hasattr(svc_session, "cookies"):
-        for cookie in svc_session.cookies:
-            if hasattr(cookie, "name") and hasattr(cookie, "value"):
-                cookies[cookie.name] = cookie.value
+    cookies: list[Dict[str, Any]] = []
+    jar = svc_session.scoped_cookies() if isinstance(svc_session, RnetSession) else getattr(svc_session, "cookies", [])
+    for cookie in jar:
+        if hasattr(cookie, "name") and hasattr(cookie, "value"):
+            cookies.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": getattr(cookie, "domain", None) or "",
+                    "path": getattr(cookie, "path", None) or "/",
+                    "secure": bool(getattr(cookie, "secure", False)),
+                }
+            )
     if not client_owns_login(session):
         headers = {k: v for k, v in headers.items() if not CONFIG_SECRET_KEY_RE.search(str(k))}
     if not session.client_auth:
-        cookies = {}
+        cookies = []
     return headers, cookies
+
+
+def cookie_values(cookies: list[Dict[str, Any]]) -> Dict[str, str]:
+    """The ``{name: value}`` form of :func:`client_session_auth` cookies, for clients that predate the jar."""
+    return {c["name"]: c["value"] for c in cookies}
 
 
 def client_owns_login(session: Any) -> bool:
@@ -4249,7 +4245,8 @@ async def session_tracks_handler(
                 "manifests": manifests,
                 "track_manifests": track_manifests,
                 "session_headers": session_headers,
-                "session_cookies": session_cookies,
+                "session_cookies": cookie_values(session_cookies),
+                "session_cookie_jar": session_cookies,
                 "server_cdm": session.server_cdm,
                 "server_cdm_type": server_cdm_type,
                 "sample_decrypt_tracks": [
@@ -4286,6 +4283,7 @@ async def session_segments_handler(
 
     try:
         result: Dict[str, Any] = {}
+        headers, cookies = client_session_auth(session)
 
         for track_id in track_ids:
             track = session.tracks.get(track_id)
@@ -4302,9 +4300,10 @@ async def session_segments_handler(
                 "descriptor": descriptor_name,
                 "url": str(track.url) if track.url else None,
                 "drm": serialize_drm(track.drm) if hasattr(track, "drm") and track.drm else None,
+                "headers": headers,
+                "cookies": cookie_values(cookies),
+                "cookie_jar": cookies,
             }
-
-            track_info["headers"], track_info["cookies"] = client_session_auth(session)
 
             # Include manifest-specific data for segment resolution. Round-trip through
             # JSON so any non-serializable value becomes its str() (default=str).
@@ -4572,7 +4571,7 @@ def resolve_handler_proxy(
     ):
         raise APIError(
             APIErrorCode.FORBIDDEN,
-            "A server-account service does not accept a client proxy URI. Pass a country code or nothing.",
+            "A server-account service takes a country code or no proxy, not a proxy URI",
             details={"service": normalized_service},
         )
 
@@ -4602,8 +4601,7 @@ def resolve_handler_proxy(
                 )
             raise APIError(
                 APIErrorCode.INVALID_PROXY,
-                "This server does not resolve country codes into proxies. "
-                "Pass --proxy with a full proxy URI (http://, https:// or socks5://).",
+                "This server does not resolve country codes into proxies, pass a full proxy URI",
                 details={"service": normalized_service},
             )
 
@@ -4629,8 +4627,7 @@ def resolve_handler_proxy(
         if client_region.lower() in {x.lower() for x in geoblock}:
             raise APIError(
                 APIErrorCode.GEOFENCE,
-                f"Service is not available in your region ({client_region.upper()}). "
-                "Pass --proxy with a proxy outside the blocked regions.",
+                f"Service is not available in your region ({client_region.upper()})",
                 details={"service": normalized_service},
             )
 
@@ -4639,8 +4636,7 @@ def resolve_handler_proxy(
             if server_region and not in_client_region:
                 raise APIError(
                     APIErrorCode.INVALID_PROXY,
-                    "This server is in a different region from yours. Pass --proxy with a proxy "
-                    "in the region you want, or pass --no-proxy to use the server's own connection.",
+                    "This server is in a different region from yours, pass --proxy or --no-proxy",
                     details={"service": normalized_service},
                 )
         elif in_client_region:
@@ -4929,11 +4925,12 @@ CACHED_PAIRS: set[tuple[str, str, str]] = set()
 
 
 def cache_to_vaults(keys: Dict[str, str], service_name: str) -> None:
-    """Cache newly obtained keys to server vaults.
+    """Cache the content keys of a CDM licence to the server vaults.
 
     A PlayReady licence always runs, and a Widevine licence runs when one PSSH KID has no content
     key in a vault, so the same content keys come back on every request for a title. This process
-    does not send a pair again after every vault accepted it.
+    does not send a pair again after every vault accepted it. A pair a client reported as bad
+    leaves that set, and is unflagged when the CDM returns it.
     """
     from uuid import UUID
 
@@ -4946,6 +4943,8 @@ def cache_to_vaults(keys: Dict[str, str], service_name: str) -> None:
             return
 
         key_map = {UUID(hex=kid): key for kid, key in new.items()}
+        for kid in vaults.clear_licensed_flags(key_map):
+            log.info(f"Unflagged {kid.hex}:{key_map[kid]}, the CDM returned it")
         cached = vaults.add_keys(key_map)
         if cached == len([vault for vault in vaults.vaults if not vault.no_push]):
             CACHED_PAIRS.update((service_name, kid, key) for kid, key in new.items())
@@ -5068,7 +5067,7 @@ def handle_single_server_cdm(
             if sources is not None:
                 sources.update(vault_hit[1])
             return vault_hit[0]
-        raise refusal or APIError(APIErrorCode.NO_CONTENT, "The server vault holds no key for this track")
+        raise refusal or APIError(APIErrorCode.NO_CONTENT, "The server vault holds no content key for this track")
 
     api_key = request.headers.get("X-Secret-Key", "anonymous") if request else "anonymous"
     user_config = serve_user_config(api_key)
@@ -5348,7 +5347,7 @@ def license_response(
     ):
         raise APIError(
             APIErrorCode.FORBIDDEN,
-            "Server CDM licensing is not enabled for this key on this service. Use a local CDM (proxy mode).",
+            "Server CDM licensing is not enabled for this API key on this service",
         )
 
     if mode == "server_cdm" and track_ids:
@@ -5618,7 +5617,8 @@ async def session_bad_key_handler(
 
     The server never sees a segment, so the client is the only side that can test a content key.
     Only a pair this remote session served can be flagged, which keeps a client from
-    poisoning the bad-key table for content keys it never received.
+    poisoning the bad-key table for content keys it never received. A pair the CDM licensed is
+    not flagged, because the CDM is the authority.
     """
     from uuid import UUID
 
@@ -5631,8 +5631,12 @@ async def session_bad_key_handler(
     if not key or served_key.lower() != key:
         log.warning(f"Session {sanitize_log(session_id[:12])} reported a bad content key it was never served: {kid}")
         raise APIError(APIErrorCode.INVALID_INPUT, "This session was not served that KID:KEY pair")
+    if source == "cdm":
+        log.warning(f"Session {sanitize_log(session_id[:12])} reported a CDM key as bad, not flagged: {kid}")
+        return web.json_response({"flagged": False})
 
-    vaults = load_server_vaults(session.service_instance.__class__.__name__)
+    service_name = session.service_instance.__class__.__name__
+    vaults = load_server_vaults(service_name)
 
     def flag() -> None:
         for vault in vaults.vaults:
@@ -5645,6 +5649,7 @@ async def session_bad_key_handler(
 
     await asyncio.to_thread(flag)
     session.served_keys.pop(kid, None)
+    CACHED_PAIRS.discard((service_name, kid, served_key))
     log.warning(
         f"Client proved {kid}:{served_key} from vault {sanitize_log(source)} wrong, flagged in the server vaults"
     )

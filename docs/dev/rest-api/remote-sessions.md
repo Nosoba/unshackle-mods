@@ -214,8 +214,10 @@ hood the client walks a remote session through its lifecycle.
     downloading. A service can build an AdaptationSet of its own that the served
     manifest does not contain. Each such track gets a one-AdaptationSet MPD in
     `track_manifests`, and the client re-parses that instead. Any
-    `session_headers` / `session_cookies` the server used are merged into the
-    client's local HTTP session.
+    `session_headers` and cookies the server used are merged into the
+    client's local HTTP session. Each cookie in `session_cookie_jar` keeps its
+    domain, path and `secure` flag, so it goes only to its own hosts. `session_cookies` carries
+    the same cookies as names and values only, for older clients.
 
     The tracks response repeats the title. A service can rewrite title fields inside
     `get_tracks`, so the client takes this copy in place of the one from the title
@@ -301,9 +303,11 @@ There are two ways DRM keys get resolved, chosen by the client's `server_cdm` fl
       decodes, and a wrong pair goes back to `POST /api/session/{id}/keys/bad`. The
       server flags the pair in every local vault it holds, reports it to the vault
       that served it, and the next licence for that KID skips the pair and reaches
-      the CDM. A server with no local SQLite vault cannot store the flag. The
-      server accepts a report only for a pair it served to that remote session. The
-      client never learns the server vault names.
+      the CDM. When the CDM returns the same pair, the server removes the flag,
+      because then the client's check was wrong. A server with no local SQLite
+      vault cannot store the flag. The server accepts a report only for a pair it
+      served to that remote session, and does not flag a pair its CDM licensed.
+      The client never learns the server vault names.
     - A content key in the client's own vaults goes first, even when the server
       already answered. The client proves it, and a server key waits as the next
       candidate.
@@ -653,7 +657,7 @@ remote session API and a good template for any client.
 - **Flow.** `authenticate()` → `create` (+ poll `prompt` every 2s up to a 600s
   deadline, answering `pending_input` prompts. With stdin closed the client logs an
   error and raises `SystemExit(1)` instead of posting an empty answer) → `get_titles()` → `get_tracks()`
-  (merging returned `session_headers`/`session_cookies`, re-parsing `manifests`) →
+  (merging returned `session_headers`/`session_cookie_jar`, re-parsing `manifests`) →
   get the licence in proxy mode or `server_cdm` mode → `close()` (`DELETE`, saving any returned
   `cache`).
 - **Server resolution.** `resolve_server()` reads `config.remote_services.<name>`
@@ -664,7 +668,7 @@ remote session API and a good template for any client.
 
 ## Troubleshooting
 
-!!! example "\"Could not connect to remote server ... Is it running?\""
+!!! example "\"Could not connect to remote server at ...\""
     The client could not reach the URL. Make sure that `unshackle serve` operates on
     the server, the `url`/port in `remote_services` are correct (default port `8786`),
     and any firewall or reverse proxy allows the connection.

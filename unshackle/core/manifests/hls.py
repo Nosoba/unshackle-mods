@@ -36,7 +36,7 @@ from unshackle.core.drm import DRM_T, ClearKey, MonaLisa, PlayReady, Widevine
 from unshackle.core.drm.segment_decrypt import SegmentDecrypter, can_use
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
-from unshackle.core.manifests.dash import RollingMerge
+from unshackle.core.manifests.dash import RollingMerge, missing_language
 from unshackle.core.session import RnetResponse, RnetSession, utf8_text
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
 from unshackle.core.tracks.track import DRM_PREFERENCE_TYPES, assert_fragments_decrypted
@@ -311,12 +311,7 @@ class HLS:
                 None,
             )
             if not track_lang:
-                msg = "Language information could not be derived for a media."
-                if language is None:
-                    msg += " No fallback language was provided when calling HLS.to_tracks()."
-                elif not tag_is_valid((str(language) or "").strip()) or str(language).startswith("und"):
-                    msg += f" The fallback language provided is also invalid: {language}"
-                raise ValueError(msg)
+                raise missing_language("an HLS media", language)
 
             tracks.add(
                 track_type(
@@ -809,8 +804,8 @@ class HLS:
         hls_data = track.data.setdefault("hls", {})
         if hls_data.get("unwanted_segments") and not unwanted_segments:
             log.warning(
-                f"None of the {len(hls_data['unwanted_segments'])} segments that the export drops is in the "
-                f"playlist of {track.id}. The download keeps every segment."
+                f"None of the {len(hls_data['unwanted_segments'])} segments the export drops is in the "
+                f"playlist of {track.id}; the download keeps every segment"
             )
         hls_data["unwanted_segments"] = [s.absolute_uri for s in unwanted_segments]
 
@@ -1723,10 +1718,7 @@ class HLS:
                 **extra_params,
             )
         elif key.keyformat and key.keyformat.lower() in {f"urn:uuid:{PR_PSSH.SYSTEM_ID}", "com.microsoft.playready"}:
-            drm = PlayReady(
-                pssh=PR_PSSH(key.uri.split(",")[-1]),
-                pssh_b64=key.uri.split(",")[-1],
-            )
+            drm = PlayReady.from_pssh_b64(key.uri.split(",")[-1])
         else:
             raise NotImplementedError(f"The key system is not supported: {key}")
 
@@ -1782,9 +1774,7 @@ class HLS:
             except NotImplementedError:
                 unsupported_keys.append(key)
             except Widevine.Exceptions.KIDNotFound:
-                logging.getLogger("HLS").warning(
-                    "Skipped an EXT-X-SESSION-KEY entry that carries no Key ID. The media playlist must supply the key."
-                )
+                logging.getLogger("HLS").warning("Skipped an EXT-X-SESSION-KEY entry with no Key ID")
 
         if not drm_objects and unsupported_keys:
             logging.debug(

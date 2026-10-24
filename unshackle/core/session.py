@@ -6,6 +6,7 @@ import http
 import logging
 import math
 import random
+import re
 import sys
 import time
 from collections.abc import Iterator, MutableMapping
@@ -17,6 +18,7 @@ from urllib.parse import urlencode, urlparse, urlunparse
 
 import rnet
 from requests import HTTPError, Request, Response
+from requests.cookies import create_cookie
 from requests.structures import CaseInsensitiveDict
 
 from unshackle.core.config import config
@@ -50,11 +52,7 @@ def resolve_impersonate(browser: str) -> rnet.Impersonate:
     preset = getattr(rnet.Impersonate, browser, None)
     if preset is not None:
         return preset
-    raise ValueError(
-        f"Unknown impersonate preset: {browser!r}. "
-        f"Use exact rnet preset names like 'Chrome131', 'OkHttp4_12', 'Edge101'. "
-        f"See rnet.Impersonate for all available presets."
-    )
+    raise ValueError(f"Unknown impersonate preset {browser!r}, expected an rnet.Impersonate name such as 'Chrome131'")
 
 
 METHOD_MAP: dict[str, rnet.Method] = {
@@ -530,6 +528,34 @@ class MaxRetriesError(Exception):
         self.__cause__ = cause
 
 
+# the innermost io error text in rnet's wreq::Error debug form, e.g. "stream closed because of a broken pipe"
+RNET_ERROR_TEXT_RE = re.compile(r'error: "([^"]+)"')
+
+
+def failure_response(exc: BaseException) -> Any:
+    """The HTTP response of a status failure, or None.
+
+    RnetSession wraps a forcelist HTTPError in MaxRetriesError as ``__cause__``, so this unwraps one level.
+    """
+    response = getattr(exc, "response", None)
+    return response if response is not None else getattr(exc.__cause__, "response", None)
+
+
+def failure_reason(exc: BaseException) -> str:
+    """Name a request failure without its URL, which can carry signed tokens.
+
+    Gives the HTTP status of a status failure, else the exception class and, for an rnet error,
+    its innermost error text.
+    """
+    inner = exc.__cause__ or exc
+    response = failure_response(exc)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return f"{status} {getattr(response, 'reason', '') or ''}".strip()
+    texts = RNET_ERROR_TEXT_RE.findall(str(inner))
+    return f"{type(inner).__name__} ({texts[-1]})" if texts else type(inner).__name__
+
+
 class RnetSession:
     """TLS-fingerprinted HTTP session powered by rnet (Rust/BoringSSL).
 
@@ -664,14 +690,19 @@ class RnetSession:
         self._client = client
 
     @staticmethod
-    def set_cookie_header(client: rnet.BlockingClient, origin: str, header: str) -> None:
-        """Set every cookie in a ``name=value; ...`` header string on one origin of *client*."""
+    def parse_cookie_header(header: str) -> Iterator[tuple[str, str]]:
+        """The ``(name, value)`` pairs of a ``name=value; ...`` header string."""
         for pair in header.split(";"):
             name, separator, value = pair.partition("=")
-            if not separator:
-                continue
+            if separator:
+                yield name.strip(), value.strip()
+
+    @staticmethod
+    def set_cookie_header(client: rnet.BlockingClient, origin: str, header: str) -> None:
+        """Set every cookie in a ``name=value; ...`` header string on one origin of *client*."""
+        for name, value in RnetSession.parse_cookie_header(header):
             try:
-                client.set_cookie(origin, rnet.Cookie(name.strip(), value.strip()))
+                client.set_cookie(origin, rnet.Cookie(name, value))
             except Exception:
                 pass
 
@@ -704,6 +735,26 @@ class RnetSession:
             if raw:
                 exported[origin] = raw.decode("utf-8", errors="replace")
         return exported
+
+    def scoped_cookies(self) -> CookieJar:
+        """Every cookie this HTTP session sends, each scoped to its domain.
+
+        The live client's cookies of each requested origin come first, then the cookies set
+        through :attr:`cookies` for any other host.
+        """
+        jar = CookieJar()
+        hosts: dict[str, set[str]] = {}
+        for origin, header in self.export_origin_cookies().items():
+            host = urlparse(origin).hostname or ""
+            for name, value in self.parse_cookie_header(header):
+                jar.set_cookie(create_cookie(name, value, domain=host))
+                hosts.setdefault(name, set()).add(host)
+        for domain, values in self.cookies.get_dict_by_domain().items():
+            bare = domain.lstrip(".")
+            for name, value in values.items():
+                if not any(h == bare or h.endswith("." + bare) for h in hosts.get(name, ())):
+                    jar.set_cookie(create_cookie(name, value, domain=domain))
+        return jar
 
     def import_origin_cookies(self, exported: dict[str, str]) -> None:
         """Load cookie headers from :meth:`export_origin_cookies` into this HTTP session's client."""
@@ -842,12 +893,12 @@ class RnetSession:
                 if response.status_code not in self.status_forcelist:
                     return response
                 last_exception = HTTPError(f"Received status code: {response.status_code}", response=response)
-                failure = f"{response.status_code} {response.reason}"
+                failure = failure_reason(last_exception)
 
             except self.catch_exceptions as e:
                 last_exception = e
                 response = None
-                failure = e.__class__.__name__
+                failure = failure_reason(e)
 
             if attempt < max_retries:
                 self.log.warning(f"{failure}({urlparse(url).path}). Retrying... ({attempt + 1}/{max_retries})")
@@ -857,7 +908,10 @@ class RnetSession:
             else:
                 break
 
-        raise MaxRetriesError(f"Max retries exceeded for {method} {url}", cause=last_exception)
+        attempts = f" after {max_retries + 1} attempts" if max_retries else ""
+        raise MaxRetriesError(
+            f"{method_upper} {parsed_origin.hostname} failed{attempts}: {failure}", cause=last_exception
+        )
 
     def get(self, url: str, **kwargs: Any) -> RnetResponse:
         return self.request("GET", url, **kwargs)

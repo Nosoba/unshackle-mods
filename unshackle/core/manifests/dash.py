@@ -20,7 +20,6 @@ from zlib import crc32
 import requests
 from langcodes import Language, tag_is_valid
 from lxml.etree import Element, ElementTree, XMLSyntaxError
-from pyplayready.system.pssh import PSSH as PR_PSSH
 from pywidevine.cdm import Cdm as WidevineCdm
 from pywidevine.pssh import PSSH
 from requests import Session
@@ -43,6 +42,19 @@ from unshackle.core.utilities import is_close_match, log_event, try_ensure_utf8
 from unshackle.core.utils import run_proxy
 from unshackle.core.utils.redact import safe_display_url
 from unshackle.core.utils.xml import load_xml
+
+
+class MissingLanguageError(ValueError):
+    """A manifest track has no language, and the fallback language is missing or invalid."""
+
+
+def missing_language(where: str, fallback: Any) -> MissingLanguageError:
+    """The MissingLanguageError for a track at ``where``, naming why the fallback did not apply."""
+    if fallback is None:
+        return MissingLanguageError(f"No language for {where}, and no fallback language was given")
+    if not tag_is_valid(str(fallback).strip()) or str(fallback).startswith("und"):
+        return MissingLanguageError(f"No language for {where}, and the fallback language {fallback} is invalid")
+    return MissingLanguageError(f"No language for {where}")
 
 
 def append_segment(dst: BinaryIO, segment_file: Path, is_text_subtitle: bool) -> None:
@@ -292,12 +304,7 @@ class DASH:
 
                     track_lang = self.get_language(adaptation_set, rep, fallback=language)
                     if not track_lang:
-                        msg = "Language information could not be derived from a Representation."
-                        if language is None:
-                            msg += " No fallback language was provided when calling DASH.to_tracks()."
-                        elif not tag_is_valid((str(language) or "").strip()) or str(language).startswith("und"):
-                            msg += f" The fallback language provided is also invalid: {language}"
-                        raise ValueError(msg)
+                        raise missing_language("a DASH Representation", language)
 
                     # for some reason it's incredibly common for services to not provide
                     # a good and actually unique track ID, sometimes because of the lang
@@ -1360,7 +1367,6 @@ class DASH:
                 )
                 if not pr_pssh_b64:
                     continue
-                pr_pssh = PR_PSSH(pr_pssh_b64)
                 kid_b64 = protection.findtext("kid")
                 kid = None
                 if kid_b64:
@@ -1369,7 +1375,10 @@ class DASH:
                     except ValueError:
                         kid = None
 
-                drm.append(PlayReady(pssh=pr_pssh, kid=kid, pssh_b64=pr_pssh_b64))
+                try:
+                    drm.append(PlayReady.from_pssh_b64(pr_pssh_b64, kid=kid))
+                except Exception as e:
+                    logging.getLogger("DASH").warning(f"Skipping unparseable PlayReady ContentProtection: {e!r}")
 
             elif urn == ClearKeyCENC.urn:
                 # W3C EME ClearKey (org.w3.clearkey): match the scheme UUID alone,

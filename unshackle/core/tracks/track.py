@@ -31,7 +31,7 @@ from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, DownloadCancelled
 from unshackle.core.downloaders import requests
 from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
-from unshackle.core.drm.verify import decrypt_track
+from unshackle.core.drm.verify import decrypt_track, has_encrypted_entry, senc_protects_samples
 from unshackle.core.events import events
 from unshackle.core.session import MAX_BACKOFF, RnetSession, utf8_text
 from unshackle.core.temp import restore_segments, stash_segments
@@ -245,42 +245,18 @@ def has_dts_uhd_sample_entry(path: Path) -> bool:
 
 
 def has_encrypted_sample_entry(path: Path) -> bool:
-    """True if the MP4's moov still carries an encrypted sample entry (encv/enca).
+    """True if the MP4's moov still carries an encrypted sample entry (``enc*`` or ``drm*``).
 
-    A faithful decrypt rewrites encv/enca back to the real codec 4CC through frma, so a
-    survivor means the decrypt tool skipped/failed the track. This is a 4CC scan
-    scoped to the moov box (where sample entries live), not a structural parse.
-    The scoping avoids chance byte collisions in mdat. Any read error -> False.
+    A faithful decrypt rewrites the entry back to the real codec 4CC through frma, so a
+    survivor means the decrypt tool skipped/failed the track. Only the moov is read, and its
+    stsd boxes are parsed, so byte runs in mdat or in metadata cannot match. Any read or
+    parse error -> False.
     """
     try:
         moov = read_top_level_box(path, b"moov")
-    except OSError:
+        return moov is not None and has_encrypted_entry(moov)
+    except (OSError, struct.error, RecursionError):
         return False
-    if not moov:
-        return False
-    for tok in (b"encv", b"enca"):
-        i = moov.find(tok, 4)
-        while i != -1:
-            # require a plausible sample-entry box size right before the 4CC
-            size = int.from_bytes(moov[i - 4 : i], "big")
-            if 16 <= size <= len(moov) - (i - 4):
-                return True
-            i = moov.find(tok, i + 1)
-    return False
-
-
-def senc_protects_samples(buf: bytes, body: int, end: int) -> bool:
-    """True if a senc/PIFF-uuid box describes protected samples.
-
-    An empty senc (sample_count 0) sits on a genuinely clear fragment, so treating it as
-    a skipped one would raise on a healthy file. Field order follows
-    read_per_sample_iv_size.
-    """
-    flags = int.from_bytes(buf[body + 1 : body + 4], "big")
-    pos = body + 4 + (20 if flags & 0x1 else 0)  # PIFF override: AlgorithmID(3)+IV_size(1)+KID(16)
-    if pos + 4 > end:
-        return False
-    return int.from_bytes(buf[pos : pos + 4], "big") > 0
 
 
 def moof_still_encrypted(moof: bytes) -> bool:
@@ -371,9 +347,7 @@ def assert_fragments_decrypted(path: Path) -> None:
             first_offset=first_offset,
         )
         raise ValueError(
-            f"{path.name}: {surviving}/{total} fragment(s) still encrypted after decryption (first at "
-            f"byte {first_offset}). The decrypt tool skipped them silently, so check "
-            f"tfhd.sample_description_index against the stsd entry count in the init segment."
+            f"{path.name}: {surviving}/{total} fragment(s) still encrypted after decryption, first at byte {first_offset}"
         )
 
 
@@ -560,9 +534,7 @@ class Track:
             return slice(None)
         low, high = (starts[0] + seconds * timescale for seconds in window)
         if low > starts[-1] and len(starts) > 1:
-            raise click.ClickException(
-                "The title ends before the sample window starts. Use --sample START-END with an earlier window."
-            )
+            raise click.ClickException("The title ends before the sample window starts, use an earlier --sample window")
         first = max(bisect_right(starts, low) - 1, 0)
         self.sample_start = (starts[first] - starts[0]) / timescale
         return slice(first, max(bisect_left(starts, high) + self.sample_tail, first + 1))
@@ -1215,7 +1187,7 @@ class Track:
                     drm_list.append(drm)
                 elif fmt in {f"urn:uuid:{PR_PSSH.SYSTEM_ID}", "com.microsoft.playready"}:
                     pssh_b64 = key.uri.split(",")[-1]
-                    drm = PlayReady(pssh=PR_PSSH(pssh_b64), pssh_b64=pssh_b64)
+                    drm = PlayReady.from_pssh_b64(pssh_b64)
                     drm_list.append(drm)
 
             if drm_list:

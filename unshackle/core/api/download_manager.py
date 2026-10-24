@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 from unshackle.core.api.events import bus, publish_service_event
 from unshackle.core.api.sanitize import sanitize_log
 from unshackle.core.utils.click_types import AUDIO_CODEC_LIST, QUALITY_LIST, VIDEO_CODEC_LIST
-from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_path, redact_text
+from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_all, redact_path, redact_text
 
 log = logging.getLogger("download_manager")
 
@@ -693,30 +693,27 @@ def perform_download(
 
     except SystemExit as exc:
         if exc.code != 0:
-            stdout_str = stdout_capture.getvalue()
-            stderr_str = stderr_capture.getvalue()
             log.error(f"Download exited with code {exc.code}")
-            log.error(f"Stdout: {stdout_str}")
-            log.error(f"Stderr: {stderr_str}")
+            log.debug("Stdout: %s", stdout_capture.getvalue())
+            log.debug("Stderr: %s", stderr_capture.getvalue())
             msg = f"Download failed with exit code {exc.code}"
-            tail = (stderr_str or stdout_str or "").strip()[-800:]
+            tail = (stderr_capture.getvalue() or stdout_capture.getvalue() or "").strip()[-800:]
             if tail:
                 msg += f": {tail}"
             raise APIError(APIErrorCode.DOWNLOAD_ERROR, msg)
 
     except Exception as exc:  # noqa: BLE001 - propagate to caller
-        stdout_str = stdout_capture.getvalue()
-        stderr_str = stderr_capture.getvalue()
         log.error(f"Download execution failed: {exc}")
-        log.error(f"Stdout: {stdout_str}")
-        log.error(f"Stderr: {stderr_str}")
+        log.debug("Stdout: %s", stdout_capture.getvalue())
+        log.debug("Stderr: %s", stderr_capture.getvalue())
         raise
 
     # dl.result() catches a download-worker exception, reports it, but returns normally (exit 0).
-    # It sets download_failed in that case, so the job isn't reported as completed with no output.
-    if getattr(dl_instance, "download_failed", False):
-        detail = (stdout_capture.getvalue() + stderr_capture.getvalue())[-800:].strip()
-        raise APIError(APIErrorCode.WORKER_ERROR, "download worker failed: " + (detail or "see logs"))
+    # It keeps the error in download_error, so the job isn't reported as completed with no output.
+    if (error := getattr(dl_instance, "download_error", None)) is not None:
+        # segment URLs carry signed CDN tokens (hmac, session IDs) that redact_text does not match
+        detail = redact_all(dl_instance.failure_lines(error)[1].strip())
+        raise APIError(APIErrorCode.WORKER_ERROR, f"download worker failed: {detail}")
 
     if progress_callback:
         skipped_subs = getattr(dl_instance, "skipped_subtitles", None)

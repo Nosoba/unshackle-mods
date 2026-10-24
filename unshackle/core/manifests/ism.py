@@ -15,7 +15,6 @@ from typing import Any, BinaryIO, Optional, Union
 import requests
 from langcodes import Language, tag_is_valid
 from lxml.etree import Element
-from pyplayready.system.pssh import PSSH as PR_PSSH
 from pywidevine.pssh import PSSH
 from requests import Session
 
@@ -24,7 +23,7 @@ from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, 
 from unshackle.core.drm import DRM_T, PlayReady, Widevine
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
-from unshackle.core.manifests.dash import RollingMerge, append_segment
+from unshackle.core.manifests.dash import RollingMerge, append_segment, missing_language
 from unshackle.core.manifests.ism_init import (
     build_init_segment,
     parse_codec_private_data_vui,
@@ -104,11 +103,9 @@ class ISM:
                 drm.append(Widevine(pssh=pssh, kid=kid))
             elif system_id == "9a04f079-9840-4286-ab92-e65be0885f95":
                 try:
-                    pr_pssh = PR_PSSH(data)
+                    drm.append(PlayReady.from_pssh_b64(data))
                 except Exception as e:
                     logging.getLogger("ISM").warning(f"Skipping unparseable PlayReady ProtectionHeader: {e!r}")
-                    continue
-                drm.append(PlayReady(pssh=pr_pssh, pssh_b64=data))
         return drm
 
     @staticmethod
@@ -254,10 +251,7 @@ class ISM:
                     track_lang = Language.get(lang)
                 if not track_lang and not language:
                     # Language is optional in MS-SSTR; video streams commonly omit it.
-                    raise ValueError(
-                        "Language information could not be derived from the manifest and no fallback "
-                        "language was provided when calling ISM.to_tracks()."
-                    )
+                    raise missing_language("an ISM stream", language)
 
                 track_urls: list[str] = []
                 track_times: list[int] = []

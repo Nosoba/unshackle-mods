@@ -56,7 +56,13 @@ from unshackle.core.constants import (
     context_settings,
 )
 from unshackle.core.credential import Credential
-from unshackle.core.downloaders import default_max_workers, format_speed, parse_speed_limit, set_speed_limit
+from unshackle.core.downloaders import (
+    default_max_workers,
+    format_speed,
+    parse_speed_limit,
+    retries_exhausted,
+    set_speed_limit,
+)
 from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine, cbcs, own_kids, real_kids, verify
 from unshackle.core.events import events
 from unshackle.core.export_name import ExportNamer, move_export, plural, season_episodes, title_label
@@ -201,10 +207,7 @@ def validate_metadata_ids(
         (flag, value) for flag, value in (("--tmdb", tmdb_id), ("--imdb", imdb_id), ("--tvdb", tvdb_id)) if value
     ]
     if len(supplied) > 1:
-        raise click.UsageError(
-            f"{', '.join(flag for flag, _ in supplied)} cannot be used together. "
-            "Give one ID and unshackle resolves the others from it."
-        )
+        raise click.UsageError(f"{', '.join(flag for flag, _ in supplied)} cannot be used together; give one ID")
     if not supplied:
         return
 
@@ -217,9 +220,7 @@ def validate_metadata_ids(
 
     if consumers:
         keys = sorted({ID_PROVIDER_KEYS[cls.NAME] for cls in consumers if cls.NAME in ID_PROVIDER_KEYS})
-        raise click.UsageError(
-            f"{flag} needs the {consumers[0].NAME} provider. Set {' or '.join(keys)} in your config."
-        )
+        raise click.UsageError(f"{flag} needs the {consumers[0].NAME} provider: set {' or '.join(keys)} in your config")
     names = sorted({cls.NAME for cls in providers.REGISTRY.values() if cls.ID_KIND == id_kind})
     raise click.UsageError(
         f"{flag} needs the {' or '.join(names)} provider, which your metadata_providers config leaves out."
@@ -261,39 +262,28 @@ def select_hybrid_bases(videos: Sequence[Video]) -> list[Video]:
     return list(bases.values())
 
 
-def hybrid_gate_failure(videos: Sequence[Video], generate_dv: bool) -> Optional[tuple[str, str]]:
-    """The (message, detail) that stops HYBRID for these selected videos, or None when it can go on."""
+def hybrid_gate_failure(videos: Sequence[Video], generate_dv: bool) -> Optional[str]:
+    """The message that stops HYBRID for these selected videos, or None when it can go on."""
     if any(v.native_hybrid for v in videos):
         return None
     hdr_tracks = [v for v in videos if v.range in (Video.Range.HDR10, Video.Range.HDR10P)]
     base_tracks = [v for v in hdr_tracks if v.codec in (Video.Codec.HEVC, None)]
     dv_tracks = [v for v in videos if v.range == Video.Range.DV]
     has_hdr10p = any(v.range == Video.Range.HDR10P for v in base_tracks)
-    available_ranges = sorted(set(v.range.name for v in videos))
+    ranges = ", ".join(sorted(set(v.range.name for v in videos))) or "none"
+    missing = f"HYBRID needs HDR10/HDR10+ and DV tracks, available ranges: {ranges}"
 
-    if not hdr_tracks and not dv_tracks:
-        return (
-            "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but neither is available",
-            f"Available ranges: {', '.join(available_ranges) if available_ranges else 'none'}",
-        )
     if not hdr_tracks:
-        return (
-            "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but only DV is available",
-            f"Available ranges: {', '.join(available_ranges)}",
-        )
+        return missing
     if not base_tracks:
         codecs = sorted(set(v.codec.name for v in hdr_tracks if v.codec))
-        return (
-            "HYBRID mode requires an HEVC HDR10/HDR10+ base, but none is available",
-            f"Available HDR10/HDR10+ codecs: {', '.join(codecs)}",
-        )
+        return f"HYBRID needs an HEVC HDR10/HDR10+ base, available codecs: {', '.join(codecs)}"
     if not dv_tracks and not (generate_dv and has_hdr10p):
-        msg_detail = f"Available ranges: {', '.join(available_ranges)}"
         if generate_dv:
-            msg_detail += ". --generate-dv needs an HEVC HDR10+ track, and the service returned none."
-        elif has_hdr10p:
-            msg_detail += ". Add --generate-dv to generate Dolby Vision from HDR10+."
-        return "HYBRID mode requires both HDR10/HDR10+ and DV tracks, but only HDR10 is available", msg_detail
+            return f"{missing}; --generate-dv found no HEVC HDR10+ track"
+        if has_hdr10p:
+            return f"{missing}; add --generate-dv to make DV from HDR10+"
+        return missing
     return None
 
 
@@ -514,10 +504,7 @@ def apply_service_dl_overrides(ctx: click.Context, service_dl_config: dict[str, 
             ctx.params[name] = param.type_cast_value(ctx, value)
             log.debug(f"Applied service dl override '{name}': {ctx.params[name]}")
         except Exception as e:
-            log.warning(
-                f"Failed to apply service dl override '{name}'={value!r}: {e}. "
-                f"Check that the value is valid for this parameter."
-            )
+            log.warning(f"Failed to apply service dl override '{name}'={value!r}: {e}")
 
 
 def download_tracks_in_passes(
@@ -1640,16 +1627,12 @@ class dl:
         # report which weren't available without parsing the console output. See SkippedSubtitle.
         self.skipped_subtitles: list[SkippedSubtitle] = []
         # result() catches a download-worker failure, reports it, and returns rather than
-        # re-raising (so the CLI still exits cleanly). Flag it so an embedding caller (the API
+        # re-raising (so the CLI still exits cleanly). Keep it so an embedding caller (the API
         # worker) can tell the title did not complete instead of reading it as a success.
-        self.download_failed: bool = False
+        self.download_error: Optional[BaseException] = None
 
         if not config.output_template:
-            raise click.ClickException(
-                "No 'output_template' configured in your unshackle.yaml.\n"
-                "Please add an 'output_template' section with movies, series, and songs/music templates.\n"
-                "See unshackle-example.yaml for examples."
-            )
+            raise click.ClickException("No 'output_template' in your unshackle.yaml")
 
         self.service = Services.get_tag(ctx.invoked_subcommand)
         self.vault_service = Services.get_vault_tag(self.service)
@@ -1692,7 +1675,7 @@ class dl:
             )
 
         if self.daily and not self.enrich:
-            self.log.warning("--daily fills air dates from TVDB only with --enrich. A service can set them itself.")
+            self.log.warning("--daily takes TVDB air dates only with --enrich")
 
         # Initialize debug logger with service name if debug logging is enabled
         if config.debug or logging.root.level == logging.DEBUG:
@@ -2181,7 +2164,7 @@ class dl:
             ("-fsl/--forced-s-lang", fsl_excl),
         ):
             if any(token.lower() == "all" for token in excludes):
-                self.log.error(f"{flag}: 'all' cannot be excluded. Name the languages to exclude instead.")
+                self.log.error(f"{flag}: 'all' cannot be excluded")
                 sys.exit(1)
         # exclusion-only use falls back to the flag's own default; -vl/-al have none, they cascade to -l
         if lang_excl and not lang:
@@ -2291,7 +2274,7 @@ class dl:
                 if vbitrate_min > vbitrate_max:
                     vbitrate_min, vbitrate_max = vbitrate_max, vbitrate_min
             except (ValueError, IndexError):
-                self.log.error("Invalid --vbitrate-range format. Use 'MIN-MAX' (e.g., '6000-7000').")
+                self.log.error("Invalid --vbitrate-range: expected MIN-MAX, such as 6000-7000")
                 sys.exit(1)
 
         abitrate_min, abitrate_max = None, None
@@ -2307,7 +2290,7 @@ class dl:
                 if abitrate_min > abitrate_max:
                     abitrate_min, abitrate_max = abitrate_max, abitrate_min
             except (ValueError, IndexError):
-                self.log.error("Invalid --abitrate-range format. Use 'MIN-MAX' (e.g., '128-256').")
+                self.log.error("Invalid --abitrate-range: expected MIN-MAX, such as 128-256")
                 sys.exit(1)
 
         if not acodec:
@@ -2331,15 +2314,13 @@ class dl:
             from unshackle.core.binaries import DoviTool
 
             if not DoviTool:
-                self.log.error("Unable to run hybrid mode: dovi_tool not detected")
-                self.log.error("Please install dovi_tool from https://github.com/quietvoid/dovi_tool")
+                self.log.error("Unable to run hybrid mode: dovi_tool not found")
                 sys.exit(1)
             if generate_dv:
                 from unshackle.core.binaries import HDR10PlusTool
 
                 if not HDR10PlusTool:
-                    self.log.error("Unable to run --generate-dv: hdr10plus_tool not detected")
-                    self.log.error("Please install hdr10plus_tool from https://github.com/quietvoid/hdr10plus_tool")
+                    self.log.error("Unable to run --generate-dv: hdr10plus_tool not found")
                     sys.exit(1)
 
         if cdm_only is None:
@@ -2458,13 +2439,13 @@ class dl:
             if enrich_lang:
                 self.log.info(f"Original language from metadata: {enrich_lang}")
             if not (enrich_title or enrich_year or enrich_lang):
-                self.log.warning("--enrich found no metadata. Is the provider's API key configured?")
+                self.log.warning("--enrich found no metadata")
             elif missing := [
                 name
                 for name, value in (("title", enrich_title), ("year", enrich_year), ("language", enrich_lang))
                 if not value
             ]:
-                self.log.warning(f"--enrich source gave no {', '.join(missing)}. Those fields are unchanged.")
+                self.log.warning(f"--enrich source gave no {', '.join(missing)}, kept the service's values")
 
             if isinstance(titles, (Series, Movies)):
                 for t in titles:
@@ -3282,12 +3263,10 @@ class dl:
                             self.log.info("No Dolby Vision track: Dolby Vision will be generated from HDR10+")
 
                         if gate_failure:
-                            msg, msg_detail = gate_failure
                             other_ranges = [r for r in range_ if r != Video.Range.HYBRID]
                             if best_available and other_ranges:
-                                self.log.warning(msg)
                                 self.log.warning(
-                                    f"Continuing with remaining range(s): {', '.join(r.name for r in other_ranges)}"
+                                    f"{gate_failure}; continuing with {', '.join(r.name for r in other_ranges)}"
                                 )
                                 range_ = other_ranges
                                 fallback_pool = pre_hybrid_videos
@@ -3316,8 +3295,7 @@ class dl:
                                         fallback_selected.append(match)
                                 title.tracks.videos = fallback_selected
                             else:
-                                self.log.error(msg)
-                                self.log.error(msg_detail)
+                                self.log.error(gate_failure)
                                 sys.exit(1)
 
                     fsl = resolve_sort_langs(forced_s_lang, title.language, exact=exact_lang)
@@ -3622,17 +3600,14 @@ class dl:
                     system_cdms = [self.cdm_for(system.lower(), height) for height in heights]
                     if not all(system_cdm and matches(system_cdm) for system_cdm in system_cdms):
                         hint = (
-                            "--cdm selects one device, so remove it."
+                            "drop --cdm, which selects one device"
                             if self.cdm_override
-                            else f"Set cdm.{self.service}.{system.lower()} in the configuration."
+                            else f"set cdm.{self.service}.{system.lower()}"
                         )
-                        raise click.ClickException(f"--all-drm needs a {system} CDM for {self.service}. {hint}")
+                        raise click.ClickException(f"--all-drm needs a {system} CDM for {self.service}: {hint}")
                     if is_remote_cdm(system_cdms[0]) and system not in self.all_drm_warned:
                         self.all_drm_warned.add(system)
-                        self.log.warning(
-                            f"The {system} CDM is remote. It can answer from its own key cache "
-                            "and send no licence request."
-                        )
+                        self.log.warning(f"The {system} CDM is remote and can answer with cached content keys")
 
             if hasattr(service, "resolve_server_keys"):
                 service.resolve_server_keys(title)
@@ -3740,11 +3715,11 @@ class dl:
                     self.log_export_summary()
                 return
             except Exception as e:  # noqa
-                # Reported and swallowed (no re-raise) so the CLI exits cleanly; flag it so the
+                # Reported and swallowed (no re-raise) so the CLI exits cleanly; keep it so the
                 # API worker sees the title failed rather than completing with no output.
-                self.download_failed = True
+                self.download_error = e
                 console.print(Padding(Group(*self.failure_lines(e)), (1, 5)))
-                if not isinstance(e, click.ClickException):
+                if not isinstance(e, click.ClickException) and not retries_exhausted(e):
                     console.print_exception()
 
                 if self.debug_logger:
@@ -3936,10 +3911,7 @@ class dl:
                             has_repacked = True
                             events.emit(events.Types.TRACK_REPACKED, track=track)
                             if has_encrypted_sample_entry(track.path):
-                                self.log.warning(
-                                    f"Track {track.id} still has an encrypted sample entry after repacking, so "
-                                    "decryption likely failed and the muxed output may be unplayable."
-                                )
+                                self.log.warning(f"Track {track.id} still has an encrypted sample entry after repack")
                     if has_repacked:
                         self.log.info("Repacked one or more tracks with FFMPEG")
 
@@ -4645,9 +4617,7 @@ class dl:
         collisions = [slot for slot, count in Counter(renumbered).items() if count > 1]
         if collisions:
             self.log.error(
-                "TVDB's %s order does not cover %d of this series' episodes, and renumbering the rest "
-                "would give %d season/episode slot(s) two episodes each. Keeping the %s numbering "
-                "%s uses. Pick an order that covers the whole series.",
+                "TVDB's %s order misses %d episode(s) and puts two in %d slot(s), keeping the %s numbering of %s",
                 self.tvdb_order,
                 unmapped,
                 len(collisions),
@@ -4843,7 +4813,7 @@ class dl:
         keys = len(doc.key_pool())
         self.log.info(f"Saved the export to {namer.path}: {plural(len(doc.titles), 'title')}, {plural(keys, 'key')}")
         if keys:
-            self.log.warning("The export holds content keys. Keep it private.")
+            self.log.warning("The export holds content keys: keep it private")
 
     def export_entry(self, title: Title_T) -> mediaexport.Entry:
         """A mediaexport entry for ``title``: manifests, chapters, a small track list, no keys yet."""
@@ -4917,14 +4887,18 @@ class dl:
 
     @staticmethod
     def failure_lines(e: BaseException) -> list[str]:
-        """Return the lines that report a failed download.
+        """Return the header and the one line that report a failed download.
 
-        A ClickException is a deliberate stop with a message for the user, so it gets no
-        "unexpected error" line, and the caller prints no traceback for it.
+        A ClickException is a deliberate stop with a message for the user, so it is reported
+        without its type, and the caller prints no traceback for it. Neither does a request
+        that failed on every retry: its line ends with its retry notes.
         """
         if isinstance(e, click.ClickException):
             return [":x: Download Failed...", f"   {e.format_message()}"]
-        lines = [":x: Download Failed...", f"   {type(e).__name__}: {e}"]
+        line = f"{type(e).__name__}: {e}"
+        if retries_exhausted(e):
+            line += f", {'; '.join(e.__notes__)}"
+        lines = [":x: Download Failed...", f"   {line}"]
         cause = e.__cause__
         if cause is not None and cause is not e:
             response = getattr(cause, "response", None)
@@ -4953,13 +4927,15 @@ class dl:
         then copied to the other vaults, once FFmpeg can decode the result. Without FFmpeg
         neither happens. For a fragmented MP4, ``verify.kid_windows`` reads from the ciphertext
         which fragments each KID encrypts, and FFmpeg decodes windows inside each KID's
-        fragments, so only a KID that fails is flagged. A KID that is not in the map, and every KID
-        of any other file, gets a start and end check of the whole file, and a failure there flags
-        each of those KIDs. On failure the pair is flagged in the local vaults and reported
-        to the vault that served it, the ciphertext is restored, and the licence runs again. Every vault skips a
-        flagged pair, so each pass burns at most one vault; when the vaults run out the CDM
-        answers, and a CDM key is not checked. A CDM that returns the flagged key clears the
-        flag and stores the content key again, because then the decode check was wrong.
+        fragments, so only a KID that fails is flagged. A complete map does not judge a KID it does
+        not hold, so a clear file judges and copies no KID. A KID that is not in an incomplete map,
+        and every KID of any other file, gets a start and end check of the whole file, and a
+        failure there flags each of those KIDs. On failure the pair is flagged in the local
+        vaults, the ciphertext is restored, and the licence runs again; ``Vaults`` tells the
+        vault that served it. Every vault skips a flagged pair, so each pass burns at most one
+        vault; when the vaults run out the CDM answers, and a CDM key is not checked. A CDM
+        that returns the flagged key clears the flag and stores the content key again, because
+        then the decode check was wrong.
 
         With ``decrypt=False`` the downloader already decrypted the segments in place, so a
         failure can only flag and raise; the next run skips the flagged pair.
@@ -5020,6 +4996,13 @@ class dl:
         def window_decodes(start: float, end: float) -> bool:
             return ffmpeg_decodes(path, start=start, seconds=end - start if end > start else 0.5, video=video)
 
+        def judged_kids() -> dict[UUID, Vault]:
+            """The vault KIDs this file can judge. A map whose KIDs all have keys skips the KIDs it lacks."""
+            kids = vault_kids()
+            if kid_map is not None and all(kid in keys for kid in windows):
+                return {kid: vault for kid, vault in kids.items() if kid in windows}
+            return kids
+
         def failed_kids(kids: dict[UUID, Vault]) -> set[UUID]:
             """The vault KIDs whose content key did not decode.
 
@@ -5050,20 +5033,21 @@ class dl:
                 done += 1
                 if decrypt:
                     drm.decrypt(path)
-                kids = vault_kids()
+                kids = judged_kids()
                 stale = flagged_kids()
                 failed: set[UUID] = set()
                 if not stale:
-                    if not kids or not binaries.FFMPEG or not path.exists():
-                        return
-                    failed = failed_kids(kids)
+                    checked = bool(kids and binaries.FFMPEG and path.exists())
+                    failed = failed_kids(kids) if checked else set()
                     if not failed:
-                        self.flush_vault_writes(
-                            [
-                                partial(self.vaults.add_key, kid, keys[kid], excluding=vault)
-                                for kid, vault in kids.items()
-                            ]
-                        )
+                        if checked:
+                            self.flush_vault_writes(
+                                [
+                                    partial(self.vaults.add_key, kid, keys[kid], excluding=vault)
+                                    for kid, vault in kids.items()
+                                ]
+                            )
+                        self.vaults.report_replaced(keys)
                         return
                 bad = {kid: drop(kid) for kid in {*failed, *stale}}
                 for kid, key in bad.items():
@@ -5071,21 +5055,23 @@ class dl:
                         continue
                     self.log.warning(f"{key} from {kids[kid].name} was bad, trying other vaults")
                     self.vaults.flag_bad_key(kid, key)
-                    if report := getattr(kids[kid], "report_bad", None):
-                        report(kid, key)
                 if not backup.exists() or not licence:
                     raise ValueError("The content key from the vault did not decrypt the track; run again")
                 path.unlink()
                 os.link(backup, path)
                 relicense(set(bad))
                 for kid, key in bad.items():
-                    if keys.get(kid) != key:
+                    new = keys.get(kid)
+                    if new is None:
                         continue
                     source = self.vaults.sources.get(kid)
                     if source is None:
-                        self.vaults.unflag_bad_key(kid, key)
-                        self.flush_vault_writes([partial(self.vaults.add_key, kid, key)])
-                    elif kid in kids and source[1] is kids[kid]:
+                        if new == key:
+                            self.vaults.unflag_bad_key(kid, key)
+                            self.flush_vault_writes([partial(self.vaults.add_key, kid, key)])
+                        elif not self.vaults.held_locally(kid, new):
+                            self.flush_vault_writes([partial(self.vaults.add_key, kid, new)])
+                    elif new == key and kid in kids and source[1] is kids[kid]:
                         raise ValueError(f"{key} from {kids[kid].name} was bad and no other source has the key")
             raise ValueError("No vault or CDM produced a content key that decrypts the track")
         finally:
@@ -5174,9 +5160,7 @@ class dl:
         flag came from a decode check that was wrong, and a local vault refuses a flagged pair."""
         if not content_keys or not self.vaults:
             return
-        for kid, key in content_keys.items():
-            if self.vaults.is_flagged(kid, key):
-                self.vaults.unflag_bad_key(kid, key)
+        self.vaults.clear_licensed_flags(content_keys)
         successful_caches = self.vaults.add_keys(content_keys)
         kids, caches = self.vault_cache_tally or (set(), successful_caches)
         self.vault_cache_tally = (kids | content_keys.keys(), min(caches, successful_caches))
@@ -5279,8 +5263,7 @@ class dl:
         if not others and other_type.__name__ not in self.all_drm_warned:
             self.all_drm_warned.add(other_type.__name__)
             self.log.warning(
-                f"A track does not offer {other_type.__name__}, so it licenses with "
-                f"{type(drm).__name__} only. This warning shows one time: {track}"
+                f"Track {track} has no {other_type.__name__} DRM, licensing with {type(drm).__name__} only"
             )
 
         targets = [drm, *others[:1]]
@@ -5480,34 +5463,22 @@ class dl:
                     drm.content_keys.update(local_drm.content_keys)
                 return
 
-        licence = partial(licence, drm_system="playready" if isinstance(drm, PlayReady) else "widevine")
+        drm_system = "playready" if isinstance(drm, PlayReady) else "widevine"
+        licence = partial(licence, drm_system=drm_system)
 
-        if not server_cdm:
-            if isinstance(drm, Widevine):
-                if not is_widevine_cdm(self.cdm):
-                    widevine_cdm = self.cdm_for("widevine", track_quality)
-                    if widevine_cdm and is_widevine_cdm(widevine_cdm):
-                        if track_quality:
-                            self.log.info(f"Switching to Widevine CDM for Widevine {track_quality}p content")
-                        else:
-                            self.log.info("Switching to Widevine CDM for Widevine content")
-                        self.cdm = widevine_cdm
-                        track_cdm = widevine_cdm
-                    else:
-                        raise ValueError(f"Title needs a Widevine CDM but {self.service} is configured with PlayReady.")
-
-            elif isinstance(drm, PlayReady):
-                if not is_playready_cdm(self.cdm):
-                    playready_cdm = self.cdm_for("playready", track_quality)
-                    if playready_cdm and is_playready_cdm(playready_cdm):
-                        if track_quality:
-                            self.log.info(f"Switching to PlayReady CDM for PlayReady {track_quality}p content")
-                        else:
-                            self.log.info("Switching to PlayReady CDM for PlayReady content")
-                        self.cdm = playready_cdm
-                        track_cdm = playready_cdm
-                    else:
-                        raise ValueError(f"Title needs a PlayReady CDM but {self.service} is configured with Widevine.")
+        if not server_cdm and isinstance(drm, (Widevine, PlayReady)):
+            matches = is_playready_cdm if drm_system == "playready" else is_widevine_cdm
+            if not matches(self.cdm):
+                name, other = ("PlayReady", "Widevine") if drm_system == "playready" else ("Widevine", "PlayReady")
+                system_cdm = self.cdm_for(drm_system, track_quality)
+                if system_cdm and matches(system_cdm):
+                    self.log.info(f"Switching to the {name} CDM")
+                    self.cdm = system_cdm
+                    track_cdm = system_cdm
+                elif self.cdm is None:
+                    raise click.ClickException(f"No CDM configured for {self.service} and no default CDM")
+                else:
+                    raise ValueError(f"Title needs a {name} CDM but {self.service} is configured with {other}.")
 
         if isinstance(drm, Widevine):
             if self.debug_logger:
