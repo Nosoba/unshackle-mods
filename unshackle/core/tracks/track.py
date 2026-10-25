@@ -36,7 +36,7 @@ from unshackle.core.events import events
 from unshackle.core.session import MAX_BACKOFF, RnetSession, utf8_text
 from unshackle.core.temp import restore_segments, stash_segments
 from unshackle.core.tracks import resume
-from unshackle.core.utilities import get_boxes, log_event, try_ensure_utf8
+from unshackle.core.utilities import get_boxes, language_name, log_event, try_ensure_utf8
 from unshackle.core.utils import run_proxy
 from unshackle.core.utils.subprocess import ffprobe
 
@@ -361,11 +361,15 @@ def parse_sidx(data: bytes, offset: int) -> tuple[int, list[tuple[int, int, int]
     Returns the timescale and one (start time, first byte, last byte) for each subsegment. The list
     is empty when the box is not a ``sidx`` or when it points at more indexes and not at media.
     """
+    size, header = int.from_bytes(data[:4], "big"), 32 if data[8:9] == b"\x00" else 40
+    # pymp4 loops forever on a box that counts more references than its size holds
+    if data[4:8] != b"sidx" or size < header + 12 * int.from_bytes(data[header - 2 : header], "big"):
+        return 0, []
     try:
         box = Box.parse(data)
     except ConstructError:
         return 0, []
-    if box.type != b"sidx" or any(reference.reference_type != "MEDIA" for reference in box.references):
+    if any(reference.reference_type != "MEDIA" for reference in box.references):
         return 0, []
     start, byte = box.earliest_presentation_time, offset + box.end + box.first_offset
     subsegments: list[tuple[int, int, int]] = []
@@ -473,7 +477,7 @@ class Track:
 
         self.path: Optional[Path] = None
         self.url = url
-        self.language = Language.get(language)
+        self.language = language
         self.is_original_lang = is_original_lang
         self.descriptor = descriptor
         self.needs_repack = needs_repack
@@ -489,23 +493,6 @@ class Track:
         self.data = data or {}
         self.extra: Any = extra or {}  # allow anything for extra, but default to a dict
         self.duration = float(duration) if duration is not None else None
-
-        if self.name is None:
-            lang = self.language
-            if (lang.language or "").lower() == (lang.territory or "").lower():
-                lang = lang.update_dict({"territory": None})
-            reduced = lang.simplify_script()
-            extra_parts = []
-            if reduced.script is not None:
-                script = reduced.script_name(max_distance=25)
-                if script and script != "Zzzz":
-                    extra_parts.append(script)
-            if reduced.territory is not None:
-                territory = reduced.territory_name(max_distance=25)
-                if territory and territory != "ZZ":
-                    territory = territory.removesuffix(" SAR China")
-                    extra_parts.append(territory)
-            self.name = ", ".join(extra_parts) or None
 
         if not id_:
             this = copy(self)
@@ -594,6 +581,15 @@ class Track:
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, Track) and self.id == other.id
+
+    @property
+    def language(self) -> Language:
+        """The language the service tagged, parsed even when a service assigns a string or None later."""
+        return self._language
+
+    @language.setter
+    def language(self, value: Union[Language, str, None]) -> None:
+        self._language = Language.get(value or "und")
 
     @property
     def formatted_duration(self) -> Optional[str]:
@@ -1056,9 +1052,37 @@ class Track:
             raise ValueError(f"Cannot reconstruct unsupported track type: {track_type!r}")
         return builder.from_dict(data)
 
+    @property
+    def mux_language(self) -> Language:
+        """The language tag written to the output file."""
+        return self.language
+
+    def embedded_audio_name(self) -> str:
+        """Name the audio a service keeps inside this track's file, by its language when the service set none."""
+        lang = self.data["audio_language"]
+        name = self.data.get("audio_language_name")
+        if not name and config.muxing.get("track_names") != "none":
+            name = language_name(Language.get(lang)) or lang
+        return self.with_original_label(name) or ""
+
     def get_track_name(self) -> Optional[str]:
-        """Get the Track Name."""
-        return self.name
+        """Get the Track Name, or the name of its language when the service set none."""
+        name = self.name
+        if name is None and config.muxing.get("track_names") != "none":
+            name = language_name(self.mux_language)
+        return self.with_original_label(name)
+
+    def with_original_label(self, name: Optional[str]) -> Optional[str]:
+        """Add `muxing.original_label` to the name of a track in the title's original language,
+        unless the name already contains the label's words."""
+        label = config.muxing.get("original_label")
+        label = label.strip() if isinstance(label, str) else ""
+        if not label or not self.is_original_lang:
+            return name
+        words = re.sub(r"[\W_]+", " ", label).strip() or label
+        if name and words.casefold() in name.casefold():
+            return name
+        return f"{name} {label}" if name else label
 
     def get_drm_for_cdm(self, cdm: Optional[object]) -> Optional[DRM_T]:
         """Return the DRM matching the provided CDM, if available."""
@@ -1320,7 +1344,7 @@ class Track:
 
             if hasattr(self, "data") and self.data.get("audio_language"):
                 audio_lang = self.data["audio_language"]
-                audio_name = self.data.get("audio_language_name", audio_lang)
+                audio_name = self.embedded_audio_name()
                 args.extend(
                     [
                         "-metadata:s:a:0",

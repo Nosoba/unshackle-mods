@@ -32,6 +32,25 @@ def stamp_for(dest: Path) -> Path:
 
 SHORTHAND_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
+JUNK_GLOBS = ("**/__pycache__/**", "**/*.pyc", "**/*.pyo", "**/.DS_Store")
+JUNK = tuple(f":(glob){g}" for g in JUNK_GLOBS)
+NOT_JUNK = (".", *(f":(exclude,glob){g}" for g in JUNK_GLOBS))
+
+
+def discard_junk_workdir(dest: Path) -> None:
+    """Restore tracked bytecode the import rewrote and delete untracked ``__pycache__`` files, so
+    neither can block ``git pull --ff-only``. It never touches compiled ``.so``/``.pyd`` modules."""
+    git = str(binaries.Git)
+    subprocess.run([git, "-C", str(dest), "clean", "-fdqx", "--", JUNK[0]], capture_output=True)  # nosec B603
+    changed = subprocess.run([git, "-C", str(dest), "diff", "--name-only", "-z", "--", *JUNK], capture_output=True)  # nosec B603
+    if not changed.stdout:
+        return
+    subprocess.run(
+        [git, "--literal-pathspecs", "-C", str(dest), "checkout", "--pathspec-from-file=-", "--pathspec-file-nul"],
+        input=changed.stdout,
+        capture_output=True,
+    )  # nosec B603
+
 
 def is_repo_spec(value: object) -> bool:
     """True if value is a git repo spec (URL or owner/repo shorthand), not a local path."""
@@ -121,6 +140,7 @@ def pull(dest: Path, stamp: Path) -> None:
     if not binaries.Git:
         write_stamp(stamp)
         return
+    discard_junk_workdir(dest)
     # never clobber local edits: refuse to refresh a dirty clone and let the caller exit cleanly
     if is_dirty(dest):
         raise DirtyServiceRepo(dest)
@@ -160,7 +180,9 @@ def head(dest: Path) -> Optional[str]:
 
 def local_dirty_services(dest: Path) -> list[str]:
     """Top-level service dirs with uncommitted edits to tracked files (lost on a force reset)."""
-    r = subprocess.run([str(binaries.Git), "-C", str(dest), "diff", "--name-only", "HEAD"], capture_output=True)  # nosec B603
+    r = subprocess.run(
+        [str(binaries.Git), "-C", str(dest), "diff", "--name-only", "HEAD", "--", *NOT_JUNK], capture_output=True
+    )  # nosec B603
     if r.returncode != 0:
         return []
     return sorted({line.split("/")[0] for line in r.stdout.decode(errors="ignore").splitlines() if line})
@@ -205,14 +227,12 @@ def force_sync(dest: Path, stamp: Path) -> None:
 def is_dirty(dest: Path) -> bool:
     """True if the clone has uncommitted edits to tracked files or local commits not on its upstream.
 
-    This function intentionally ignores untracked files: a `git pull --ff-only` only touches tracked
-    files, so untracked files (including `__pycache__` that importing the services creates) are never
-    at risk and must not falsely flag the clone as dirty.
+    This function ignores untracked files, tracked bytecode and ``.DS_Store``: importing a service
+    rewrites a committed ``.pyc`` whose source modification time changed on checkout.
     """
     git = str(binaries.Git)
-    # modifications to tracked files only (--untracked-files=no skips __pycache__ etc.)
     status = subprocess.run(
-        [git, "-C", str(dest), "status", "--porcelain", "--untracked-files=no"], capture_output=True
+        [git, "-C", str(dest), "status", "--porcelain", "--untracked-files=no", "--", *NOT_JUNK], capture_output=True
     )  # nosec B603
     if status.returncode == 0 and status.stdout.strip():
         return True

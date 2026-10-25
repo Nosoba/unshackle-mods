@@ -290,6 +290,81 @@ warning and continues.
 !!! note "Height channels"
     A track with height channels is named bed.LFE.heights, such as `5.1.4`.
 
+### Track names and language tags
+
+When the service gives a track no name, unshackle names it with the English name of its language,
+such as `English`, `Portuguese (Portugal)` or `Spanish (Latin America)`. The name leaves out the
+region that is the default for the language, so `en-US` is `English` and `pt-BR` is `Portuguese`,
+but `en-GB` is `English (United Kingdom)`. A name from the service is kept as is. unshackle adds the SDH, CC, Forced or Descriptive label after either name.
+
+A subtitle in a language with more than one script gets the script from its region:
+
+| Service tag | Tag in the file | Track name |
+|-------------|-----------------|------------|
+| `zh-TW` | `zh-Hant-TW` | Chinese (Traditional) |
+| `zh-HK` | `zh-Hant-HK` | Chinese (Traditional, Hong Kong) |
+| `zh-CN` | `zh-Hans-CN` | Chinese (Simplified) |
+| `sr-ME` | `sr-Latn-ME` | Serbian (Latin, Montenegro) |
+| `zh` | `zh` | Chinese |
+
+A tag without a region, such as `zh`, gets no script because the region is what tells the script.
+unshackle writes audio tags as the service gives them, because a script applies only to written text.
+Track selection, `--list` tags and file names use the service tag.
+
+Set `muxing.track_names` to `native` to name each track in its own language. The same rules apply
+to the script and the region:
+
+```yaml title="unshackle.yaml"
+muxing:
+  track_names: native
+```
+
+| Service tag | Track name |
+|-------------|------------|
+| `zh-TW` subtitle | 中文（繁體） |
+| `zh-HK` subtitle | 中文（繁體，香港） |
+| `pt-PT` | Português (Portugal) |
+| `es-419` | Español (Latinoamérica) |
+| `ja-JP` | 日本語 |
+
+Set `muxing.track_names` to `none` to leave a track unnamed when the service gives it no name. An
+SDH, CC, Forced or Descriptive track then has only that label as its name.
+
+The option also changes the names in `--list` and in the `track_name` field of the REST API.
+
+Set `muxing.original_label` to add a label after the name of each audio and subtitle track in the
+title's original language. unshackle also sets the Matroska original flag on these tracks, but some
+players show only the name. MP4 output has no original flag, so there the label is the only marker:
+
+```yaml title="unshackle.yaml"
+muxing:
+  original_label: "[Original]"
+```
+
+| Track | Track name |
+|-------|------------|
+| Japanese audio, original language | Japanese [Original] |
+| Japanese SDH subtitle, original language | Japanese [Original] (SDH) |
+| Korean subtitle | Korean |
+
+The label can be any text, for example `"| Original"` or a label in another language. Put it in
+quotes: YAML reads an unquoted `[Original]` as a list, and an unquoted `| Original` stops the config
+from loading. unshackle ignores a value that is not text.
+
+The label also applies to a name that the service sets, and to audio that a service keeps inside the
+video file. unshackle does not add the label when the name already contains its words, so a service
+name `Original` or `Japanese (original)` stays as it is.
+
+!!! tip "Use an English label with Jellyfin 12"
+    Jellyfin 12 adds its own "Original" to an original-language audio track from the flag, unless the
+    name already contains the word. It adds none to a subtitle. A label in another language, such as `[원어]`, then shows next to Jellyfin's
+    "Original".
+
+!!! note "Players that show the language next to the name"
+    Some players, such as Jellyfin, show the track name and the language name together. They leave
+    out the language when the name already contains it, so an English name shows once. A native name
+    such as `日本語` shows next to `Japanese` in an English interface.
+
 ### DTS:X Profile 2 output
 
 A title whose audio holds a `dtsx` or `dtsy` sample entry (DTS:X Profile 2, DTS-UHD) muxes

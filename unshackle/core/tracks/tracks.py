@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from langcodes import Language
+from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn, TimeRemainingColumn
 from rich.table import Table
 from rich.tree import Tree
@@ -89,6 +91,21 @@ MANUAL_TRANSLATIONS = {
 def at_resolution(video: Video, res: int) -> bool:
     """Whether a track has this height, or this height from a 16:9 width (a letterboxed encode)."""
     return video.height == res or bool(video.width and int(video.width * 9 / 16) == res)
+
+
+def file_track_ids(path: Path) -> dict[str, int]:
+    """Return the mkvmerge ID of the first track of each type in a file. A TS file can hold its audio first."""
+    res = subprocess.run(
+        [str(binaries.MKVToolNix), "-J", str(path)], capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
+    ids: dict[str, int] = {}
+    for track in json.loads(res.stdout or "{}").get("tracks") or []:
+        ids.setdefault(track["type"], track["id"])
+    if not ids:
+        logging.getLogger("Tracks").debug(
+            f"mkvmerge found no tracks in {path.name}, so it is addressed as video 0, audio 1"
+        )
+    return ids or {"video": 0, "audio": 1}
 
 
 class Tracks:
@@ -684,7 +701,7 @@ class Tracks:
                 track.name = self._generate_auto_name(track)
 
             delay = round((track.sample_start - sample_base) * 1000) if config.sample else 0
-            cl.extend(["-add", f"{source}:lang={track.language}" + (f":delay={delay}" if delay else "")])
+            cl.extend(["-add", f"{source}:lang={track.mux_language}" + (f":delay={delay}" if delay else "")])
             name = "" if isinstance(track, Video) else (track.get_track_name() or "")
             if name:
                 names.extend(["-name", f"{track_id}={name}"])
@@ -843,14 +860,11 @@ class Tracks:
             video_track = video_track or self.videos[0]
             if video_track.language.is_valid():
                 lang_code = str(video_track.language)
-                lang_name = video_track.language.display_name()
-
                 for video in self.videos:
                     if video.data.get("audio_language"):
                         continue
                     video.needs_repack = True
                     video.data["audio_language"] = lang_code
-                    video.data["audio_language_name"] = lang_name
 
         if any(at.path and at.path.exists() and has_dts_uhd_sample_entry(at.path) for at in self.audio):
             return self._mux_mp4(
@@ -873,7 +887,7 @@ class Tracks:
 
         def sample_sync(start: float) -> list[str]:
             shift = round((start - sample_base) * 1000)
-            return ["--sync", f"0:{shift}"] if config.sample and shift else []
+            return ["--sync", f"-1:{shift}"] if config.sample and shift else []
 
         if config.sample:
             start, end = (seconds - sample_base for seconds in config.sample)
@@ -912,15 +926,17 @@ class Tracks:
             else:
                 is_default = i == 0
 
+            ids = file_track_ids(vt.path)
+            v = ids.get("video", 0)
             video_args = [
                 "--language",
-                f"0:{vt.language}",
+                f"{v}:{vt.mux_language}",
                 "--default-track",
-                f"0:{is_default}",
+                f"{v}:{is_default}",
                 "--original-flag",
-                f"0:{vt.is_original_lang and original_flag}",
+                f"{v}:{vt.is_original_lang and original_flag}",
                 "--compression",
-                "0:none",
+                f"{v}:none",
                 *sample_sync(vt.sample_start),
             ]
 
@@ -929,9 +945,9 @@ class Tracks:
                 video_args.extend(
                     [
                         "--default-duration",
-                        f"0:{vt.fps}fps" if isinstance(vt.fps, str) else f"0:{vt.fps:.3f}fps",
+                        f"{v}:{vt.fps}fps" if isinstance(vt.fps, str) else f"{v}:{vt.fps:.3f}fps",
                         "--fix-bitstream-timing-information",
-                        "0:1",
+                        f"{v}:1",
                     ]
                 )
 
@@ -939,19 +955,20 @@ class Tracks:
                 video_args.extend(
                     [
                         "--color-transfer-characteristics",
-                        "0:18",  # ARIB STD-B67 (HLG)
+                        f"{v}:18",  # ARIB STD-B67 (HLG)
                     ]
                 )
 
-            if hasattr(vt, "data") and vt.data.get("audio_language"):
-                audio_lang = vt.data["audio_language"]
-                audio_name = vt.data.get("audio_language_name", audio_lang)
+            a = ids.get("audio")
+            if vt.data.get("audio_language") and a is not None:
                 video_args.extend(
                     [
                         "--language",
-                        f"1:{audio_lang}",
+                        f"{a}:{vt.data['audio_language']}",
                         "--track-name",
-                        f"1:{audio_name}",
+                        f"{a}:{vt.embedded_audio_name()}",
+                        "--original-flag",
+                        f"{a}:{vt.is_original_lang}",
                     ]
                 )
 
@@ -971,7 +988,7 @@ class Tracks:
                     "--track-name",
                     f"0:{at.get_track_name() or ''}",
                     "--language",
-                    f"0:{at.language}",
+                    f"0:{at.mux_language}",
                     "--default-track",
                     f"0:{audio_default}",
                     "--visual-impaired-flag",
@@ -1002,7 +1019,7 @@ class Tracks:
                         "--track-name",
                         f"0:{st.get_track_name() or ''}",
                         "--language",
-                        f"0:{st.language}",
+                        f"0:{st.mux_language}",
                         "--sub-charset",
                         "0:UTF-8",
                         "--forced-track",

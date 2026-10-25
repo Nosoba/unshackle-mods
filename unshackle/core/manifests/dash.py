@@ -6,7 +6,6 @@ import logging
 import math
 import re
 import shutil
-import sys
 from concurrent.futures import Future
 from contextlib import ExitStack, closing
 from copy import deepcopy
@@ -17,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 from uuid import UUID
 from zlib import crc32
 
+import click
 import requests
 from langcodes import Language, tag_is_valid
 from lxml.etree import Element, ElementTree, XMLSyntaxError
@@ -502,14 +502,13 @@ class DASH:
             if config.sample and segments:
                 break
 
+        # raise, never sys.exit: this runs in a download thread, where SystemExit escapes the failure handler
         if not segments:
-            log.error("Could not find a way to get segments from this MPD manifest.")
             log.debug(track.url)
-            sys.exit(1)
+            raise click.ClickException("Could not find a way to get segments from this MPD manifest.")
 
         if config.sample and not segment_durations and not isinstance(track, Subtitle):
-            log.error("--sample cannot cut this track: the manifest gives it as one file with no segment index.")
-            sys.exit(1)
+            raise click.ClickException("--sample cannot cut this track: the server sent no segment index for it.")
 
         # TODO: Should we floor/ceil/round, or is int() ok?
         track.data["dash"]["timescale"] = int(segment_timescale)
@@ -1299,8 +1298,8 @@ class DASH:
 
     @staticmethod
     def is_closed_caption(adaptation_set: Element) -> bool:
-        """Whether the Adaptation Set is a Closed Caption Subtitle."""
-        return any(
+        """Whether the Adaptation Set is a Closed Caption Subtitle. A caption that is also marked SDH counts as SDH."""
+        return not DASH.is_sdh(adaptation_set) and any(
             (x.get("schemeIdUri"), x.get("value")) == ("urn:mpeg:dash:role:2011", "caption")
             for x in adaptation_set.findall("Role")
         )
