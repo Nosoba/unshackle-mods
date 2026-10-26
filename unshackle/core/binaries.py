@@ -15,7 +15,8 @@ def find(*names: str, search_dirs: Optional[list[Path]] = None) -> Optional[Path
     """Find the path of the first found binary name."""
     services_dir = package_binaries_dir.parent / "services"
 
-    dirs_to_check: list[Path] = [package_binaries_dir, user_binaries_dir]
+    scripts_dir = Path(sys.executable).parent
+    dirs_to_check: list[Path] = [package_binaries_dir, user_binaries_dir, scripts_dir]
     if services_dir.exists():
         for s_dir in services_dir.iterdir():
             s_bin = s_dir / "binaries"
@@ -74,6 +75,9 @@ __binaries = {
     "DoviTool": ("dovi_tool",),
     "HDR10PlusTool": ("hdr10plus_tool", "HDR10Plus_tool"),
     "Mp4decrypt": ("mp4decrypt",),
+    "AssyCLI": ("assy-cli", "assy"),
+    "FFSubSync": ("ffsubsync",),
+    "Alass": ("alass", "alass-cli"),
     "Docker": ("docker",),
     "Git": ("git",),
 }
@@ -143,6 +147,9 @@ __all__ = (
     "DoviTool",
     "HDR10PlusTool",
     "Mp4decrypt",
+    "AssyCLI",
+    "FFSubSync",
+    "Alass",
     "Docker",
     "Git",
     "find",

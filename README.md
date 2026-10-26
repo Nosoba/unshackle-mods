@@ -22,7 +22,7 @@ A fork of [unshackle](https://github.com/unshackle-dl/unshackle) (originally bas
 
 - **More precise episode selection:** fractional seasons and episodes, plus separately playable episode parts.
 - **Optional Japanese title replacements:** add `source|replacement` entries to your user config's `config_romaji.txt` to customize title names.
-- **External subtitles:** include a local subtitle file or supported URL with the CLI's `--dl-sub` option. This option is not available through the REST API.
+- **External subtitles & Auto-Sync:** include a local subtitle file or supported URL with the CLI's `--dl-sub` option. External subtitles from TVer are automatically synchronized against the episode audio using [AutoSubSync](https://github.com/denizsafak/AutoSubSync) (`assy-cli` / `ffsubsync`) before muxing.
 - **Output improvements:** shorter service source tags in filenames, improved track duration and muxed metadata, and export filenames.
 - **API and download diagnostics:** stateless list/search requests fail clearly when a service requires interactive authentication; download errors retain their underlying HTTP cause.
 

@@ -74,6 +74,7 @@ dependencies = [
     "xmltodict>=1.0.4",
     "base58>=2.1.1",
     "mediaexport @ git+https://github.com/unshackle-dl/mediaexport@main",
+    "assy>=6.5",
 ]
 
 [project.urls]

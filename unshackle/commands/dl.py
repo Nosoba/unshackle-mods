@@ -775,6 +775,107 @@ class dl:
                 self.log.warning(f"Failed to delete temp file {temp_path}: {e}")
         temp_files.clear()
 
+    def autosync_subtitle(
+        self, sub_track: Subtitle, reference_path: Path, temp_files_list: Optional[list] = None
+    ) -> bool:
+        """Synchronize an external subtitle (e.g. from TVer) against reference audio/video.
+
+        Prefers assy-cli (AutoSubSync), falling back to ffsubsync or alass.
+        """
+        sub_path = sub_track.path
+        if not sub_path or not sub_path.exists() or not reference_path.exists():
+            return False
+
+        out_ext = sub_path.suffix if sub_path.suffix.lower() in (".srt", ".vtt", ".ass") else ".srt"
+        synced_path = config.directories.temp / f"synced_{sub_path.stem}_{str(uuid.uuid4())[:8]}{out_ext}"
+
+        cmd: Optional[list[str]] = None
+        tool_name = "AutoSubSync"
+
+        assy_bin = binaries.AssyCLI
+        ffs_bin = binaries.FFSubSync
+        alass_bin = binaries.Alass
+
+        if assy_bin:
+            cmd = [str(assy_bin), "sync", str(reference_path), str(sub_path), "-o", str(synced_path)]
+            tool_name = "assy-cli"
+        elif ffs_bin:
+            cmd = [str(ffs_bin), str(reference_path), "-i", str(sub_path), "-o", str(synced_path)]
+            tool_name = "ffsubsync"
+        elif alass_bin:
+            cmd = [str(alass_bin), str(reference_path), str(sub_path), str(synced_path)]
+            tool_name = "alass"
+        else:
+            # Check if assy or ffsubsync can be invoked as Python modules
+            try:
+                probe = subprocess.run(
+                    [sys.executable, "-m", "assy.cli", "--version"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                if probe.returncode == 0:
+                    cmd = [sys.executable, "-m", "assy.cli", "sync", str(reference_path), str(sub_path), "-o", str(synced_path)]
+                    tool_name = "python -m assy.cli"
+            except Exception:
+                pass
+
+        if not cmd:
+            try:
+                probe = subprocess.run(
+                    [sys.executable, "-m", "ffsubsync", "--version"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=5,
+                )
+                if probe.returncode == 0:
+                    cmd = [sys.executable, "-m", "ffsubsync", str(reference_path), "-i", str(sub_path), "-o", str(synced_path)]
+                    tool_name = "python -m ffsubsync"
+            except Exception:
+                pass
+
+        if not cmd:
+            self.log.warning(
+                " - AutoSubSync / ffsubsync not found. Skipping subtitle sync. Run 'uv sync' or 'pip install assy' to enable."
+            )
+            return False
+
+        self.log.info(f" - Auto-syncing external subtitle '{sub_path.name}' using {tool_name}...")
+        try:
+            res = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=300,
+            )
+            if res.returncode == 0 and synced_path.exists() and synced_path.stat().st_size > 0:
+                self.log.info(" + Subtitle auto-sync completed successfully.")
+                sub_track.path = synced_path
+                sub_track.url = str(synced_path)
+                sub_track.from_file = synced_path
+                ext = synced_path.suffix.lower()
+                if ext == ".srt":
+                    sub_track.codec = Subtitle.Codec.SubRip
+                elif ext == ".vtt":
+                    sub_track.codec = Subtitle.Codec.WebVTT
+                elif ext in (".ass", ".ssa"):
+                    sub_track.codec = Subtitle.Codec.SubStationAlphav4
+                if temp_files_list is not None:
+                    temp_files_list.append(synced_path)
+                return True
+            else:
+                err_snippet = (res.stderr or res.stdout or "").strip()
+                self.log.warning(
+                    f" - Subtitle auto-sync failed (code {res.returncode}): {err_snippet[:300]}. Keeping original subtitle."
+                )
+        except subprocess.TimeoutExpired:
+            self.log.warning(" - Subtitle auto-sync timed out after 300s. Keeping original subtitle.")
+        except Exception as e:
+            self.log.warning(f" - Error during subtitle auto-sync: {e}. Keeping original subtitle.")
+
+        return False
+
     def external_subtitle_proxy(self, source: str, service: Service) -> Optional[str]:
         """The proxy URI to fetch an external subtitle (-dls) URL through, or None to go direct.
 
@@ -1000,6 +1101,7 @@ class dl:
                         )
                         sub.path = sub_file
                         sub.downloader = downloader_temp
+                        sub.needs_autosync = True
                         title.tracks.add(sub)
 
                 except subprocess.CalledProcessError as e:
@@ -3927,6 +4029,21 @@ class dl:
                 remux_music_tracks(title, self.log)
                 if sample:
                     cut_music_sample(title, sample, self.log)
+
+                # Auto-sync external subtitles (e.g. from TVer) against reference audio/video
+                autosync_subs = [
+                    s for s in title.tracks.subtitles
+                    if getattr(s, "needs_autosync", False) and s.path and s.path.exists()
+                ]
+                if autosync_subs:
+                    ref_track = (
+                        next((t for t in title.tracks.audio if t.path and t.path.exists()), None)
+                        or next((t for t in title.tracks.videos if t.path and t.path.exists()), None)
+                    )
+                    if ref_track and ref_track.path and ref_track.path.exists():
+                        with console.status("Auto-syncing external subtitles with AutoSubSync..."):
+                            for s in autosync_subs:
+                                self.autosync_subtitle(s, ref_track.path, temp_files_list=temp_external_subs)
 
                 muxed_paths = []
                 muxed_audio_codecs: dict[Path, Optional[Audio.Codec]] = {}
