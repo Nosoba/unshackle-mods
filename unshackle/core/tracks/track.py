@@ -28,7 +28,7 @@ from unshackle.core.cdm.detect import is_playready_cdm, is_widevine_cdm
 from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, DownloadCancelled
 from unshackle.core.downloaders import requests
-from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
+from unshackle.core.drm import DRM_T, BlowfishStripe, ClearKeyCENC, PlayReady, Widevine
 from unshackle.core.drm.verify import decrypt_track, has_encrypted_entry, senc_protects_samples
 from unshackle.core.events import events
 from unshackle.core.session import MAX_BACKOFF, RnetSession, utf8_text
@@ -211,12 +211,16 @@ def strip_duplicate_init_boxes(src: Path, dst: Path) -> int:
     return dropped
 
 
-def has_dts_uhd_sample_entry(path: Path) -> bool:
-    """True if the MP4 holds a DTS-UHD (DTS:X Profile 2) audio sample entry.
+MPEGH_SAMPLE_ENTRIES = ("mha1", "mha2", "mhm1", "mhm2")
+
+
+def has_mp4_only_audio_entry(path: Path) -> bool:
+    """True if the MP4 holds a DTS-UHD (DTS:X Profile 2) or MPEG-H audio sample entry.
 
     Matroska has no CodecID for DTS-UHD, so mkvmerge stores it as an A_QUICKTIME
-    passthrough and every reader reports the container fallback instead of the codec. A
-    file this returns True for has to go into MP4 to keep its codec readable.
+    passthrough and every reader reports the container fallback instead of the codec.
+    mkvmerge drops an MPEG-H track completely. A file this returns True for has to go
+    into MP4 to keep its audio.
 
     Only "dtsx"/"dtsy" mean DTS-UHD. DTS:X Profile 1 rides inside DTS-HD Master Audio as
     "dtsc"/"dtse"/"dtsh"/"dtsl", which Matroska maps to A_DTS and stores properly, so it
@@ -232,7 +236,7 @@ def has_dts_uhd_sample_entry(path: Path) -> bool:
         return False
     if not moov:
         return False
-    for tok in (b"dtsx", b"dtsy"):
+    for tok in (b"dtsx", b"dtsy", *(entry.encode() for entry in MPEGH_SAMPLE_ENTRIES)):
         i = moov.find(tok, 4)
         while i != -1:
             size = int.from_bytes(moov[i - 4 : i], "big")
@@ -846,8 +850,8 @@ class Track:
                                     log.debug("No Widevine or PlayReady PSSH was found for this track, is it DRM free?")
 
                     if self.drm:
-                        track_kid = self.get_key_id(session=session)
                         drm = self.get_drm_for_cdm(cdm)
+                        track_kid = None if isinstance(drm, BlowfishStripe) else self.get_key_id(session=session)
                         if isinstance(drm, Widevine):
                             if not prepare_drm:
                                 raise ValueError("prepare_drm func must be supplied to use Widevine DRM")
@@ -914,7 +918,8 @@ class Track:
                         if drm:
                             progress(downloaded="Decrypting", completed=0, total=None)
                             decrypt_track(drm, save_path, prepare_drm, track_kid)
-                            assert_fragments_decrypted(save_path)
+                            if not isinstance(drm, BlowfishStripe):
+                                assert_fragments_decrypted(save_path)
                             self.drm = None
                             events.emit(events.Types.TRACK_DECRYPTED, track=self, drm=drm, segment=None)
                             progress(downloaded="Decrypted", completed=100, total=100)
