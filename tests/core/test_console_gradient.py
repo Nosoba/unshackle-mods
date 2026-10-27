@@ -53,7 +53,9 @@ def test_upstream_theme_disables_random_gradient(monkeypatch: pytest.MonkeyPatch
     from unshackle.core.themes import DEFAULT_THEME, resolve_palette
 
     assert DEFAULT_THEME == "mods"
-    assert resolve_palette("mods") == resolve_palette("catppuccin-mocha")
+    assert resolve_palette("mods") is not None
+    assert resolve_palette("mods") != resolve_palette("catppuccin-mocha")
+    assert resolve_palette("mods")["pink"] == "#ff2a8d"
     monkeypatch.setattr(console_module, "mods_theme", False)
     with patch("unshackle.core.console.random.sample", side_effect=AssertionError("unexpected gradient")):
         assert gradient_text("Plain theme").plain == "Plain theme"
@@ -130,6 +132,16 @@ def test_gradient_log_message_rebuilds_text_keeping_spans() -> None:
     assert transformed.plain == "Login ok"
     # original semantic span is reapplied over the gradient base
     assert any(span.start == 0 and span.end == 5 for span in transformed.spans)
+
+
+def test_gradient_text_defaults_to_bold_for_mods_theme() -> None:
+    text = gradient_text("Bold gradient")
+    assert text.spans[0].style.bold is True
+
+
+def test_gradient_text_respects_explicit_non_bold_style() -> None:
+    text = gradient_text("Normal gradient", style="not bold")
+    assert text.spans[0].style.bold is False
 
 
 def _gradient_log_message_for_test(renderable: object) -> object:

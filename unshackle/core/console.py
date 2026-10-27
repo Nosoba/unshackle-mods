@@ -496,6 +496,8 @@ def gradient_text(
     if colors is not None and not palette:
         raise ValueError("At least one gradient color is required")
     base_style = Style.parse(style) if isinstance(style, str) else (style or Style())
+    if mods_theme and base_style.bold is None:
+        base_style = base_style + Style(bold=True)
     if len(palette) == 1:
         return Text(text, style=base_style + Style(color=palette[0]))
 
@@ -515,7 +517,7 @@ def gradient_text(
         position = 0
         for char in line:
             if char.isspace():
-                result.append(char, base_style)
+                result.append(char)
                 continue
             progress = position / max(visible - 1, 1)
             scaled = progress * (len(stops) - 1)
