@@ -169,8 +169,23 @@ PALETTES: dict[str, dict[str, str]] = {
     },
 }
 
-# Preserve the fork's original Catppuccin colours as a selectable theme.
-PALETTES["mods"] = dict(PALETTES["catppuccin-mocha"])
+# Default high-saturation vibrant neon palette for mods
+PALETTES["mods"] = {
+    "bg": "#12131c",
+    "text": "#ffffff",
+    "text2": "#a0aec0",
+    "black": "#1a1b26",
+    "bright_black": "#565f89",
+    "red": "#ff2a5f",
+    "green": "#00ff88",
+    "yellow": "#ffe600",
+    "blue": "#3894ff",
+    "pink": "#ff2a8d",
+    "cyan": "#00f0ff",
+    "gray": "#718096",
+    "bright_gray": "#cbd5e1",
+    "dark_gray": "#282a36",
+}
 
 ALIASES = {
     "default": DEFAULT_THEME,
