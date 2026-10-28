@@ -1564,11 +1564,12 @@ def extract_manifests(tracks) -> List[Dict[str, Any]]:
 
 
 def extract_track_manifests(tracks) -> List[Dict[str, Any]]:
-    """Build a one-AdaptationSet MPD for each track whose AdaptationSet the served manifest does not contain.
+    """Build a one-AdaptationSet MPD for each track the client cannot find again in the served manifest.
 
     A service can build an AdaptationSet of its own, out of merged segment timelines or
-    copied nodes, that never joins the manifest tree the server serialises. The client's
-    re-parse of that manifest cannot find it, so each of those tracks gets its own MPD.
+    copied nodes, that never joins the manifest tree the server serialises. A service can also
+    build a manifest that holds only its own track, which the client's attribute match cannot
+    tell apart from others. Each of those tracks gets its own MPD, matched by track id.
     """
     import base64
     import zlib
@@ -1587,7 +1588,7 @@ def extract_track_manifests(tracks) -> List[Dict[str, Any]]:
         adaptation_set = dash.get("adaptation_set")
         if manifest is None or adaptation_set is None:
             continue
-        if adaptation_set.getroottree().getroot() is manifest:
+        if adaptation_set.getroottree().getroot() is manifest and len(manifest.findall(".//Representation")) > 1:
             continue
 
         root = etree.Element("MPD", dict(manifest.attrib))
@@ -1759,6 +1760,7 @@ def serialize_video_track(track: Video, include_url: bool = False) -> Dict[str, 
         "closed_captions": list(getattr(track, "closed_captions", None) or []),
         "dv_compatible_bitstream": bool(getattr(track, "dv_compatible_bitstream", False)),
         "hdr10plus": bool(getattr(track, "hdr10plus", False)),
+        "hdr10_base": bool(getattr(track, "hdr10_base", False)),
     }
     result.update(serialize_track_common(track))
     if include_url and hasattr(track, "url") and track.url:
@@ -3669,7 +3671,7 @@ def forwarded_dl_params(data: Dict[str, Any]) -> Dict[str, Any]:
         return None
 
     params: Dict[str, Any] = {}
-    for key in ("lang", "v_lang", "a_lang"):
+    for key in ("lang", "v_lang", "a_lang", "s_lang"):
         langs = str_list(key)
         params[key] = langs if langs is not None else list(cast(List[str], DEFAULT_DOWNLOAD_PARAMS[key]))
     # the dl CLI default is [], and some services test membership in it
@@ -5671,6 +5673,7 @@ async def session_info_handler(session_id: str, request: Optional[web.Request] =
             "service": session.service_tag,
             "valid": True,
             "expires_in": get_session_store().ttl,
+            "draining": get_session_store().draining,
             "track_count": len(session.tracks),
             "title_count": len(session.title_map),
         }

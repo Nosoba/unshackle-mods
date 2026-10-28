@@ -207,6 +207,9 @@ async def health(request: web.Request) -> web.Response:
                   type: string
                   nullable: true
                   example: "1d22a1e"
+                draining:
+                  type: boolean
+                  description: True while the server refuses new sessions before a restart
                 update_check:
                   type: object
                   properties:
@@ -220,7 +223,7 @@ async def health(request: web.Request) -> web.Response:
                       nullable: true
     """
     try:
-        latest_version = await UpdateChecker.check_for_updates(__version__)
+        latest_version = await asyncio.to_thread(UpdateChecker.check_for_updates_sync, __version__)
         update_info = {
             "update_available": latest_version is not None,
             "current_version": __version__,
@@ -230,8 +233,16 @@ async def health(request: web.Request) -> web.Response:
         log.warning(f"Failed to check for updates: {e}")
         update_info = {"update_available": None, "current_version": __version__, "latest_version": None}
 
+    from unshackle.core.api.session_store import get_session_store
+
     return web.json_response(
-        {"status": "ok", "version": __version__, "code_hash": __code_hash__ or None, "update_check": update_info}
+        {
+            "status": "ok",
+            "version": __version__,
+            "code_hash": __code_hash__ or None,
+            "draining": get_session_store().draining,
+            "update_check": update_info,
+        }
     )
 
 
@@ -795,7 +806,7 @@ async def list_tracks(request: web.Request) -> web.Response:
               dl_params:
                 type: object
                 description: |
-                  The dl track selection (lang, v_lang, a_lang, acodec, forced_subs, exact_lang), in the same
+                  The dl track selection (lang, v_lang, a_lang, s_lang, acodec, forced_subs, exact_lang), in the same
                   form as on `/api/session/create`. The service reads it from `ctx.parent.params`.
               credentials:
                 type: object
@@ -1916,6 +1927,11 @@ async def session_create(request: web.Request) -> web.Response:
                     items:
                       type: string
                     default: []
+                  s_lang:
+                    type: array
+                    items:
+                      type: string
+                    default: ["all"]
                   forced_subs:
                     type: boolean
                     default: false
