@@ -1,12 +1,35 @@
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 from enum import Enum
 from typing import Any, Optional, Union
 
 from unshackle.core import binaries
-from unshackle.core.tracks.track import Track
+from unshackle.core.tracks.track import MPEGH_SAMPLE_ENTRIES, Track
+
+# the Dolby DASH channel configuration is the E-AC-3 chanmap (ETSI TS 102 366 Table E.1.4), read from the MSB
+DOLBY_CHANNEL_BITS = (
+    (1, "main"),  # L
+    (1, "main"),  # C
+    (1, "main"),  # R
+    (1, "main"),  # Ls
+    (1, "main"),  # Rs
+    (2, "main"),  # Lc/Rc
+    (2, "main"),  # Lrs/Rrs
+    (1, "main"),  # Cs
+    (1, "height"),  # Ts
+    (2, "main"),  # Lsd/Rsd
+    (2, "main"),  # Lw/Rw
+    (2, "height"),  # Vhl/Vhr
+    (1, "height"),  # Vhc
+    (2, "height"),  # Lts/Rts
+    (1, "lfe"),  # LFE2
+    (1, "lfe"),  # LFE
+)
+
+COUNT_CHANNEL_LAYOUTS: dict[int, float] = {6: 5.1, 7: 6.1, 8: 7.1}
 
 
 class Audio(Track):
@@ -19,8 +42,12 @@ class Audio(Track):
         OGG = "VORB"  # https://wikipedia.org/wiki/Vorbis
         DTS = "DTS"  # https://en.wikipedia.org/wiki/DTS,_Inc.#DTS_Digital_Surround
         DTSX = "DTS-X"  # https://en.wikipedia.org/wiki/DTS,_Inc.#DTS:X
+        DTSHD = "DTS-HD"  # https://en.wikipedia.org/wiki/DTS-HD_Master_Audio
+        MPEGH = "MPEG-H"  # https://en.wikipedia.org/wiki/MPEG-H_3D_Audio
         ALAC = "ALAC"  # https://en.wikipedia.org/wiki/Apple_Lossless_Audio_Codec
         FLAC = "FLAC"  # https://en.wikipedia.org/wiki/FLAC
+        MP3 = "MP3"  # https://en.wikipedia.org/wiki/MP3
+        PCM = "PCM"  # https://en.wikipedia.org/wiki/Pulse-code_modulation
 
         @property
         def extension(self) -> str:
@@ -43,6 +70,10 @@ class Audio(Track):
                 return Audio.Codec.DTSX
             if mime == "dtsc":
                 return Audio.Codec.DTS
+            if mime in ("dtsh", "dtsl", "dtse"):  # High Resolution, Master Audio, Express
+                return Audio.Codec.DTSHD
+            if mime in MPEGH_SAMPLE_ENTRIES:
+                return Audio.Codec.MPEGH
             if mime == "alac":
                 return Audio.Codec.ALAC
             if mime == "flac":
@@ -59,21 +90,6 @@ class Audio(Track):
                     pass
             raise ValueError(f"No MIME types matched any supported Audio Codecs in '{codecs}'")
 
-        @staticmethod
-        def from_netflix_profile(profile: str) -> Audio.Codec:
-            profile = profile.lower().strip()
-            if profile.startswith("heaac") or profile.startswith("xheaac"):
-                return Audio.Codec.AAC
-            if profile.startswith("dd-"):
-                return Audio.Codec.AC3
-            if profile.startswith("ddplus"):
-                return Audio.Codec.EC3
-            if profile.startswith("ac4"):
-                return Audio.Codec.AC4
-            if profile.startswith("playready-oggvorbis"):
-                return Audio.Codec.OGG
-            raise ValueError(f"The Content Profile '{profile}' is not a supported Audio Codec")
-
     def __init__(
         self,
         *args: Any,
@@ -83,7 +99,7 @@ class Audio(Track):
         joc: Optional[int] = None,
         descriptive: Union[bool, int] = False,
         **kwargs: Any,
-    ):
+    ) -> None:
         """
         Make a new Audio track object.
 
@@ -173,14 +189,14 @@ class Audio(Track):
                 bitrate_str += f", {self.estimated_size}"
         return " | ".join(
             filter(
-                bool,
+                None,
                 [
                     "AUD",
                     f"[{self.codec.value}]" if self.codec else None,
                     str(self.language),
                     ", ".join(
                         filter(
-                            bool,
+                            None,
                             [
                                 str(self.channels) if self.channels else None,
                                 "Atmos" if self.atmos else None,
@@ -192,6 +208,7 @@ class Audio(Track):
                     self.formatted_duration,
                     self.get_track_name(),
                     ", ".join(self.edition) if self.edition else None,
+                    self.note,
                 ],
             )
         )
@@ -210,11 +227,9 @@ class Audio(Track):
         It does not convert the value to assume a sub speaker channel layout, e.g. 5.1->6.0.
         """
         if isinstance(channels, str):
-            # TODO: Support all possible DASH channel configurations (https://datatracker.ietf.org/doc/html/rfc8216)
-            if channels.upper() == "A000":
-                return 2.0
-            elif channels.upper() == "F801":
-                return 5.1
+            # a manifest parser decodes a Dolby mask by its scheme; this shape guess serves a service passing one raw
+            if re.fullmatch(r"[0-9A-Fa-f]{4}", channels) and not channels.isdigit():
+                return Audio.dolby_channel_layout(int(channels, 16))
             layout = channels.replace("ch", "")
             if layout.count(".") == 2 and all(part.isdigit() for part in layout.split(".")):
                 return layout
@@ -223,6 +238,29 @@ class Audio(Track):
             raise NotImplementedError(f"Unsupported Channels string value, '{channels}'")
 
         return float(channels)
+
+    @staticmethod
+    def dolby_channel_layout(mask: int) -> Union[float, str]:
+        """Channel layout of a Dolby DASH channel configuration mask, e.g. 0xF801 -> 5.1."""
+        counts = {"main": 0, "lfe": 0, "height": 0}
+        for bit, (count, kind) in enumerate(DOLBY_CHANNEL_BITS):
+            if mask & (0x8000 >> bit):
+                counts[kind] += count
+        if counts["height"]:
+            return f"{counts['main']}.{counts['lfe']}.{counts['height']}"
+        return float(f"{counts['main']}.{counts['lfe']}")
+
+    @staticmethod
+    def channels_from_count(count: Union[str, int, None]) -> Union[float, str, None]:
+        """
+        Channel layout for a bare number of channels, as HLS CHANNELS, Smooth Streaming and most DASH schemes give it.
+
+        A count does not say which channel is the LFE, so 6, 7 and 8 take the 5.1, 6.1 and 7.1 layouts those streams
+        carry in practice. Any other value goes back as-is, for parse_channels to read.
+        """
+        if count is None or (isinstance(count, str) and not count.isdigit()):
+            return count
+        return COUNT_CHANNEL_LAYOUTS.get(int(count), float(count))
 
     @staticmethod
     def channel_total(channels: Union[str, int, float]) -> float:
@@ -256,6 +294,7 @@ class Audio(Track):
             Audio.Codec.FLAC: ".flac",
             Audio.Codec.OPUS: ".opus",
             Audio.Codec.OGG: ".ogg",
+            Audio.Codec.MP3: ".mp3",
         }
         extension = containers.get(self.codec, ".m4a")
         original_path = self.path

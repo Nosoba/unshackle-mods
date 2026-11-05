@@ -119,8 +119,12 @@ either enum **names** or their **values**, comma-separated.
 | `VP8` | `VP8` |
 | `VP9` | `VP9` |
 | `AV1` | `AV1` |
+| `LCEVC` | `LCEVC` |
 
 `H264` and `H265` are aliases of `AVC` and `HEVC`.
+
+An LCEVC (MPEG-5 Part 2) track only adds detail on top of its base video track and cannot play
+alone, so unshackle selects it only when you ask for it with `-v LCEVC`.
 
 ```shell title="Either spelling works"
 unshackle dl -v HEVC   EXAMPLE 81234567
@@ -137,7 +141,7 @@ unshackle dl -v hevc,avc EXAMPLE 81234567
 | `SDR` | Standard dynamic range (default) |
 | `HLG` | Hybrid Log-Gamma |
 | `HDR10` | HDR10 |
-| `HDR10P` | HDR10+ |
+| `HDR10P` | HDR10+ (`-r HDR10+` also works) |
 | `DV` | Dolby Vision |
 | `HYBRID` | Fetch both an HDR10/HDR10+ base and a DV track, then merge them |
 
@@ -145,17 +149,79 @@ unshackle dl -v hevc,avc EXAMPLE 81234567
 unshackle dl -q 2160 -r HDR10,DV EXAMPLE '...'
 ```
 
+`--list` labels a track that carries a second format as `<range>+<format>`:
+
+- The first part is the range that `-r` selects the track by.
+- The second part is the format that the track also carries.
+- The `+` only joins the two parts. unshackle writes HDR10+ as `HDR10P`, so `HDR10+DV` is HDR10 with
+  Dolby Vision, not HDR10+ with Dolby Vision.
+
+| Label | Track | Selected by |
+| --- | --- | --- |
+| `DV+HDR10P` | A Dolby Vision track that also carries HDR10+ | `-r DV` |
+| `HDR10+DV` | An HDR10 track whose frames also carry a Dolby Vision profile 8 RPU | `-r HDR10` |
+| `HDR10P+DV` | An HDR10+ track whose frames also carry a Dolby Vision profile 8 RPU | `-r HDR10P` |
+
+The output file of a track with a Dolby Vision profile 8 RPU plays as Dolby Vision on a DV screen.
+
 !!! warning "HYBRID requires dovi_tool"
     `-r HYBRID` makes a single hybrid track by injecting the Dolby Vision RPU
     metadata onto an HDR10/HDR10+ base layer with **dovi_tool**.
     It requires the `dovi_tool` binary, resolved from unshackle's `binaries/` folder,
-    the `binaries` folder of your user data directory, or your `PATH`. The normal case is a DV track plus an HDR10 or HDR10+ base. With HDR10+
-    and no DV, unshackle converts the HDR10+ metadata to DV instead, which also needs
-    `hdr10plus_tool`. With no DV and no HDR10+, the title fails.
-    When HDR10+ is present, unshackle prefers it over HDR10 as the base layer.
+    the `binaries` folder of your user data directory, or your `PATH`. A hybrid needs a DV track plus an HDR10 or
+    HDR10+ base. With no DV track, the title fails, unless you add `--generate-dv` (see below).
+    When HDR10+ is present, unshackle prefers it over HDR10 as the base layer. The base must be
+    HEVC; a title whose HDR10/HDR10+ tracks are all in another codec fails before it downloads.
+    If the hybrid step fails for one resolution, unshackle logs an error, skips that resolution
+    and goes on with the other resolutions of the title. When no hybrid file at all was made,
+    the title fails.
+
+    A track that is `DV+HDR10P`, `HDR10+DV` or `HDR10P+DV` in `--list` already carries Dolby Vision and an HDR10
+    or HDR10+ base, so it is already a hybrid. At a resolution that has one, `-r HYBRID` selects it
+    and muxes it as it is, with no base track and no dovi_tool step. A track that carries HDR10+
+    comes first, then the highest bitrate (the lowest with `--worst`). The other resolutions get a
+    hybrid that unshackle makes.
 
     To keep an HDR10+ deliverable *alongside* the hybrid, request both ranges:
     `-r HYBRID,HDR10P`. `-r HYBRID` on its own muxes only the merged hybrid.
+
+#### Dolby Vision from HDR10+
+
+When a title has HDR10+ but no DV track, `-r HYBRID --generate-dv` makes a Dolby Vision
+Profile 8.1 track from the HDR10+ metadata. It needs `hdr10plus_tool` as well as `dovi_tool`.
+When a title has a DV track, unshackle uses that track and ignores the flag. When it has none,
+the flag also makes unshackle ask the service for its HDR10+ tracks. A track that the service labels HDR10 but
+that carries HDR10+ metadata also qualifies (see [`hdr10plus_probe`](../reference/configuration/download.md#hdr10plus_probe)).
+
+```shell title="Generate Dolby Vision from HDR10+, and keep the HDR10+ file too"
+unshackle dl -q 2160 -r HYBRID,HDR10P --generate-dv EXAMPLE '...'
+```
+
+Each HDR10+ scene becomes one Dolby Vision shot, with its own scene cut and its own Level 1
+brightness values (peak and average). unshackle calculates the average itself, as a PQ mean of
+the HDR10+ brightness distribution without the letterbox bars. A scene with no black pixels keeps
+its whole frame, so a title that changes aspect ratio is also correct. The `dovi_tool generate
+--hdr10plus-json` average makes most scenes too bright.
+
+The [`generate_dv_mode`](../reference/configuration/download.md#generate_dv_mode) setting in
+`unshackle.yaml` changes how the average is set: `v29` (default), `v40` for the 10-nit floor of studio
+Dolby Vision, or `legacy` for the `dovi_tool` average.
+
+!!! warning "Generated Dolby Vision is not studio Dolby Vision"
+    - There are no colourist trims (Level 2 and Level 8). The TV does all the tone mapping
+      from the Level 1 values.
+    - Dolby Vision does not let the average go below about 2.4 nits (10 nits with
+      `generate_dv_mode: v40`), so a very dark scene reads a little brighter than its pixels.
+    - The HDR10+ tone-mapping curve (Profile B) has no Dolby Vision equivalent. The HDR10+
+      metadata stays in the file, so an HDR10+ TV still reads it.
+    - The result can be no better than the HDR10+ metadata. Profile A metadata is often less
+      reliable than Profile B, and unshackle shows a warning for Profile A.
+    - A TV or player that supports both formats almost always picks Dolby Vision. On such a
+      TV, the generated Dolby Vision replaces the original HDR10+. To keep the original, also
+      request `HDR10P`, as in the example above.
+
+    An HDR10 track that a service labels HDR10 but that carries HDR10+ metadata does not
+    convert. Only a track with the `HDR10P` range does.
 
 ## Bitrate selection
 
@@ -218,8 +284,11 @@ bitrate for the top renditions, overriding the manifest value:
 | `OGG` | `VORB` | Vorbis |
 | `DTS` | `DTS` | DTS |
 | `DTSX` | `DTS-X` | DTS:X Profile 2 (DTS-UHD) |
+| `DTSHD` | `DTS-HD` | DTS-HD High Resolution, Master Audio and Express |
+| `MPEGH` | `MPEG-H` | MPEG-H 3D Audio |
 | `ALAC` | `ALAC` | Apple Lossless |
 | `FLAC` | `FLAC` | FLAC |
+| `MP3` | `MP3` | MPEG-1 Audio Layer III |
 
 unshackle accepts names, values, and a few aliases: `eac3` and `ddp` both give `EC3`,
 and `vorbis` gives `OGG`.
@@ -315,9 +384,9 @@ unshackle dl -l en,-es -vl ja EXAMPLE 81234567
 !!! note "Rules for exclusion tokens"
     - `orig` becomes the title's own original language, so `-sl -orig` drops the
       subtitles in that language.
-    - `--exact-lang` applies to exclusions with the same matching rules as selection:
-      `-es` removes exactly the tracks that `es` would select. Without it, `-es` also
-      removes `es-419` and `es-ES`.
+    - An exclusion without a region removes every regional form: `-es` removes `es-419`
+      and `es-ES`. An exclusion with a region removes only that variant: `-es-419` removes
+      only `es-419`. With `--exact-lang`, `-es` removes only the variant `es` means.
     - Tracks with no language tag are never excluded.
     - unshackle rejects `-all`. Name the languages you do not want instead.
     - The comma form is the documented style. `-sl -es` also works, but a shell can read
@@ -345,9 +414,28 @@ See [`subtitle.language_priority`](../reference/configuration/download.md#subtit
 
 ### Exact vs fuzzy matching
 
-By default language matching is fuzzy: `-l en` also accepts `en-US`, `en-GB`, and the
-other regional forms (up to a small distance). Pass `--exact-lang` when only an exact
-match is acceptable: with it, `-l es-419` selects only `es-419`, not `es-ES`.
+A tag without a region asks for the variant it means: `pt` is Brazilian Portuguese, `es` is
+Spanish from Spain, and `en` is US English. With `pt-PT` and `pt-BR` tracks, `-l pt`
+selects `pt-BR`. If the title has no such variant, the tag takes every regional form, so
+`-l es` on a title with only `es-419` selects `es-419`.
+
+A tag with a region asks for that variant only: `-l es-419` selects `es-419`, never `es-ES`
+or `es-MX`. If the service has no `es-419` track, unshackle reports `es-419 not found` and
+stops. With `--best-available`, it continues with the other languages.
+
+A track without a region matches only the region its language implies. `en` is US English
+and `pt` is Brazilian Portuguese, so `-l en-US` accepts a track tagged `en`, but `-l en-GB`
+and `-l pt-PT` do not accept `en` or `pt`. To take any English track, write `en`.
+
+`--exact-lang` turns off that fallback: a tag without a region then selects only the
+variant it means, so `-l es` does not select `es-419`.
+
+`orig` is the title language that the service gives. It selects that exact variant first,
+so a `fr-CA` title takes `fr-CA` audio over `fr-FR`. When the title has no track in that
+variant, `orig` takes the closest regional form, unless you pass `--exact-lang`.
+
+An exclusion without a region removes every regional form: `-es` drops `es-ES` and `es-419`.
+See the [exclusion rules](#excluding-languages) for `--exact-lang`.
 
 !!! tip "The `all` and `best` tokens"
     For audio, the tokens `all` and `best` bypass the usual one-track-per-language pick
@@ -711,8 +799,23 @@ By default, `mkvmerge` muxes the tracks of a movie or an episode into a single M
 | Flag | Behaviour | Default source |
 | --- | --- | --- |
 | `--no-mux` | Do not mux; keep the individual track files. | - |
+| `--sample` | Download a short sample: 60 seconds from 2 minutes in, or `--sample START-END` for a window in seconds. | - |
+| `--include-sample` | Download the full title, then also cut a 60 second sample from each muxed file into a `Sample` folder. | - |
 | `--split-audio` | Write a separate output file per audio codec instead of merging all audio. | config `muxing.merge_audio` (on) |
 | `--merge-video` | Mux video tracks that share a height, range, and codec into one file, so only language varies inside a file. | config `muxing.merge_video` (off) |
+
+!!! note "`--sample` needs a segmented track"
+    `--sample` downloads only the segments that hold the window, and `mkvmerge` cuts the output
+    to the window. The cut starts at the first video keyframe in the window, so a sample can be
+    some seconds short. unshackle downloads each subtitle track in full and then keeps only the
+    cues of the window.
+
+    The run stops before the download starts in two conditions: a service gives a video or
+    audio track as one file with no segments and no segment index, or the title ends before the
+    window starts.
+
+    A sidecar subtitle file with `sidecar_format: original` is not trimmed. It holds the segments around the
+    window, or the whole file when the track is one file.
 
 !!! note "Music is never muxed"
     A song skips the muxer. unshackle keeps the container that the service
@@ -779,7 +882,7 @@ Three related flags:
 | --- | --- |
 | `--workers N` | Threads used per track for segment downloads. Default depends on the downloader. |
 | `--adaptive-workers` | Opt-in: start the per-track worker count at `--workers`, reduce it when the CDN returns errors, then raise it again while the extra workers add measured throughput. The count never goes above `--workers`. Off by default (fixed worker count). |
-| `--download-processes N` | Opt-in: split a large segment batch across `N` download processes, each with its own worker pool. A single process tops out around 1.3 Gb/s (Python interpreter limit); `2` reaches 2.5GbE line rate on fast CDNs. Only engages for batches of 24+ segments. Ignored while `--speed-limit` (or serve's `global_speed_limit`) is set: the cap is one shared budget, which extra processes cannot share, so the download stays in a single process. Also ignored when the service HTTP session carries state a child process cannot rebuild, such as a custom TLS adapter. The download stays in a single process instead of running with the wrong settings. Default `1`. |
+| `--download-processes N` | Opt-in: split a large segment batch across `N` download processes, each with its own worker pool. A single process tops out around 1.3 Gb/s (Python interpreter limit); `2` reaches 2.5GbE line rate on fast CDNs. Only engages for batches of 24+ segments. Ignored while `--speed-limit` (or serve's `global_speed_limit`) is set: the cap is a per-job budget, which extra processes cannot share, so the download stays in a single process. Also ignored when the service HTTP session carries state a child process cannot rebuild, such as a custom TLS adapter. The download stays in a single process instead of running with the wrong settings. Default `1`. |
 | `--continue-downloads` | Opt-in: keep completed segment files when a download fails so the next run resumes instead of restarting from zero. One-off enable of the [`continue_downloads`](../reference/configuration/download.md#continue_downloads) config option, which documents what can and cannot resume. |
 | `--downloads N` | Number of tracks downloaded concurrently. Default `1`. |
 | `--slow [MIN-MAX]` | Add a delay between titles to look more like a real device. `--slow` alone means 60-120s; `--slow 20-40` sets a custom range. Minimum 20s. |
@@ -810,8 +913,10 @@ unshackle dl --skip-dl EXAMPLE 81234567
 
 `--export` writes a `mediaexport` JSON file into the configured exports directory. It holds
 the manifest, the DRM init data, the content keys, the KIDs of each track and the title
-metadata for each title. `unshackle import` reads it to reconstruct a download later, and gives
-each track only the content keys for its KIDs. The importer also reads the
+metadata for each title. For a DASH or ISM title, it also holds the manifest as the service
+left it, with the ad periods that the service skips. `unshackle import` reads it to reconstruct
+a download later, and gives each track only the content keys for its KIDs. The import uses the
+saved manifest, so it skips the same periods and does not fetch the manifest again. The importer also reads the
 older unshackle `version: 2` files and unidl's own export files.
 
 ```shell title="Export track info and keys"
@@ -884,6 +989,14 @@ The [mediaexport](https://github.com/unshackle-dl/mediaexport) package specifies
     An HLS master playlist gives no language for a video track. When the export gives no
     title language, the video track takes the language of the default audio track. When
     the master playlist gives no audio language either, the import stops with a message.
+
+!!! note "Ad periods a service skipped stay skipped"
+    Some services skip DASH periods, such as ads, by a rule of their own. The export also
+    records the periods the service kept as `content_periods` on each manifest. An import that
+    must fetch the manifest again, because the file has no saved manifest or another tool wrote
+    it, downloads only those periods, also when the new manifest gives an ad period a new ID.
+    When the new manifest has none of the recorded periods, the import logs a warning and keeps
+    every period.
 
 ## Metadata and tagging
 

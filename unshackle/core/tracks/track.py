@@ -1,35 +1,46 @@
 import base64
+import contextlib
 import html
 import logging
 import math
 import re
 import shutil
+import struct
 import subprocess
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Sequence, Union
 from uuid import UUID
 from zlib import crc32
 
+import click
 from langcodes import Language
-from requests import Response, Session
+from requests import Session
 from requests.adapters import HTTPAdapter, Retry
 
 from unshackle.core import binaries
 from unshackle.core.cdm.detect import is_playready_cdm, is_widevine_cdm
 from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, DownloadCancelled
-from unshackle.core.downloaders import requests
-from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
-from unshackle.core.drm.verify import decrypt_track
+from unshackle.core.downloaders.requests import requests
+from unshackle.core.drm import DRM_T, BlowfishStripe, ClearKeyCENC, PlayReady, Widevine
+from unshackle.core.drm.verify import (
+    decrypt_track,
+    has_encrypted_sample_entry,
+    read_top_level_box,
+    senc_protects_samples,
+)
 from unshackle.core.events import events
-from unshackle.core.session import RnetSession
+from unshackle.core.session import MAX_BACKOFF, AnySession, RnetSession, utf8_text
+from unshackle.core.temp import restore_segments, stash_segments
 from unshackle.core.tracks import resume
-from unshackle.core.utilities import get_boxes, log_event, try_ensure_utf8
+from unshackle.core.utilities import get_boxes, language_name, log_event, try_ensure_utf8
+from unshackle.core.utils import run_proxy
 from unshackle.core.utils.subprocess import ffprobe
 
 DRM_PREFERENCE_TYPES: dict[str, Union[type[Widevine], type[PlayReady]]] = {
@@ -40,12 +51,11 @@ DRM_PREFERENCE_TYPES: dict[str, Union[type[Widevine], type[PlayReady]]] = {
 }
 
 
-def direct_session(session: Union[Session, "RnetSession"], proxy: Optional[str] = None) -> Session:
+def direct_session(session: AnySession, proxy: Optional[str] = None) -> Session:
     """requests.Session with copied headers/cookies and no proxy, or only ``proxy`` when given."""
     new = Session()
     if proxy:
-        # requests lets HTTP(S)_PROXY override session proxies, so the env must be ignored for a chosen proxy
-        new.trust_env = False
+        run_proxy.pin(new)
         new.proxies = {"http": proxy, "https": proxy}
     headers = getattr(session, "headers", None)
     if headers is not None:
@@ -55,64 +65,30 @@ def direct_session(session: Union[Session, "RnetSession"], proxy: Optional[str] 
             pass
     cookies = getattr(session, "cookies", None)
     if cookies is not None:
-        jar = getattr(cookies, "jar", None)
+        snapshot = getattr(cookies, "snapshot", None)
         try:
-            new.cookies.update(jar if jar is not None else cookies)
+            if snapshot is None:
+                new.cookies.update(cookies)
+            else:
+                for cookie in snapshot():
+                    new.cookies.set_cookie(copy(cookie))  # set_cookie edits a quoted value in place
         except Exception:
             pass
-        # RnetCookieAdapter.jar holds only cookies that arrived as a CookieJar; the ones set by name or
-        # received from a server live in its domain map, so copy those across too
-        by_domain = getattr(cookies, "get_dict_by_domain", None)
-        if by_domain is not None:
-            try:
-                for domain, named in by_domain().items():
-                    for name, value in named.items():
-                        if name not in new.cookies:
-                            new.cookies.set(name, value, **({"domain": domain} if domain else {}))
-            except Exception:
-                pass
     new.mount(
         "https://",
         HTTPAdapter(
-            max_retries=Retry(total=5, backoff_factor=0.2, status_forcelist=[429, 500, 502, 503, 504]),
+            max_retries=Retry(
+                total=5,
+                backoff_factor=0.2,
+                status_forcelist=[429, 500, 502, 503, 504],
+                retry_after_max=int(MAX_BACKOFF),
+            ),
             pool_maxsize=64,
             pool_block=True,
         ),
     )
     new.mount("http://", new.adapters["https://"])
     return new
-
-
-def read_top_level_box(path: Path, box_type: bytes) -> Optional[bytes]:
-    """Read a single top-level box from an MP4 file.
-
-    This function walks only the box headers, so the wanted box is the only payload it reads into memory.
-    Returns None if the file has no such top-level box, or if a box header is truncated or declares an
-    impossible size.
-    """
-    file_size = path.stat().st_size
-    with path.open("rb") as f:
-        start = 0
-        while start + 8 <= file_size:
-            header = f.read(8)
-            if len(header) < 8:
-                return None
-            size = int.from_bytes(header[:4], "big")
-            if size == 1:
-                large = f.read(8)
-                if len(large) < 8:
-                    return None
-                size = int.from_bytes(large, "big")
-            elif size == 0:
-                size = file_size - start
-            if size < 8:
-                return None
-            if header[4:8] == box_type:
-                f.seek(start)
-                return f.read(size)
-            start += size
-            f.seek(start)
-    return None
 
 
 def iter_top_level_boxes(path: Path) -> Iterable[tuple[bytes, int, int]]:
@@ -201,12 +177,16 @@ def strip_duplicate_init_boxes(src: Path, dst: Path) -> int:
     return dropped
 
 
-def has_dts_uhd_sample_entry(path: Path) -> bool:
-    """True if the MP4 holds a DTS-UHD (DTS:X Profile 2) audio sample entry.
+MPEGH_SAMPLE_ENTRIES = ("mha1", "mha2", "mhm1", "mhm2")
+
+
+def has_mp4_only_audio_entry(path: Path) -> bool:
+    """True if the MP4 holds a DTS-UHD (DTS:X Profile 2) or MPEG-H audio sample entry.
 
     Matroska has no CodecID for DTS-UHD, so mkvmerge stores it as an A_QUICKTIME
-    passthrough and every reader reports the container fallback instead of the codec. A
-    file this returns True for has to go into MP4 to keep its codec readable.
+    passthrough and every reader reports the container fallback instead of the codec.
+    mkvmerge drops an MPEG-H track completely. A file this returns True for has to go
+    into MP4 to keep its audio.
 
     Only "dtsx"/"dtsy" mean DTS-UHD. DTS:X Profile 1 rides inside DTS-HD Master Audio as
     "dtsc"/"dtse"/"dtsh"/"dtsl", which Matroska maps to A_DTS and stores properly, so it
@@ -222,7 +202,7 @@ def has_dts_uhd_sample_entry(path: Path) -> bool:
         return False
     if not moov:
         return False
-    for tok in (b"dtsx", b"dtsy"):
+    for tok in (b"dtsx", b"dtsy", *(entry.encode() for entry in MPEGH_SAMPLE_ENTRIES)):
         i = moov.find(tok, 4)
         while i != -1:
             size = int.from_bytes(moov[i - 4 : i], "big")
@@ -230,45 +210,6 @@ def has_dts_uhd_sample_entry(path: Path) -> bool:
                 return True
             i = moov.find(tok, i + 1)
     return False
-
-
-def has_encrypted_sample_entry(path: Path) -> bool:
-    """True if the MP4's moov still carries an encrypted sample entry (encv/enca).
-
-    A faithful decrypt rewrites encv/enca back to the real codec 4CC through frma, so a
-    survivor means the decrypt tool skipped/failed the track. This is a 4CC scan
-    scoped to the moov box (where sample entries live), not a structural parse.
-    The scoping avoids chance byte collisions in mdat. Any read error -> False.
-    """
-    try:
-        moov = read_top_level_box(path, b"moov")
-    except OSError:
-        return False
-    if not moov:
-        return False
-    for tok in (b"encv", b"enca"):
-        i = moov.find(tok, 4)
-        while i != -1:
-            # require a plausible sample-entry box size right before the 4CC
-            size = int.from_bytes(moov[i - 4 : i], "big")
-            if 16 <= size <= len(moov) - (i - 4):
-                return True
-            i = moov.find(tok, i + 1)
-    return False
-
-
-def senc_protects_samples(buf: bytes, body: int, end: int) -> bool:
-    """True if a senc/PIFF-uuid box describes protected samples.
-
-    An empty senc (sample_count 0) sits on a genuinely clear fragment, so treating it as
-    a skipped one would raise on a healthy file. Field order follows
-    read_per_sample_iv_size.
-    """
-    flags = int.from_bytes(buf[body + 1 : body + 4], "big")
-    pos = body + 4 + (20 if flags & 0x1 else 0)  # PIFF override: AlgorithmID(3)+IV_size(1)+KID(16)
-    if pos + 4 > end:
-        return False
-    return int.from_bytes(buf[pos : pos + 4], "big") > 0
 
 
 def moof_still_encrypted(moof: bytes) -> bool:
@@ -359,10 +300,39 @@ def assert_fragments_decrypted(path: Path) -> None:
             first_offset=first_offset,
         )
         raise ValueError(
-            f"{path.name}: {surviving}/{total} fragment(s) still encrypted after decryption (first at "
-            f"byte {first_offset}). The decrypt tool skipped them silently, so check "
-            f"tfhd.sample_description_index against the stsd entry count in the init segment."
+            f"{path.name}: {surviving}/{total} fragment(s) still encrypted after decryption, first at byte {first_offset}"
         )
+
+
+SAMPLE_PROBE_BYTES = 64 * 1024
+SAMPLE_PROBE_LIMIT = 8 * 1024 * 1024
+
+
+def parse_sidx(data: bytes, offset: int) -> tuple[int, list[tuple[int, int, int]]]:
+    """Read a ``sidx`` box that starts at byte ``offset`` of its file.
+
+    Returns the timescale and one (start time, first byte, last byte) for each subsegment. The list
+    is empty when the box is not a ``sidx`` or when it points at more indexes and not at media.
+    """
+    # read by hand: pymp4's Box.parse gives wrong results when two threads parse at once
+    size, header = int.from_bytes(data[:4], "big"), 32 if data[8:9] == b"\x00" else 40
+    count = int.from_bytes(data[header - 2 : header], "big")
+    if data[4:8] != b"sidx" or len(data) < header or min(size, len(data)) < header + 12 * count:
+        return 0, []
+    if header == 32:
+        timescale, start, first_offset = struct.unpack_from(">III", data, 16)
+    else:
+        timescale, start, first_offset = struct.unpack_from(">IQQ", data, 16)
+    byte = offset + size + first_offset
+    subsegments: list[tuple[int, int, int]] = []
+    for i in range(count):
+        word, duration = struct.unpack_from(">II", data, header + 12 * i)
+        if word >> 31:
+            return 0, []
+        subsegments.append((start, byte, byte + (word & 0x7FFFFFFF) - 1))
+        start += duration
+        byte += word & 0x7FFFFFFF
+    return timescale, subsegments
 
 
 @dataclass
@@ -372,7 +342,7 @@ class DownloadContext:
     save_path: Path
     save_dir: Path
     progress: partial
-    session: Optional[Union[Session, "RnetSession"]] = None
+    session: Optional[AnySession] = None
     proxy: Optional[str] = None
     max_workers: Optional[int] = None
     adaptive_workers: bool = False
@@ -380,11 +350,11 @@ class DownloadContext:
     license_widevine: Optional[Callable] = None
     cdm: Optional[object] = None
 
-    def ensure_session(self) -> Union[Session, "RnetSession"]:
+    def ensure_session(self) -> AnySession:
         """Return the HTTP session, or a new ``Session`` if none was set."""
         session = self.session
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
         elif not isinstance(session, (Session, RnetSession)):
             raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {session!r}")
         return session
@@ -397,6 +367,8 @@ class Track:
         DASH = 3  # https://en.wikipedia.org/wiki/Dynamic_Adaptive_Streaming_over_HTTP
         ISM = 4  # https://learn.microsoft.com/en-us/silverlight/smooth-streaming
 
+    sample_tail = 0
+
     def __init__(
         self,
         url: Union[str, list[str]],
@@ -407,7 +379,8 @@ class Track:
         name: Optional[str] = None,
         drm: Optional[Iterable[DRM_T]] = None,
         edition: Optional[str] = None,
-        session: Optional[Union[Session, "RnetSession"]] = None,
+        note: Optional[str] = None,
+        session: Optional[AnySession] = None,
         downloader: Optional[Callable] = None,
         downloader_args: Optional[dict] = None,
         from_file: Optional[Path] = None,
@@ -432,7 +405,9 @@ class Track:
             raise TypeError(f"Expected id_ to be a {str}, not {type(id_)}")
         if not isinstance(edition, (str, list, type(None))):
             raise TypeError(f"Expected edition to be a {str}, {list}, or None, not {type(edition)}")
-        if not isinstance(downloader, (Callable, type(None))):
+        if not isinstance(note, (str, type(None))):
+            raise TypeError(f"Expected note to be a {str}, not {type(note)}")
+        if downloader is not None and not callable(downloader):
             raise TypeError(f"Expected downloader to be a {Callable}, not {type(downloader)}")
         if not isinstance(downloader_args, (dict, type(None))):
             raise TypeError(f"Expected downloader_args to be a {dict}, not {type(downloader_args)}")
@@ -445,7 +420,7 @@ class Track:
         if duration is not None and (duration < 0 or not math.isfinite(duration)):
             raise ValueError(f"Expected duration to be a finite, non-negative number, not {duration!r}")
 
-        invalid_urls = ", ".join(set(type(x) for x in url if not isinstance(x, str)))
+        invalid_urls = ", ".join({str(type(x)) for x in url if not isinstance(x, str)})
         if invalid_urls:
             raise TypeError(f"Expected all items in url to be a {str}, but found {invalid_urls}")
 
@@ -460,7 +435,7 @@ class Track:
 
         self.path: Optional[Path] = None
         self.url = url
-        self.language = Language.get(language)
+        self.language = language
         self.is_original_lang = is_original_lang
         self.descriptor = descriptor
         self.needs_repack = needs_repack
@@ -468,6 +443,7 @@ class Track:
         self.drm = drm
         self._drm_preference: Optional[str] = None
         self.edition: list[str] = [edition] if isinstance(edition, str) else (edition or [])
+        self.note = note
         self.session = session
         self.downloader = downloader
         self.downloader_args = downloader_args
@@ -477,26 +453,10 @@ class Track:
         self.extra: Any = extra or {}  # allow anything for extra, but default to a dict
         self.duration = float(duration) if duration is not None else None
 
-        if self.name is None:
-            lang = Language.get(self.language)
-            if (lang.language or "").lower() == (lang.territory or "").lower():
-                lang.territory = None
-            reduced = lang.simplify_script()
-            extra_parts = []
-            if reduced.script is not None:
-                script = reduced.script_name(max_distance=25)
-                if script and script != "Zzzz":
-                    extra_parts.append(script)
-            if reduced.territory is not None:
-                territory = reduced.territory_name(max_distance=25)
-                if territory and territory != "ZZ":
-                    territory = territory.removesuffix(" SAR China")
-                    extra_parts.append(territory)
-            self.name = ", ".join(extra_parts) or None
-
         if not id_:
             this = copy(self)
-            this.url = self.url.rsplit("?", maxsplit=1)[0]
+            if isinstance(self.url, str):
+                this.url = self.url.rsplit("?", maxsplit=1)[0]
             checksum = crc32(repr(this).encode("utf8"))
             id_ = hex(checksum)[2:]
 
@@ -504,6 +464,76 @@ class Track:
 
         # TODO: Currently using OnFoo event naming, change to just segment_filter
         self.OnSegmentFilter: Optional[Callable] = None
+        self.sample_start: float = 0.0
+        self.sample_bytes: Optional[tuple[bytes, str]] = None
+
+    def sample_slice(
+        self, starts: Sequence[float], timescale: float = 1, window: Optional[tuple[int, int]] = None
+    ) -> slice:
+        """Return the slice of segments that hold ``window``, from the start time of each segment.
+
+        Sets ``sample_start`` to the start time of the first kept segment, in seconds. A video keeps
+        ``sample_tail`` segments after the window: mkvmerge ends the cut only at a video keyframe, and
+        with no such keyframe the audio and the subtitles continue to their own end.
+        """
+        self.sample_start = 0.0
+        if not window or not starts:
+            return slice(None)
+        low, high = (starts[0] + seconds * timescale for seconds in window)
+        if low > starts[-1] and len(starts) > 1:
+            raise click.ClickException("The title ends before the sample window starts, use an earlier --sample window")
+        first = max(bisect_right(starts, low) - 1, 0)
+        self.sample_start = (starts[first] - starts[0]) / timescale
+        return slice(first, max(bisect_left(starts, high) + self.sample_tail, first + 1))
+
+    def sample_byte_range(self, session: AnySession) -> Optional[tuple[bytes, str]]:
+        """Find the bytes of a one-file track that hold the sample window.
+
+        Reads the start of the file for a ``sidx`` box. Returns the bytes before that box, which hold
+        the init data, and the byte range of the window. Returns None when the file has no such index.
+        """
+        if self.sample_bytes or not isinstance(self.url, str):
+            return self.sample_bytes
+        url = self.url
+        head = b""
+
+        def read_to(end: int) -> None:
+            nonlocal head
+            if end > len(head):
+                res = session.get(url, headers={"Range": f"bytes={len(head)}-{end - 1}"})
+                if res.ok:
+                    head += res.content
+
+        pos = 0
+        while pos < SAMPLE_PROBE_LIMIT:
+            if pos + 8 > len(head):
+                read_to(pos + SAMPLE_PROBE_BYTES)
+            if pos + 8 > len(head):
+                return None
+            size, kind = struct.unpack(">I4s", head[pos : pos + 8])
+            if size < 8:
+                return None
+            if kind != b"sidx":
+                pos += size
+                continue
+            read_to(pos + size)
+            timescale, subsegments = parse_sidx(head[pos : pos + size], pos)
+            if not subsegments:
+                return None
+            kept = subsegments[self.sample_slice([start for start, _, _ in subsegments], timescale, config.sample)]
+            self.sample_bytes = head[:pos], f"{kept[0][1]}-{kept[-1][2]}"
+            return self.sample_bytes
+        return None
+
+    def can_sample(self, session: AnySession) -> bool:
+        """Return False when a sample cannot cut this track, because it is one file with no segment index."""
+        if self.descriptor == self.Descriptor.URL:
+            return bool(self.sample_byte_range(session))
+        if self.descriptor == self.Descriptor.DASH:
+            from unshackle.core.manifests import DASH
+
+            return DASH.has_segment_timing(self)
+        return True
 
     def __repr__(self) -> str:
         return "{name}({items})".format(
@@ -512,6 +542,16 @@ class Track:
 
     def __eq__(self, other: Any) -> bool:
         return isinstance(other, Track) and self.id == other.id
+
+    @property
+    @property
+    def language(self) -> Language:
+        """The language the service tagged, parsed even when a service assigns a string or None later."""
+        return self._language
+
+    @language.setter
+    def language(self, value: Union[Language, str, None]) -> None:
+        self._language = Language.get(value or "und")
 
     @property
     def formatted_duration(self) -> Optional[str]:
@@ -635,7 +675,7 @@ class Track:
 
     def download(
         self,
-        session: Union[Session, "RnetSession"],
+        session: AnySession,
         prepare_drm: partial,
         max_workers: Optional[int] = None,
         progress: Optional[partial] = None,
@@ -645,14 +685,18 @@ class Track:
         proxy_download: Optional[str] = None,
         adaptive_workers: bool = False,
         download_processes: int = 1,
-    ):
+    ) -> None:
         """Download and optionally Decrypt this Track.
 
         For a URL-descriptor Video or Audio track with no `drm` set, unshackle probes the DRM from the
         track's init data and stores it on the track, so a service need not declare `drm` itself.
         """
         from unshackle.core.manifests import DASH, HLS, ISM
+        from unshackle.core.tracks.audio import Audio
+        from unshackle.core.tracks.subtitle import Subtitle
+        from unshackle.core.tracks.video import Video
 
+        assert isinstance(self, (Video, Audio, Subtitle)) and progress is not None
         if DOWNLOAD_LICENCE_ONLY.is_set():
             progress(downloaded="[yellow]SKIPPING")
 
@@ -675,7 +719,8 @@ class Track:
 
         track_type = self.__class__.__name__
         save_path = config.directories.temp / f"{track_type}_{self.id}.mp4"
-        if track_type == "Subtitle":
+        if isinstance(self, Subtitle):
+            assert self.codec
             save_path = save_path.with_suffix(f".{self.codec.extension}")
 
         if self.descriptor != self.Descriptor.URL:
@@ -691,11 +736,23 @@ class Track:
                 if keep_segments:
                     if save_dir.exists():
                         for partial in save_dir.rglob("*.!dev"):
+                            partial.with_name(partial.name.removesuffix(".!dev")).unlink(missing_ok=True)
                             partial.unlink(missing_ok=True)
                 else:
                     if save_dir.exists():
                         shutil.rmtree(save_dir)
                     resume.clear_sidecar(save_dir)
+
+        def abandon() -> None:
+            """Clean up a failed or cancelled download and stash its segments when resume is on.
+
+            The downloader does not wait for its workers on failure, so on Windows one can still hold a
+            .!dev file open (WinError 32). A cleanup error must not replace the download's own error.
+            """
+            with contextlib.suppress(OSError):
+                cleanup()
+            if keep_segments:
+                stash_segments(save_dir)
 
         if not DOWNLOAD_LICENCE_ONLY.is_set():
             if config.directories.temp.is_file():
@@ -705,10 +762,12 @@ class Track:
 
             # completed segments are reusable once the parser proves the segmentation
             # unchanged (resume sidecar); partial .!dev files never survive a run boundary
+            if keep_segments:
+                restore_segments(save_dir)
             cleanup()
 
         try:
-            manifest_parsers = {
+            manifest_parsers: dict[Track.Descriptor, Union[type[DASH], type[HLS], type[ISM]]] = {
                 self.Descriptor.HLS: HLS,
                 self.Descriptor.DASH: DASH,
                 self.Descriptor.ISM: ISM,
@@ -754,8 +813,8 @@ class Track:
                                     log.debug("No Widevine or PlayReady PSSH was found for this track, is it DRM free?")
 
                     if self.drm:
-                        track_kid = self.get_key_id(session=session)
                         drm = self.get_drm_for_cdm(cdm)
+                        track_kid = None if isinstance(drm, BlowfishStripe) else self.get_key_id(session=session)
                         if isinstance(drm, Widevine):
                             if not prepare_drm:
                                 raise ValueError("prepare_drm func must be supplied to use Widevine DRM")
@@ -780,8 +839,17 @@ class Track:
                     if DOWNLOAD_LICENCE_ONLY.is_set():
                         progress(downloaded="[yellow]SKIPPED")
                     else:
+                        sample_range = None
+                        if config.sample and track_type in ("Video", "Audio"):
+                            sample_range = self.sample_byte_range(dl_session)
+                            if not sample_range:
+                                raise click.ClickException(
+                                    "--sample cannot cut this track: it is one file with no segment index."
+                                )
                         for status_update in self.downloader(
-                            urls=self.url,
+                            urls=[{"url": self.url, "headers": {"Range": f"bytes={sample_range[1]}"}}]
+                            if sample_range
+                            else self.url,
                             output_dir=save_path.parent,
                             filename=save_path.name,
                             headers=dl_session.headers,
@@ -799,13 +867,22 @@ class Track:
                                     status_update["downloaded"] = f"URL {downloaded}"
                                 progress(**status_update)
 
+                        if sample_range:
+                            media_path = save_path.with_name(f"{save_path.name}.media")
+                            save_path.replace(media_path)
+                            with save_path.open("wb") as joined, media_path.open("rb") as media:
+                                joined.write(sample_range[0])
+                                shutil.copyfileobj(media, joined)
+                            media_path.unlink()
+
                         self.path = save_path
                         events.emit(events.Types.TRACK_DOWNLOADED, track=self)
 
                         if drm:
                             progress(downloaded="Decrypting", completed=0, total=None)
                             decrypt_track(drm, save_path, prepare_drm, track_kid)
-                            assert_fragments_decrypted(save_path)
+                            if not isinstance(drm, BlowfishStripe):
+                                assert_fragments_decrypted(save_path)
                             self.drm = None
                             events.emit(events.Types.TRACK_DECRYPTED, track=self, drm=drm, segment=None)
                             progress(downloaded="Decrypted", completed=100, total=100)
@@ -814,7 +891,7 @@ class Track:
                             if has_encrypted_sample_entry(save_path):
                                 self.needs_repack = True
 
-                        if track_type == "Subtitle" and self.codec.name not in ("fVTT", "fTTML"):
+                        if isinstance(self, Subtitle) and self.codec and self.codec.name not in ("fVTT", "fTTML"):
                             track_data = self.path.read_bytes()
                             track_data = try_ensure_utf8(track_data)
                             track_data = (
@@ -837,21 +914,19 @@ class Track:
                     progress(downloaded="[red]FAILED")
                     raise
         except DownloadCancelled:
-            try:
-                cleanup()
-            except OSError:
-                pass
+            abandon()
             progress(downloaded="[yellow]SKIPPED")
             return
         except (Exception, KeyboardInterrupt):
             if not DOWNLOAD_LICENCE_ONLY.is_set():
-                cleanup()
+                abandon()
             raise
 
         if DOWNLOAD_CANCELLED.is_set():
             return
 
         if not DOWNLOAD_LICENCE_ONLY.is_set():
+            assert self.path is not None
             if self.path.stat().st_size <= 3:  # Empty UTF-8 BOM == 3 bytes
                 raise IOError("Download failed, the downloaded file is empty.")
 
@@ -909,7 +984,11 @@ class Track:
             "needs_repack": self.needs_repack,
             "name": self.name,
             "edition": self.edition,
+<<<<<<< HEAD
             "duration": self.duration,
+=======
+            "note": self.note,
+>>>>>>> upstream/dev
         }
         return data
 
@@ -928,6 +1007,7 @@ class Track:
             "needs_repack": data.get("needs_repack", False),
             "name": data.get("name"),
             "edition": data.get("edition") or None,
+            "note": data.get("note"),
             "id_": data.get("id"),
             "duration": data.get("duration"),
         }
@@ -940,15 +1020,43 @@ class Track:
         from unshackle.core.tracks.video import Video
 
         track_type = data.get("type")
-        builders = {"Video": Video, "Audio": Audio, "Subtitle": Subtitle}
+        builders: dict[Optional[str], type[Track]] = {"Video": Video, "Audio": Audio, "Subtitle": Subtitle}
         builder = builders.get(track_type)
         if builder is None:
             raise ValueError(f"Cannot reconstruct unsupported track type: {track_type!r}")
         return builder.from_dict(data)
 
+    @property
+    def mux_language(self) -> Language:
+        """The language tag written to the output file."""
+        return self.language
+
+    def embedded_audio_name(self) -> str:
+        """Name the audio a service keeps inside this track's file, by its language when the service set none."""
+        lang = self.data["audio_language"]
+        name = self.data.get("audio_language_name")
+        if not name and config.muxing.get("track_names") != "none":
+            name = language_name(Language.get(lang)) or lang
+        return self.with_original_label(name) or ""
+
     def get_track_name(self) -> Optional[str]:
-        """Get the Track Name."""
-        return self.name
+        """Get the Track Name, or the name of its language when the service set none."""
+        name = self.name
+        if name is None and config.muxing.get("track_names") != "none":
+            name = language_name(self.mux_language)
+        return self.with_original_label(name)
+
+    def with_original_label(self, name: Optional[str]) -> Optional[str]:
+        """Add `muxing.original_label` to the name of a track in the title's original language,
+        unless the name already contains the label's words."""
+        label = config.muxing.get("original_label")
+        label = label.strip() if isinstance(label, str) else ""
+        if not label or not self.is_original_lang:
+            return name
+        words = re.sub(r"[\W_]+", " ", label).strip() or label
+        if name and words.casefold() in name.casefold():
+            return name
+        return f"{name} {label}" if name else label
 
     def get_drm_for_cdm(self, cdm: Optional[object]) -> Optional[DRM_T]:
         """Return the DRM matching the provided CDM, if available."""
@@ -971,9 +1079,9 @@ class Track:
                 playready[0].absorb(*playready[1:])
                 return playready[0]
 
-        return self.drm[0]
+        return next(iter(self.drm))
 
-    def get_key_id(self, init_data: Optional[bytes] = None, *args, **kwargs) -> Optional[UUID]:
+    def get_key_id(self, init_data: Optional[bytes] = None, *args: Any, **kwargs: Any) -> Optional[UUID]:
         """
         Probe the DRM encryption Key ID (KID) for this specific track.
 
@@ -1013,8 +1121,9 @@ class Track:
                 tenc = uuid_box.data
                 if tenc.key_ID.int != 0:
                     return tenc.key_ID
+        return None
 
-    def load_drm_if_needed(self, service=None) -> bool:
+    def load_drm_if_needed(self, service: Optional[Any] = None) -> bool:
         """
         Load DRM information for this track if the parser deferred it.
 
@@ -1059,12 +1168,11 @@ class Track:
             from pywidevine.cdm import Cdm as WidevineCdm
             from pywidevine.pssh import PSSH as WV_PSSH
 
-            session = getattr(self, "session", None) or Session()
+            session = getattr(self, "session", None) or run_proxy.fallback_session()
+            assert isinstance(self.url, str)
 
             response = session.get(self.url)
-            if isinstance(response, Response):
-                response.encoding = response.encoding or "utf-8"
-            playlist = m3u8.loads(response.text, self.url)
+            playlist = m3u8.loads(utf8_text(response), self.url)
 
             drm_list = []
 
@@ -1075,11 +1183,11 @@ class Track:
                 fmt = key.keyformat.lower()
                 if fmt == WidevineCdm.urn:
                     pssh_b64 = key.uri.split(",")[-1]
-                    drm = Widevine(pssh=WV_PSSH(pssh_b64))
+                    drm: DRM_T = Widevine(pssh=WV_PSSH(pssh_b64))
                     drm_list.append(drm)
                 elif fmt in {f"urn:uuid:{PR_PSSH.SYSTEM_ID}", "com.microsoft.playready"}:
                     pssh_b64 = key.uri.split(",")[-1]
-                    drm = PlayReady(pssh=PR_PSSH(pssh_b64), pssh_b64=pssh_b64)
+                    drm = PlayReady.from_pssh_b64(pssh_b64)
                     drm_list.append(drm)
 
             if drm_list:
@@ -1097,7 +1205,7 @@ class Track:
         maximum_size: int = 20000,
         url: Optional[str] = None,
         byte_range: Optional[str] = None,
-        session: Optional[Session] = None,
+        session: Optional[AnySession] = None,
     ) -> bytes:
         """
         Get the Track's initial segment data.
@@ -1133,12 +1241,12 @@ class Track:
         if not url:
             if self.descriptor != self.Descriptor.URL:
                 raise ValueError(f"An explicit URL must be provided for {self.descriptor.name} tracks")
-            if not self.url:
+            if not self.url or not isinstance(self.url, str):
                 raise ValueError("An explicit URL must be provided as the track has no URL")
             url = self.url
 
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
 
         content_length = maximum_size
 
@@ -1160,6 +1268,7 @@ class Track:
             if range_test.status_code == 206:
                 byte_range = f"0-{content_length - 1}"
 
+        init_data: Optional[bytes]
         if byte_range:
             res = session.get(url=url, headers={"Range": f"bytes={byte_range}"})
             res.raise_for_status()
@@ -1192,15 +1301,16 @@ class Track:
         if not self.path or not self.path.exists():
             raise ValueError("Cannot repackage a Track that has not been downloaded.")
 
-        if not binaries.FFMPEG:
+        ffmpeg_bin = binaries.FFMPEG
+        if not ffmpeg_bin:
             raise EnvironmentError('FFmpeg executable "ffmpeg" was not found but is required for this call.')
 
         original_path = self.path
         output_path = original_path.with_stem(f"{original_path.stem}_repack")
 
-        def ffmpeg(extra_args: list[str] = None, bsf: Optional[str] = None):
-            args = [
-                binaries.FFMPEG,
+        def ffmpeg(extra_args: Optional[list[str]] = None, bsf: Optional[str] = None) -> None:
+            args: list[Union[str, Path]] = [
+                ffmpeg_bin,
                 "-nostdin",
                 "-hide_banner",
                 "-loglevel",
@@ -1212,7 +1322,7 @@ class Track:
 
             if hasattr(self, "data") and self.data.get("audio_language"):
                 audio_lang = self.data["audio_language"]
-                audio_name = self.data.get("audio_language_name", audio_lang)
+                audio_name = self.embedded_audio_name()
                 args.extend(
                     [
                         "-metadata:s:a:0",

@@ -79,6 +79,9 @@ class EXAMPLE(Service):
     # ANIME: this catalogue is anime, so metadata lookups ask AniList first. Set it False (the
     # default) on a mixed catalogue and flag the anime titles individually in get_titles().
     ANIME = True
+    # ANONYMOUS_SEARCH: set True only when search() needs no login and no state from
+    # authenticate(). A search then skips the cookie load, authenticate() and the cookie save.
+    ANONYMOUS_SEARCH = False
     # VAULT_TAG: store/read keys under a different vault namespace than this service's tag.
     # Lets sibling services share one key vault. Omit to use the service's own tag.
     VAULT_TAG = "DIFFERENT_NAME"
@@ -107,7 +110,7 @@ class EXAMPLE(Service):
     def cli(ctx: click.Context, **kwargs: Any) -> EXAMPLE:
         return EXAMPLE(ctx, **kwargs)
 
-    def __init__(self, ctx: click.Context, title: str, movie: bool, device: str):
+    def __init__(self, ctx: click.Context, title: str, movie: bool, device: str) -> None:
         # Store CLI args BEFORE super().__init__ if the base needs them; here order
         # doesn't matter, but storing first is the common convention.
         self.title = title
@@ -373,11 +376,6 @@ class EXAMPLE(Service):
             # The manifest can't always be trusted for range - stamp what we asked for.
             video.range = range_
 
-            # HDR10+ is a BITSTREAM feature the manifest often labels as plain HDR10.
-            # If this service is known to ship HDR10+ SEI, flip it so mediainfo agrees.
-            if range_ == Video.Range.HDR10P:
-                video.range = Video.Range.HDR10P
-
             # DV-composite: a stream carrying DV RPU NALs inside a container that only
             # signals HEVC. Setting this flag makes DVFixup round-trip the bitstream
             # through dovi_tool so the muxed MKV is recognised as Dolby Vision.
@@ -390,9 +388,6 @@ class EXAMPLE(Service):
         # Drop "clear"/unencrypted decoy renditions the API sometimes returns.
         tracks.audio = [a for a in tracks.audio if "clear" not in (a.data["dash"]["representation"].get("id") or "")]
         for audio in tracks.audio:
-            # Normalize odd channel counts (6.0 -> 5.1) for correct filename tokens.
-            if audio.channels == 6.0:
-                audio.channels = 5.1
             # Mark descriptive / audio-description tracks from the AdaptationSet label.
             label = audio.data["dash"]["adaptation_set"].get("label") or ""
             if "Audio Description" in label or "description" in label.lower():
@@ -401,10 +396,11 @@ class EXAMPLE(Service):
             # tells us explicitly we can set it eagerly.
             if audio.data.get("isAtmos"):
                 audio.joc = 16
-            # is_original_lang was set by to_tracks (via the language= arg). Use it to
-            # label the original audio so it reads "Original" in selection/output.
-            if audio.is_original_lang:
-                audio.name = "Original"
+            # Leave audio.name unset: core names the track from its language and writes
+            # is_original_lang (set by to_tracks) as the original flag. Set a name only
+            # for what the language tag cannot say, such as a commentary track.
+            if "commentary" in label.lower():
+                audio.name = "Commentary"
 
         # Subtitles built by hand (not via to_tracks) skip the parser's is_original_lang
         # pass, so determine it ourselves with the same helper the parser uses.

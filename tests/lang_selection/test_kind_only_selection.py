@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 import pytest
 
@@ -77,9 +77,16 @@ class FakeService:
         raise AttributeError(name)
 
 
-def run(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, episodes: dict, **flags: Any) -> Any:
+def run(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    episodes: dict,
+    service: Optional[FakeService] = None,
+    **flags: Any,
+) -> Any:
     """Return the Selected ids, the exit code, or None for a run that completes."""
     monkeypatch.setattr(Tracks, "tree", lambda self, *a, **k: (_ for _ in ()).throw(Selected(self)))
+    monkeypatch.setattr("unshackle.core.providers.search_metadata", lambda *a, **k: None)
     cmd = Harness.__new__(Harness)
     cmd.log = logging.getLogger("test_kind_only")
     cmd.service = "FAKE"
@@ -95,7 +102,7 @@ def run(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, episo
     kwargs.update(flags)
     caplog.set_level(logging.WARNING, logger="test_kind_only")
     try:
-        cmd.result(cast(Service, FakeService(episodes)), **kwargs)
+        cmd.result(cast(Service, service or FakeService(episodes)), **kwargs)
     except Selected as sel:
         return sel.ids
     except SystemExit as exc:
@@ -147,3 +154,21 @@ def test_a_multi_title_run_with_every_title_skipped_completes(
 ) -> None:
     assert run(monkeypatch, caplog, {1: {}, 2: {}}, forced_subs_only=True) is None
     assert caplog.text.count("Skipping Show S01E") == 2
+
+
+class LcevcService(FakeService):
+    """A 540p base video and the 1080p LCEVC enhancement layer that decodes on top of it."""
+
+    def get_tracks(self, title: Episode) -> Tracks:
+        tracks = super().get_tracks(title)
+        tracks.videos[0].height = 540
+        tracks.add(Video(id_="lcevc", url="https://x/l", language="en", codec=Video.Codec.LCEVC, height=1080))
+        return tracks
+
+
+def test_an_lcevc_layer_is_left_out_unless_asked_for(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert run(monkeypatch, caplog, {1: {}}, service=LcevcService({1: {}}))["video"] == ["v"]
+    asked = run(monkeypatch, caplog, {1: {}}, service=LcevcService({1: {}}), vcodec=[Video.Codec.LCEVC])
+    assert asked["video"] == ["lcevc"]

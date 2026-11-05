@@ -16,7 +16,8 @@ from typing import Any, Callable, Dict
 from uuid import uuid4
 
 from unshackle.core.api.input_bridge import AUTH_INPUT_TIMEOUT
-from unshackle.core.console import set_prompt_handler
+from unshackle.core.console import set_notice_handler, set_prompt_handler
+from unshackle.core.downloaders import format_speed, set_speed_limit
 
 from .download_manager import perform_download
 
@@ -64,7 +65,7 @@ def relay_prompts(progress_callback: Callable[[Dict[str, Any]], None]) -> None:
     The parent writes each answer as one JSON string per line, so an answer can hold a newline. The reader
     uses unbuffered stdin: a daemon thread blocked in ``sys.stdin.buffer`` aborts the interpreter at shutdown.
     Prompts go out one at a time, and a prompt discards answers that arrived before it, such as a late
-    answer to a prompt that timed out.
+    answer to a prompt that timed out. A show_notice() message goes out as ``notice`` progress and needs no answer.
     """
     answers: queue.Queue[str] = queue.Queue()
     one_prompt = threading.Lock()
@@ -92,6 +93,16 @@ def relay_prompts(progress_callback: Callable[[Dict[str, Any]], None]) -> None:
                 progress_callback({"input_prompt": None})
 
     set_prompt_handler(ask)
+    set_notice_handler(lambda message: progress_callback({"notice": message}))
+
+
+def apply_payload_speed_limit(payload: Dict[str, Any]) -> None:
+    """Lock this worker's share of the server speed limit so the job cannot clear it."""
+    limit = payload.get("speed_limit")
+    if not limit:
+        return
+    set_speed_limit(limit, lock=True)
+    log.info(f"Job speed limit: {format_speed(limit)} (share of the global speed limit)")
 
 
 def main(argv: list[str]) -> int:
@@ -115,6 +126,7 @@ def main(argv: list[str]) -> int:
         service = payload["service"]
         title_id = payload["title_id"]
         params = payload.get("parameters", {})
+        apply_payload_speed_limit(payload)
 
         log.info(f"Worker starting job {job_id} ({service}:{title_id})")
 
@@ -128,9 +140,7 @@ def main(argv: list[str]) -> int:
                 try:
                     with progress_lock:
                         progress_state.update(progress_data)
-                        log.info(f"Writing progress update: {progress_data}")
                         write_result(progress_path, progress_state)
-                    log.info(f"Progress update written to {progress_path}")
                 except Exception as e:
                     log.error(f"Failed to write progress update: {e}")
 

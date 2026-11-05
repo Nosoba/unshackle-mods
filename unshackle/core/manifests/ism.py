@@ -15,7 +15,6 @@ from typing import Any, BinaryIO, Optional, Union
 import requests
 from langcodes import Language, tag_is_valid
 from lxml.etree import Element
-from pyplayready.system.pssh import PSSH as PR_PSSH
 from pywidevine.pssh import PSSH
 from requests import Session
 
@@ -24,7 +23,7 @@ from unshackle.core.constants import DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, 
 from unshackle.core.drm import DRM_T, PlayReady, Widevine
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
-from unshackle.core.manifests.dash import RollingMerge, append_segment
+from unshackle.core.manifests.dash import RollingMerge, append_segment, missing_language
 from unshackle.core.manifests.ism_init import (
     build_init_segment,
     parse_codec_private_data_vui,
@@ -36,6 +35,7 @@ from unshackle.core.session import RnetSession
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Track, Tracks, Video, resume
 from unshackle.core.tracks.track import assert_fragments_decrypted
 from unshackle.core.utilities import log_event, try_ensure_utf8
+from unshackle.core.utils import run_proxy
 from unshackle.core.utils.redact import safe_display_url
 from unshackle.core.utils.xml import load_xml
 
@@ -60,7 +60,7 @@ class ISM:
         if not url:
             raise requests.URLRequired("ISM manifest URL must be provided")
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
         elif not isinstance(session, (Session, RnetSession)):
             raise TypeError(f"Expected session to be a {Session} or {RnetSession}, not {session!r}")
         res = session.get(url, **kwargs)
@@ -103,11 +103,9 @@ class ISM:
                 drm.append(Widevine(pssh=pssh, kid=kid))
             elif system_id == "9a04f079-9840-4286-ab92-e65be0885f95":
                 try:
-                    pr_pssh = PR_PSSH(data)
+                    drm.append(PlayReady.from_pssh_b64(data))
                 except Exception as e:
                     logging.getLogger("ISM").warning(f"Skipping unparseable PlayReady ProtectionHeader: {e!r}")
-                    continue
-                drm.append(PlayReady(pssh=pr_pssh, pssh_b64=data))
         return drm
 
     @staticmethod
@@ -253,12 +251,10 @@ class ISM:
                     track_lang = Language.get(lang)
                 if not track_lang and not language:
                     # Language is optional in MS-SSTR; video streams commonly omit it.
-                    raise ValueError(
-                        "Language information could not be derived from the manifest and no fallback "
-                        "language was provided when calling ISM.to_tracks()."
-                    )
+                    raise missing_language("an ISM stream", language)
 
                 track_urls: list[str] = []
+                track_times: list[int] = []
                 fragment_time = 0
                 fragments = stream_index.findall("c")
                 # MS-SSTR UrlPattern; regex over str.format so {Bitrate}/{start_time}
@@ -276,6 +272,7 @@ class ISM:
                     first_time = int(fragments[0].get("t") or 0)
                     if first_time != 0:
                         track_urls.append(re.sub(r"\{start[ _]time\}", "0", url_template))
+                        track_times.append(first_time)
 
                 for idx, frag in enumerate(fragments):
                     fragment_time = int(frag.get("t", fragment_time))
@@ -292,6 +289,7 @@ class ISM:
                         duration_frag = (next_time - fragment_time) // repeat
                     for _ in range(repeat):
                         track_urls.append(re.sub(r"\{start[ _]time\}", str(fragment_time), url_template))
+                        track_times.append(fragment_time)
                         fragment_time += duration_frag
 
                 track_id = hashlib.md5(
@@ -312,6 +310,8 @@ class ISM:
                         "stream_index": stream_index,
                         "quality_level": ql,
                         "segments": track_urls,
+                        "segment_times": track_times,
+                        "timescale": int(stream_index.get("TimeScale") or self.manifest.get("TimeScale") or 10000000),
                     }
                 }
                 timescale = int(stream_index.get("TimeScale") or self.manifest.get("TimeScale") or 10000000)
@@ -357,7 +357,7 @@ class ISM:
                             language=track_lang or language,
                             is_original_lang=bool(language and track_lang and str(track_lang) == str(language)),
                             bitrate=ql.get("Bitrate"),
-                            channels=ql.get("Channels"),
+                            channels=Audio.channels_from_count(ql.get("Channels")),
                             extra={"atmos": True} if (ql.get("HasAtmos") or "").lower() == "true" else None,
                             descriptor=Track.Descriptor.ISM,
                             drm=drm,
@@ -419,6 +419,11 @@ class ISM:
             session.proxies.update({"all": proxy})
 
         segments: list[str] = track.data["ism"]["segments"]
+        segment_times: list[int] = track.data["ism"].get("segment_times") or []
+        if segment_times:
+            kept = track.sample_slice(segment_times, track.data["ism"]["timescale"], config.sample)
+            segments = segments[kept]
+            track.data["ism"]["fragment_times"] = segment_times[kept]
 
         session_drm = None
         if track.drm:
@@ -448,6 +453,7 @@ class ISM:
         use_rolling_merge = config.merge_segments and not isinstance(track, Subtitle)
         can_resume = config.continue_downloads and not use_rolling_merge
 
+        assert isinstance(track.url, str)
         digest = resume.fingerprint(track.url, [(url, None) for url in segments])
         if not (can_resume and resume.reusable(save_dir, digest)):
             shutil.rmtree(save_dir, ignore_errors=True)
@@ -455,7 +461,7 @@ class ISM:
         if can_resume:
             resume.write_sidecar(save_dir, digest)
 
-        downloader_args = dict(
+        downloader_args: dict[str, Any] = dict(
             urls=[{"url": url} for url in segments],
             output_dir=save_dir,
             filename="{i:0%d}.mp4" % len(str(len(segments))),

@@ -13,7 +13,12 @@ Per-service configuration, keyed by the canonical service tag (for example `EXAM
 - **`title_map`**: an exact-match rename map applied to fetched titles (source name →
   desired name), so a service that names a title differently from your library still matches.
 - **`dl`**: per-service download defaults, using the same keys as the global
-  [`dl`](download.md#dl) block.
+  [`dl`](download.md#dl) block. Set `remote: true` to send the `dl` and `search` runs of that
+  service to a [remote server](#remote_services) without `--remote`. Add `server` to select one of
+  several servers. On the command line, `--local` and `--server` override these keys. A REST API job ignores both keys.
+  A REST API job takes the other keys that it accepts as download parameters as its defaults,
+  above the `serve` defaults and below the values that the request sends.
+  See [making a service remote by default](../../dev/rest-api/remote-sessions.md#making-a-service-remote-by-default).
 
 Individual services may read any additional keys they define. unshackle hands the merged result
 (the service's own `config.yaml` with this block layered on top) to the service as `self.config`.
@@ -84,16 +89,35 @@ Definitions of remote unshackle service servers, used by the `--remote` mode. Ea
 named by you (pick it with `--server`, or do not write that flag when you configure only one) and gives
 the server's `url` (required), an optional `api_key`, an optional `auth_headers` list, an
 optional `server_cdm` boolean, an optional `timeout` in seconds, and an optional `services` sub-dict of per-service local
-overrides such as `title_map`.
+overrides such as `title_map`, keyed by service tag in any case. A `server_cdm` in a `services` entry replaces the `server_cdm` of
+the server entry for that service.
 
 Leave `server_cdm` unset and the client follows the server: it uses the server CDM for each
 service the API key has it on, and the local CDM for the others. `true` asks for the server CDM
 and falls back to the local CDM when the server refuses; `false` always uses the local CDM.
 `dl --cdm <name>` on a remote run has the same effect as `false` for that run: the device you
-name licenses the remote session. A [`cdm`](drm.md#cdm) entry for the service has the same
-effect for that service when it names the device that unshackle loaded. Both take priority over
-`server_cdm: true`. Remove the entry to use the server CDM for that service. The `default`
-entry does not count.
+name licenses the remote session, and it takes priority over `server_cdm: true`. When
+`server_cdm` is unset, a [`cdm`](drm.md#cdm) entry for the service has the same effect for that
+service when it names the device that unshackle loaded. The `default` entry does not count.
+With `server_cdm: true`, the server CDM licenses the remote session, and the device of the entry
+licenses only when the server refuses. Thus the entry applies to local runs and the server CDM
+applies to remote runs:
+
+```yaml
+cdm:
+  EXAMPLE1: my_device          # local runs of EXAMPLE1
+
+remote_services:
+  my_server:
+    url: https://example.com
+    server_cdm: true           # remote runs of EXAMPLE1 use the server CDM
+    services:
+      EXAMPLE2:
+        server_cdm: false      # remote runs of EXAMPLE2 use your own device
+```
+
+When the server refuses the server CDM for a service whose `cdm` entry loaded the device,
+unshackle logs the fallback to that device as info, not as a warning.
 
 The server has the last word. When it keeps the server CDM for a remote session that your
 device was to license, unshackle shows a warning. This occurs with a server that does not read
@@ -142,7 +166,7 @@ is the [REST API](../../dev/rest-api/index.md) section. These are the config key
 | `compression_level` | int | `1` | gzip level for responses. |
 | `services_refresh_interval` | int (s) | `0` | How often the server pulls the git-backed service repositories in `directories.services` and hot-reloads the services that changed. `0` turns it off. A service with a running or queued job, or a live remote session, is staged and swaps to the new code as soon as its last job and session finish. |
 | `services_staged_max_age` | int (s) | `0` | How long a staged service waits for its jobs and sessions before the server swaps it in anyway. `0` waits forever. Set it on a server whose popular services never have a quiet moment. A session that is live at the swap keeps the old code until it ends; a running job keeps its old code too. |
-| `global_speed_limit` | str | *(unlimited)* | Server-wide download speed cap, e.g. `10M`, `1.5G` or plain bytes/sec (same format as `speed_limit`). One shared budget across all concurrent jobs; the server ignores per-job speed limits while it is set. |
+| `global_speed_limit` | str | *(unlimited)* | Server-wide download speed cap, e.g. `10M`, `1.5G` or plain bytes/sec (same format as `speed_limit`). Each download job gets an equal share: the cap divided by the number of download job slots (2 by default, see [job lifecycle](../../dev/rest-api/job-lifecycle.md)). A job that runs alone still gets only its share. The server ignores per-job speed limits while it is set. |
 | `cdm_overrides` | list or bool | *(unset)* | Allowed per-request CDM overrides: a list of permitted device names, or `true` for any. Unset rejects every override. |
 | `allow_job_credentials` | bool | `false` | Permit clients to supply credentials per job. |
 | `server_accounts` | dict | `{}` | Services whose remote sessions use the server's own `credentials` and cookie files instead of the client's (see below). |
@@ -163,7 +187,8 @@ list.
     continue; an API key you removed gets `401` on its next request. A file that does not parse
     or validate keeps the running settings and logs the reason. A change to `remote_only`,
     `services_refresh_interval`, the first PlayReady device, or any command-line flag needs
-    a restart, and the log says so. Windows has no `SIGHUP`: restart the server there.
+    a restart, and the log says so. A new `global_speed_limit` applies to jobs that start after the
+    reload; running jobs keep their share. Windows has no `SIGHUP`: restart the server there.
 
 `server_cdm` decides whether the server runs the CDM licensing for that API key. Set it to
 `true` to enable every service, or to a list of service tags to enable only those. It is `false`
@@ -174,8 +199,8 @@ an API key without `server_cdm` for that service also cannot submit or retry `/a
 jobs. Keys that have no `users` entry, such as `api_secret`, keep server CDM access.
 
 A remote client that picks its own device licenses the remote session with that device. It picks
-with `dl --cdm`, with a `cdm` entry for the service, or with `server_cdm: false` in its
-`remote_services` entry. The server CDM makes no licence for that remote session, with or without
+with `dl --cdm`, with `server_cdm: false` in its `remote_services` entry or in the `services`
+entry for the service, or with a `cdm` entry for the service when `server_cdm` is unset. The server CDM makes no licence for that remote session, with or without
 a limit. A service option that runs the remote session on the server's device, such as a
 server-identity flag, keeps the server CDM.
 
@@ -193,7 +218,7 @@ the remote client's `-q` when the remote session starts:
   The service sees the DRM system and security level of the client's device. A client with no
   local CDM gets a `SERVER_CDM_CAPPED` error.
 - A download job must pass a `quality` at or below the limit, and must not set `best_available` or
-  a `HYBRID` range. `HYBRID` always keeps the lowest Dolby Vision track, at any quality. A job with
+  a `HYBRID` range. `HYBRID` can keep the lowest Dolby Vision track, at any quality. A job with
   no `quality`, with a higher one, with `best_available`, or with `HYBRID` gets a `SERVER_CDM_CAPPED`
   error. The server checks the values the job runs with, after it applies the service defaults
   and the `serve:` download defaults.
@@ -283,6 +308,12 @@ full proxy URI, or `no_proxy` to accept the server's own connection. Set `server
 to let that API key send a country code or a `provider:country` value, and to let the server
 pick a proxy for the client's region and for a service geofence. The client reports its own
 region; a client that reports none is not blocked.
+
+Without `server_proxy`, the server refuses a proxy URI whose host is not a public address:
+loopback, private, link-local and other special-purpose addresses, and `localhost`. This also
+applies to a server on a LAN, so a client proxy on that LAN needs `server_proxy` or an admin key.
+The server checks the proxy values the job uses, including a `proxy` default from the server's
+own config.
 
 ```yaml
 serve:

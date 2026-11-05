@@ -101,7 +101,7 @@ def test_the_client_refuses_a_challenge_for_the_other_drm_system() -> None:
     assert "not a playready device" in answer["error"]
 
 
-def test_a_cdm_call_after_authentication_leaves_the_status_and_client_auth_alone() -> None:
+def test_a_cdm_call_after_authentication_leaves_the_status_alone() -> None:
     bridge = InputBridge()
     bridge.status = AuthStatus.AUTHENTICATED
     result: list[dict] = []
@@ -118,7 +118,6 @@ def test_a_cdm_call_after_authentication_leaves_the_status_and_client_auth_alone
 
     assert result == [{"session": "s", "challenge": "Yw=="}]
     assert bridge.status is AuthStatus.AUTHENTICATED
-    assert bridge.answered is False
     assert bridge.get_pending_cdm_call() is None
 
 
@@ -239,7 +238,7 @@ def test_a_lent_device_session_never_licenses_live() -> None:
 
 
 def test_a_vault_only_miss_raises_the_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(handlers, "check_vaults", lambda kids, service: None)
+    monkeypatch.setattr(handlers, "check_vaults", lambda kids, service, **_: None)
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda *a, **k: None)
     refusal = handlers.live_licence_refusal(SimpleNamespace(server_device=True), object())
     with pytest.raises(APIError) as caught:
@@ -258,7 +257,7 @@ def test_a_vault_only_miss_raises_the_refusal(monkeypatch: pytest.MonkeyPatch) -
 
 def test_a_vault_only_hit_needs_no_server_device(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        handlers, "check_vaults", lambda kids, service: ({SESSION_KID.hex: "k"}, {SESSION_KID.hex: "v"})
+        handlers, "check_vaults", lambda kids, service, **_: ({SESSION_KID.hex: "k"}, {SESSION_KID.hex: "v"})
     )
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -390,7 +389,7 @@ def test_a_lent_device_session_keeps_its_auth_headers_and_track_secrets() -> Non
     headers, cookies = handlers.client_session_auth(session)
 
     assert headers == {"User-Agent": "ua"}
-    assert cookies == {"account": "client"}
+    assert handlers.cookie_values(cookies) == {"account": "client"}
     assert handlers.scrub_track_data({"token": "server", "id": 1}, session) == {"id": 1}
 
 
@@ -406,6 +405,7 @@ def test_a_lent_device_without_the_vault_grant_asks_the_server_for_no_key() -> N
     svc._server_device = True
     svc._local_vaults_only = True
     svc.client_licensed = set()
+    svc.deferred_refusals = {}
     svc.client = SimpleNamespace(post=lambda *a, **k: pytest.fail("the server refuses every key request"))
     track = SimpleNamespace(id="vid", drm=None)
 

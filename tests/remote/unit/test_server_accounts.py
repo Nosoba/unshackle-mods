@@ -162,6 +162,17 @@ def _create_with_real_ctx(monkeypatch, data):
     return svc
 
 
+DL_DEFAULTS = {
+    "lang": ["orig"],
+    "v_lang": [],
+    "a_lang": [],
+    "s_lang": ["all"],
+    "acodec": [],
+    "forced_subs": False,
+    "exact_lang": False,
+}
+
+
 def test_nested_dl_params_reach_the_parent_ctx(monkeypatch):
     from unshackle.core.tracks import Audio
 
@@ -170,23 +181,32 @@ def test_nested_dl_params_reach_the_parent_ctx(monkeypatch):
             "lang": ["es-419", "en"],
             "v_lang": ["ja"],
             "a_lang": ["es-419"],
+            "s_lang": ["ko"],
             "acodec": ["EC3", "NOPE", "AAC"],
             "forced_subs": True,
+            "exact_lang": True,
         }
     }
     svc = _create_with_real_ctx(monkeypatch, data)
     assert svc.parent_params["lang"] == ["es-419", "en"]
     assert svc.parent_params["v_lang"] == ["ja"]
     assert svc.parent_params["a_lang"] == ["es-419"]
+    assert svc.parent_params["s_lang"] == ["ko"]
     assert svc.parent_params["acodec"] == [Audio.Codec.EC3, Audio.Codec.AAC]
     assert svc.parent_params["forced_subs"] is True
+    assert svc.parent_params["exact_lang"] is True
 
 
 def test_absent_dl_params_fall_back_to_the_dl_defaults(monkeypatch):
     svc = _create_with_real_ctx(monkeypatch, {})
+<<<<<<< HEAD
     selection = {k: svc.parent_params[k] for k in ("lang", "v_lang", "a_lang", "acodec", "forced_subs")}
     # mods: dl's --lang defaults to "best", not upstream's "orig"
     assert selection == {"lang": ["best"], "v_lang": [], "a_lang": [], "acodec": [], "forced_subs": False}
+=======
+    selection = {k: svc.parent_params[k] for k in (*DL_DEFAULTS,)}
+    assert selection == DL_DEFAULTS
+>>>>>>> upstream/dev
 
 
 def test_an_empty_lang_list_is_kept(monkeypatch):
@@ -205,15 +225,20 @@ def test_a_service_lang_option_never_gets_the_dl_lang(monkeypatch):
     "dl_params",
     [
         "en",
-        {"lang": "en", "v_lang": "ja", "a_lang": {"x": 1}, "acodec": "EC3", "forced_subs": "yes"},
-        {"lang": [1], "v_lang": [None], "a_lang": ["en", None], "acodec": [3], "forced_subs": 1},
+        {"lang": "en", "v_lang": "ja", "a_lang": {"x": 1}, "acodec": "EC3", "forced_subs": "yes", "exact_lang": "yes"},
+        {"lang": [1], "v_lang": [None], "a_lang": ["en", None], "acodec": [3], "forced_subs": 1, "exact_lang": 1},
     ],
 )
 def test_malformed_dl_params_are_ignored(monkeypatch, dl_params):
     svc = _create_with_real_ctx(monkeypatch, {"dl_params": dl_params})
+<<<<<<< HEAD
     selection = {k: svc.parent_params[k] for k in ("lang", "v_lang", "a_lang", "acodec", "forced_subs")}
     # mods: dl's --lang defaults to "best", not upstream's "orig"
     assert selection == {"lang": ["best"], "v_lang": [], "a_lang": [], "acodec": [], "forced_subs": False}
+=======
+    selection = {k: svc.parent_params[k] for k in (*DL_DEFAULTS,)}
+    assert selection == DL_DEFAULTS
+>>>>>>> upstream/dev
 
 
 def test_profile_reaches_the_parent_ctx_params(monkeypatch):

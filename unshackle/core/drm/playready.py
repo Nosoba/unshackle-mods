@@ -15,9 +15,9 @@ import m3u8
 from construct import Container
 from pymp4.parser import Box
 from pyplayready.cdm import Cdm as PlayReadyCdm
+from pyplayready.misc.exceptions import InvalidPssh
 from pyplayready.system.pssh import PSSH
 from pyplayready.system.wrmheader import WRMHeader
-from requests import Session
 from rich.text import Text
 
 from unshackle.core import binaries
@@ -25,7 +25,10 @@ from unshackle.core.config import config
 from unshackle.core.console import console
 from unshackle.core.constants import AnyTrack
 from unshackle.core.drm import key_args as drm_key_args
-from unshackle.core.utilities import get_boxes, log_event
+from unshackle.core.drm.verify import kidless_track_kids, mp4decrypt_or_shaka, read_top_level_box
+from unshackle.core.session import AnySession, utf8_text
+from unshackle.core.utilities import call_licence, get_boxes, log_event
+from unshackle.core.utils import run_proxy
 from unshackle.core.utils.subprocess import ffprobe
 
 
@@ -40,7 +43,7 @@ class PlayReady:
         kid: Union[UUID, str, bytes, None] = None,
         pssh_b64: Optional[str] = None,
         **kwargs: Any,
-    ):
+    ) -> None:
         if not pssh:
             raise ValueError("Provided PSSH is empty.")
         if not isinstance(pssh, PSSH):
@@ -169,9 +172,29 @@ class PlayReady:
         return []
 
     @classmethod
-    def from_track(cls, track: AnyTrack, session: Optional[Session] = None) -> PlayReady:
+    def from_pssh_b64(cls, pssh_b64: str, kid: Optional[UUID] = None) -> PlayReady:
+        """Load a base64 PSSH box or PlayReady Object, or a bare UTF-16LE WRMHEADER that some packagers emit.
+
+        It wraps a bare WRMHEADER in a PlayReady Object and keeps that as `pssh_b64`, so remote CDMs and
+        the REST API can parse it again.
+        """
+        try:
+            pssh = PSSH(pssh_b64)
+        except InvalidPssh:
+            try:
+                raw = base64.b64decode(pssh_b64)
+            except ValueError:
+                raw = b""
+            if not raw.startswith(b"<\x00"):
+                raise
+            pssh_b64 = cls.pro_b64_for(WRMHeader(raw))
+            pssh = PSSH(pssh_b64)
+        return cls(pssh=pssh, kid=kid, pssh_b64=pssh_b64)
+
+    @classmethod
+    def from_track(cls, track: AnyTrack, session: Optional[AnySession] = None) -> PlayReady:
         if not session:
-            session = Session()
+            session = run_proxy.fallback_session()
             session.headers.update(config.headers)
 
         kid: Optional[UUID] = None
@@ -180,7 +203,8 @@ class PlayReady:
 
         if track.descriptor == track.Descriptor.HLS:
             m3u_url = track.url
-            master = m3u8.loads(session.get(m3u_url).text, uri=m3u_url)
+            assert isinstance(m3u_url, str)
+            master = m3u8.loads(utf8_text(session.get(m3u_url)), uri=m3u_url)
             pssh_boxes.extend(
                 Box.parse(base64.b64decode(x.uri.split(",")[-1]))
                 for x in (master.session_keys or master.keys)
@@ -468,10 +492,7 @@ class PlayReady:
                         challenge_size=len(challenge),
                         kid_count=len(required_kids),
                     )
-                    try:
-                        license_res = licence(challenge=challenge, pssh_b64=pssh_b64)
-                    except TypeError:
-                        license_res = licence(challenge=challenge)
+                    license_res = call_licence(licence, challenge, pssh_b64=pssh_b64, session_id=session_id)
                     if isinstance(license_res, bytes):
                         license_str = license_res.decode(errors="ignore")
                     else:
@@ -551,7 +572,7 @@ class PlayReady:
 
         decrypt_start = time.monotonic()
         if decrypter == "mp4decrypt":
-            self.decrypt_with_mp4decrypt(path)
+            mp4decrypt_or_shaka(self, path)
         else:
             self.decrypt_with_shaka_packager(path)
 
@@ -576,9 +597,9 @@ class PlayReady:
             return [self._kid]
         return self.kids
 
-    def mp4decrypt_key_args(self) -> list[str]:
-        """Build the mp4decrypt --key arguments for every content key and the zero-KID fallback."""
-        return drm_key_args.mp4decrypt_key_args(self.content_keys, self.own_kids())
+    def mp4decrypt_key_args(self, track_kids: Optional[dict[int, UUID]] = None) -> list[str]:
+        """Build the mp4decrypt --key arguments for every content key, the zero-KID and the track ID fallbacks."""
+        return drm_key_args.mp4decrypt_key_args(self.content_keys, self.own_kids(), track_kids)
 
     def decrypt_with_mp4decrypt(self, path: Path) -> None:
         """Decrypt using mp4decrypt"""
@@ -587,7 +608,7 @@ class PlayReady:
 
         output_path = path.with_stem(f"{path.stem}_decrypted")
 
-        key_args = self.mp4decrypt_key_args()
+        key_args = self.mp4decrypt_key_args(kidless_track_kids(read_top_level_box(path, b"moov") or b""))
 
         cmd = [
             str(binaries.Mp4decrypt),
@@ -628,7 +649,7 @@ class PlayReady:
         config.directories.temp.mkdir(parents=True, exist_ok=True)
 
         try:
-            arguments = [
+            arguments: list[str | Path] = [
                 f"input={path},stream=0,output={output_path},output_format=MP4",
                 "--enable_raw_key_decryption",
                 "--keys",
@@ -647,33 +668,26 @@ class PlayReady:
             )
 
             stream_skipped = False
-            had_error = False
             shaka_log_buffer = ""
+            assert p.stderr is not None
             for line in iter(p.stderr.readline, ""):
                 line = line.strip()
                 if not line:
                     continue
                 if "Skip stream" in line:
                     stream_skipped = True
-                if ":INFO:" in line:
-                    continue
-                if "I0" in line or "W0" in line:
-                    continue
-                if ":ERROR:" in line:
-                    had_error = True
-                if "Insufficient bits in bitstream for given AVC profile" in line:
+                if drm_key_args.shaka_noise(line):
                     continue
                 shaka_log_buffer += f"{line.strip()}\n"
 
-            if shaka_log_buffer:
-                shaka_log_buffer = "\n            ".join(
-                    textwrap.wrap(shaka_log_buffer.rstrip(), width=console.width - 22, initial_indent="")
-                )
-                console.log(Text.from_ansi("\n[PlayReady]: " + shaka_log_buffer))
-
             p.wait()
 
-            if p.returncode != 0 or had_error:
+            if p.returncode != 0:
+                if shaka_log_buffer:
+                    shaka_log_buffer = "\n            ".join(
+                        textwrap.wrap(shaka_log_buffer.rstrip(), width=console.width - 22, initial_indent="")
+                    )
+                    console.log(Text.from_ansi("\n[PlayReady]: " + shaka_log_buffer))
                 raise subprocess.CalledProcessError(p.returncode, [binaries.ShakaPackager, *arguments])
 
             path.unlink()

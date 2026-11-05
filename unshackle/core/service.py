@@ -1,13 +1,15 @@
 import logging
+import time
 from abc import ABCMeta, abstractmethod
 from collections.abc import Callable, Generator
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Sequence, TypeVar, Union
 
 if TYPE_CHECKING:
     from unshackle.core.api.input_bridge import InputBridge
+    from unshackle.core.drm.cbcs import SampleDecrypter
 
 import click
 import m3u8
@@ -18,12 +20,12 @@ from rich.rule import Rule
 
 from unshackle.core.cacher import Cacher
 from unshackle.core.config import config
-from unshackle.core.console import console, prompt_user
+from unshackle.core.console import console, prompt_user, show_notice
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
 from unshackle.core.drm import DRM_T
 from unshackle.core.proxies.basic import Basic
-from unshackle.core.proxies.resolve import find_provider
+from unshackle.core.proxies.resolve import pick_proxy
 from unshackle.core.search_result import SearchResult
 from unshackle.core.session import (
     BACKOFF_FACTOR,
@@ -40,6 +42,7 @@ from unshackle.core.titles import Title_T, Titles_T, remap_titles
 from unshackle.core.tracks import Chapters, Tracks
 from unshackle.core.tracks.video import Video
 from unshackle.core.utilities import declared_kwargs
+from unshackle.core.utils import run_proxy
 from unshackle.core.utils.ip_info import get_ip_info, verify_proxy_exit
 from unshackle.core.utils.redact import mask_proxy
 
@@ -81,10 +84,10 @@ class TimeoutHTTPAdapter(HTTPAdapter):
         self.default_timeout = timeout
         super().__init__(*args, **kwargs)
 
-    def send(self, request: Any, **kwargs: Any) -> Any:
+    def send(self, request: requests.PreparedRequest, *args: Any, **kwargs: Any) -> requests.Response:
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = getattr(self, "default_timeout", DEFAULT_TIMEOUT)
-        return super().send(request, **kwargs)
+        return super().send(request, *args, **kwargs)
 
 
 def grow_session_pool(session: Any, size: int) -> None:
@@ -123,6 +126,7 @@ class TrackRequest:
     codecs: list[Video.Codec] = field(default_factory=list)
     ranges: list[Video.Range] = field(default_factory=lambda: [Video.Range.SDR])
     best_available: bool = False
+    generate_dv: bool = False
 
 
 def sanitize_proxy_for_log(uri: Optional[str], mask_host: bool = False) -> Optional[str]:
@@ -140,6 +144,9 @@ def sanitize_proxy_for_log(uri: Optional[str], mask_host: bool = False) -> Optio
     return mask_proxy(uri, mask_host=mask_host, allow_debug=False)
 
 
+T = TypeVar("T")
+
+
 class Service(metaclass=ABCMeta):
     """The Service Base Class.
 
@@ -154,6 +161,7 @@ class Service(metaclass=ABCMeta):
     GEOBLOCK: tuple[str, ...] = ()  # ip regions where the service refuses to work; everything else is allowed.
     ANIME: bool = False  # service catalogue is anime; metadata lookups prefer AniList. Title.anime overrides per title.
     DAILY: bool = False  # catalog is daily/date-based. episodes are named by air date. Title.daily overrides per title.
+    ANONYMOUS_SEARCH: bool = False  # search() needs no login; a search then skips cookies and authenticate().
     # vault namespace override; when set, key vault read/write uses this tag instead of the service's own.
     VAULT_TAG: Optional[str] = None
     # Auth methods the service accepts ("cookies"/"credentials"); when None the REST /services
@@ -166,7 +174,7 @@ class Service(metaclass=ABCMeta):
     # one of them set keeps the server CDM even when the remote client picked its own device.
     SERVER_DEVICE_OPTIONS: tuple[str, ...] = ()
 
-    def __init__(self, ctx: click.Context):
+    def __init__(self, ctx: click.Context) -> None:
         console.print(Padding(Rule(f"[rule.text]Service: {self.__class__.__name__}"), (1, 2)))
 
         self.config = ctx.obj.config
@@ -179,7 +187,7 @@ class Service(metaclass=ABCMeta):
         self.cache_dir = config.directories.cache / self.__class__.__name__
 
         self.ctx = ctx
-        self.credential = None  # Will be set in authenticate()
+        self.credential: Optional[Credential] = None  # Will be set in authenticate()
         self.current_region = None  # Will be set based on proxy/geolocation
         self._input_bridge: Optional[InputBridge] = None
 
@@ -187,10 +195,12 @@ class Service(metaclass=ABCMeta):
         vcodec = ctx.parent.params.get("vcodec") if ctx.parent else None
         range_ = ctx.parent.params.get("range_") if ctx.parent else None
         best_available = ctx.parent.params.get("best_available", False) if ctx.parent else False
+        generate_dv = ctx.parent.params.get("generate_dv", False) if ctx.parent else False
         self.track_request = TrackRequest(
             codecs=list(vcodec) if vcodec else [],
             ranges=list(range_) if range_ else [Video.Range.SDR],
             best_available=bool(best_available),
+            generate_dv=bool(generate_dv),
         )
 
         whose = "the server's" if ctx.parent and ctx.parent.params.get("served") else "your"
@@ -219,40 +229,16 @@ class Service(metaclass=ABCMeta):
                     self.log.info(
                         f"Found service-specific proxy mapping: {full_proxy_key} -> {sanitize_proxy_for_log(mapped_value)}"
                     )
-                    if proxy_provider_name:
-                        # Specific provider requested
-                        try:
-                            proxy_provider = find_provider(ctx.obj.proxy_providers, proxy_provider_name)
-                        except ValueError:
-                            proxy_provider = None
-                        if proxy_provider:
-                            mapped_proxy_uri = proxy_provider.get_proxy(mapped_value)
-                            if mapped_proxy_uri:
-                                proxy = mapped_proxy_uri
-                                self.log.info(
-                                    f"Using mapped proxy from {proxy_provider.__class__.__name__}: "
-                                    f"{sanitize_proxy_for_log(proxy, mask_host=isinstance(proxy_provider, Basic))}"
-                                )
-                            else:
-                                self.log.warning(
-                                    f"Failed to get proxy for mapped value '{sanitize_proxy_for_log(mapped_value)}', using default"
-                                )
-                        else:
-                            self.log.warning(f"Proxy provider '{proxy_provider_name}' not found, using default proxy")
-                    else:
-                        for proxy_provider in ctx.obj.proxy_providers:
-                            mapped_proxy_uri = proxy_provider.get_proxy(mapped_value)
-                            if mapped_proxy_uri:
-                                proxy = mapped_proxy_uri
-                                self.log.info(
-                                    f"Using mapped proxy from {proxy_provider.__class__.__name__}: "
-                                    f"{sanitize_proxy_for_log(proxy, mask_host=isinstance(proxy_provider, Basic))}"
-                                )
-                                break
-                        else:
-                            self.log.warning(
-                                f"No provider could resolve mapped value '{sanitize_proxy_for_log(mapped_value)}', using default"
-                            )
+                    try:
+                        proxy_provider, proxy = pick_proxy(ctx.obj.proxy_providers, mapped_value, proxy_provider_name)
+                        self.log.info(
+                            f"Using mapped proxy from {proxy_provider.__class__.__name__}: "
+                            f"{sanitize_proxy_for_log(proxy, mask_host=isinstance(proxy_provider, Basic))}"
+                        )
+                    except ValueError:
+                        self.log.warning(
+                            f"No provider could resolve mapped value '{sanitize_proxy_for_log(mapped_value)}', using default"
+                        )
 
             if not proxy:
                 # don't override the explicit proxy set by the user, even if they may be geoblocked
@@ -266,24 +252,18 @@ class Service(metaclass=ABCMeta):
                                 self.log.info("Service is not Geoblocked in your region")
                             elif not (fence_targets := [x for x in self.GEOFENCE if self.is_region_allowed(x)]):
                                 raise click.ClickException(
-                                    f"Service is not available in {whose} region ({current_region.upper()}). "
-                                    "Pass --proxy with a proxy outside the blocked regions."
+                                    f"Service is not available in {whose} region ({current_region.upper()})"
                                 )
                             else:
                                 requested_proxy = fence_targets[0]  # first is likely main region
                                 self.log.info(
                                     f"Service is Geoblocked in your region, getting a Proxy to {requested_proxy}"
                                 )
-                                for proxy_provider in ctx.obj.proxy_providers:
-                                    proxy = proxy_provider.get_proxy(requested_proxy)
-                                    if proxy:
-                                        self.log.info(f"Got Proxy from {proxy_provider.__class__.__name__}")
-                                        break
-                                if not proxy:
-                                    self.log.warning(
-                                        f"No proxy available for {requested_proxy}. "
-                                        f"Pass --proxy with a proxy in {requested_proxy}, or the request can fail."
-                                    )
+                                try:
+                                    proxy_provider, proxy = pick_proxy(ctx.obj.proxy_providers, requested_proxy)
+                                    self.log.info(f"Got Proxy from {proxy_provider.__class__.__name__}")
+                                except ValueError:
+                                    self.log.warning(f"No proxy available for {requested_proxy}")
                         except click.ClickException:
                             raise
                         except Exception as e:
@@ -293,6 +273,8 @@ class Service(metaclass=ABCMeta):
 
             if proxy:
                 self.session.proxies.update({"all": proxy})
+                if isinstance(self.session, requests.Session):
+                    run_proxy.pin(self.session)
                 # Don't set Proxy-Authorization manually: both rnet (Proxy.all) and
                 # requests authenticate from the credentials embedded in the proxy URL.
                 # A manual header here was malformed (no "Basic " scheme) and broke
@@ -304,8 +286,7 @@ class Service(metaclass=ABCMeta):
                 # Only GEOBLOCK applies here: an explicit --proxy outside GEOFENCE stays the user's call.
                 if exit_region and any(x.lower() == exit_region.lower() for x in self.GEOBLOCK):
                     raise click.ClickException(
-                        f"Service is not available in {whose} proxy's region ({exit_region.upper()}). "
-                        "Pass --proxy with a proxy outside the blocked regions."
+                        f"Service is not available in {whose} proxy's region ({exit_region.upper()})"
                     )
             else:
                 # No proxy, use cached IP info for title caching (non-critical)
@@ -315,6 +296,8 @@ class Service(metaclass=ABCMeta):
                 except Exception as e:
                     self.log.debug(f"Failed to get cached IP info: {e}")
                     self.current_region = None
+
+        run_proxy.watch(type(self), run_proxy.proxy_of(self.session))
 
     @classmethod
     def is_region_allowed(cls, region: Optional[str]) -> bool:
@@ -336,13 +319,19 @@ class Service(metaclass=ABCMeta):
     ) -> Tracks:
         """Call fetch_fn for each codec/range combo in track_request, merge results.
 
+        Video, audio and subtitles merge from every combo, so a track that only one manifest
+        offers is kept. The helper skips a later track whose ``Tracks.signature`` matches a held
+        one, because its ID can differ between manifests. Chapters and attachments come from the
+        first combo only.
+
         Services that need separate API calls per codec/range combo can use this
         helper from their get_tracks() implementation.
 
         The fetch_fn signature should be: (title, codec, range_) -> Tracks
 
         For HYBRID range, this helper calls fetch_fn with HDR10 and DV separately,
-        then merges the DV video tracks into the HDR10 result.
+        then merges the DV tracks into the HDR10 result. With no DV video and
+        ``generate_dv`` requested, it merges the HDR10P tracks instead.
 
         Args:
             title: The title to process.
@@ -351,12 +340,21 @@ class Service(metaclass=ABCMeta):
         all_tracks = Tracks()
         first = True
 
-        codecs = self.track_request.codecs or [None]
+        def merge(tracks: Tracks) -> None:
+            nonlocal first
+            if first:
+                all_tracks.add(tracks, warn_only=True)
+                first = False
+                return
+            held = {Tracks.signature(track) for track in all_tracks}
+            all_tracks.add([track for track in tracks if Tracks.signature(track) not in held], warn_only=True)
+
+        codecs: Sequence[Optional[Video.Codec]] = self.track_request.codecs or [None]
         ranges = self.track_request.ranges or [Video.Range.SDR]
 
         for range_val in ranges:
             if range_val == Video.Range.HYBRID:
-                # HYBRID: fetch HDR10 first (full tracks), then DV (video only)
+                # HYBRID: fetch HDR10 first, then DV
                 for codec_val in codecs:
                     try:
                         hdr_tracks = fetch_fn(title, codec=codec_val, range_=Video.Range.HDR10)
@@ -365,21 +363,23 @@ class Service(metaclass=ABCMeta):
                             self.log.warning(f" - HDR10 not available for HYBRID, skipping ({e})")
                             continue
                         raise
-                    if first:
-                        all_tracks.add(hdr_tracks, warn_only=True)
-                        if hdr_tracks.manifest_url and not all_tracks.manifest_url:
-                            all_tracks.manifest_url = hdr_tracks.manifest_url
-                        first = False
-                    else:
-                        for video in hdr_tracks.videos:
-                            all_tracks.add(video, warn_only=True)
+                    merge(hdr_tracks)
 
                     try:
                         dv_tracks = fetch_fn(title, codec=codec_val, range_=Video.Range.DV)
-                        for video in dv_tracks.videos:
-                            all_tracks.add(video, warn_only=True)
                     except (ValueError, SystemExit):
                         self.log.info(" - No DolbyVision manifest available for HYBRID")
+                        dv_tracks = Tracks()
+                    merge(dv_tracks)
+                    has_hdr10p = any(v.range == Video.Range.HDR10P for v in all_tracks.videos)
+                    if not dv_tracks.videos and self.track_request.generate_dv and not has_hdr10p:
+                        # the HDR10 request may not return HDR10+, which the conversion needs as its base
+                        try:
+                            hdr10p_tracks = fetch_fn(title, codec=codec_val, range_=Video.Range.HDR10P)
+                        except (ValueError, SystemExit):
+                            self.log.info(" - No HDR10+ manifest available for HYBRID")
+                        else:
+                            merge(hdr10p_tracks)
             else:
                 for codec_val in codecs:
                     try:
@@ -390,19 +390,9 @@ class Service(metaclass=ABCMeta):
                             self.log.warning(f" - {range_val.name}/{codec_name} not available, skipping ({e})")
                             continue
                         raise
-                    if first:
-                        all_tracks.add(tracks, warn_only=True)
-                        if tracks.manifest_url and not all_tracks.manifest_url:
-                            all_tracks.manifest_url = tracks.manifest_url
-                        first = False
-                    else:
-                        for video in tracks.videos:
-                            all_tracks.add(video, warn_only=True)
+                    merge(tracks)
 
         return all_tracks
-
-    # Deprecated 5.5.0 shim for service repos still on the old underscored name; drop once they migrate.
-    _get_tracks_for_variants = get_tracks_for_variants
 
     @staticmethod
     def get_session() -> requests.Session:
@@ -429,6 +419,7 @@ class Service(metaclass=ABCMeta):
                     status_forcelist=STATUS_FORCELIST,
                     allowed_methods=RETRY_METHODS,
                     respect_retry_after_header=True,
+                    retry_after_max=int(MAX_BACKOFF),
                 ),
                 pool_connections=POOL_MAX_SIZE,
                 pool_maxsize=POOL_MAX_SIZE,
@@ -452,7 +443,8 @@ class Service(metaclass=ABCMeta):
 
         This is effectively a login() function. Any API calls or object initializations
         needing to be made, should be made here. unshackle operates this method before
-        any of the following abstract functions.
+        any of the following abstract functions. The one exception is a search on a
+        Service that sets ``ANONYMOUS_SEARCH``, which does not operate this method.
 
         You should avoid storing or using the Credential outside this function.
         Make any calls you need for any Cookies, Tokens, or such, then use those.
@@ -490,6 +482,32 @@ class Service(metaclass=ABCMeta):
             return self._input_bridge.request_input(prompt)
         return prompt_user(prompt)
 
+    def wait_for_approval(
+        self, message: str, check: Callable[[], Optional[T]], timeout: float, interval: float = 3.0
+    ) -> T:
+        """Show ``message``, then call ``check`` until it returns a value.
+
+        Use it for a login that the user approves on another device, such as a pair code.
+        ``check`` returns None while the approval is pending, and must return within a few
+        seconds. Raises TimeoutError after ``timeout`` seconds, and RuntimeError when the
+        remote session no longer exists. A REST download job shows ``message`` as its ``notice``.
+        """
+        self.log.info(message)
+        show_notice(message)
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if self._input_bridge is not None:
+                    self._input_bridge.ensure_active()
+                result = check()
+                if result is not None:
+                    return result
+                if time.monotonic() + interval >= deadline:
+                    raise TimeoutError(f"No approval within {timeout:.0f}s")
+                time.sleep(interval)
+        finally:
+            show_notice(None)
+
     def search(self) -> Generator[SearchResult, None, None]:
         """
         Find titles from the Service by query.
@@ -503,7 +521,7 @@ class Service(metaclass=ABCMeta):
 
     def get_widevine_service_certificate(
         self, *, challenge: bytes, title: Title_T, track: AnyTrack
-    ) -> Union[bytes, str]:
+    ) -> Optional[Union[bytes, str]]:
         """
         Get the Widevine Service Certificate used for Privacy Mode.
 
@@ -578,7 +596,7 @@ class Service(metaclass=ABCMeta):
         :return: The JWK Set license as a dict, JSON str, or raw bytes. Return None (the default)
             to let the framework POST the challenge to the manifest-provided Laurl, if any.
             Services with no license server can instead pre-populate the DRM object's
-            `content_keys` in get_tracks.
+            `signatures` in get_tracks.
         """
         return None
 
@@ -597,7 +615,7 @@ class Service(metaclass=ABCMeta):
         This can be useful to store information on each title that you need later, like any sub-asset IDs, or such.
         """
 
-    def get_titles_cached(self, title_id: str = None) -> Titles_T:
+    def get_titles_cached(self, title_id: Optional[str] = None) -> Titles_T:
         """
         Cached wrapper around get_titles() to reduce redundant API calls.
 
@@ -700,6 +718,20 @@ class Service(metaclass=ABCMeta):
         wants "Chapter {n}" style Chapter names (or similar) then they can use the config
         option `chapter_fallback_name`. For example, `"Chapter {i:02}"` for "Chapter 01".
         """
+
+    # Optional sample decryption
+
+    def decrypts_samples(self, track: AnyTrack) -> bool:
+        """Whether this service decrypts the cbcs file of `track` after the download, through `get_sample_decrypter`."""
+        return False
+
+    def get_sample_decrypter(self, track: AnyTrack, entry: int) -> Union[bytes, "SampleDecrypter"]:
+        """The content key, or a `cbcs.SampleDecrypter`, for `stsd` entry `entry` (1-based) of `track`.
+
+        unshackle calls this only for a track `decrypts_samples` names. A remote session runs it on the
+        server, so a decrypter that needs a local process works for remote clients too.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not decrypt samples")
 
     # Optional Event methods
 

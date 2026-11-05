@@ -9,15 +9,17 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import traceback
 import unicodedata
 import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence, Union
 from urllib.parse import ParseResult, urlparse
 from uuid import uuid4
 
@@ -26,6 +28,7 @@ import pycountry
 from construct import ValidationError
 from fontTools import ttLib
 from langcodes import Language, closest_match
+from langcodes.data_dicts import LIKELY_SUBTAGS
 from langcodes.tag_parser import LanguageTagError
 from pymp4.parser import Box
 from unidecode import unidecode
@@ -98,12 +101,12 @@ def import_module_by_path(path: Path) -> ModuleType:
 
     # compute package hierarchy for relative import support
     if path.is_relative_to(config.directories.core_dir):
-        name = []
+        parts: list[str] = []
         _path = path.parent
         while _path.stem != config.directories.core_dir.stem:
-            name.append(_path.stem)
+            parts.append(_path.stem)
             _path = _path.parent
-        name = ".".join([config.directories.core_dir.stem] + name[::-1])
+        name = ".".join([config.directories.core_dir.stem] + parts[::-1])
     else:
         # is outside the src package
         if str(path.parent.parent) not in sys.path:
@@ -111,6 +114,7 @@ def import_module_by_path(path: Path) -> ModuleType:
         name = path.parent.stem
 
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -132,6 +136,27 @@ FULLWIDTH_REPLACEMENTS = {
     "*": "＊",
     "!": "！",
 }
+
+RESOLUTION_TIERS = (4320, 2160, 1440, 1080, 720, 576, 540, 480, 360, 240)
+
+def standard_resolution(width: Optional[int], height: Optional[int]) -> Optional[int]:
+    """The resolution a release name uses: the nearest standard height within 10%, from the short side or a 16:9 width.
+
+    A cropped 1920x800, a padded 1920x1088 and a 1080x1920 portrait picture are all 1080. A size with no
+    standard height near it keeps its own, and a picture with no size gives None.
+    """
+    sides = [side for side in (width, height) if side]
+    if not sides:
+        return None
+    short, long = min(sides), max(sides)
+    # naming policy: a short side near 2160, 1440 or 1080 names the picture, so an ultrawide 2560x1080 is 1080
+    # as other media tools name it, even though a 1440 scope crop has the same size
+    by_height = next((tier for tier in (2160, 1440, 1080) if abs(short - tier) <= 16), None)
+    if by_height:
+        return by_height
+    equivalent = max(short, long * 9 / 16)
+    tier = min(RESOLUTION_TIERS, key=lambda t: abs(t - equivalent))
+    return tier if abs(tier - equivalent) <= tier / 10 else round(equivalent)
 
 
 def sanitize_filename(filename: str, spacer: str = ".", unicode: Optional[bool] = None) -> str:
@@ -205,6 +230,82 @@ def valid_language(language: Any) -> Optional[str]:
     return str(language)
 
 
+def spoken_language(tag: Any) -> str:
+    """
+    Return the language a tag names, under its macrolanguage: cmn and zh-TW give zh, yue stays yue.
+
+    nb and nn give no by hand, because CLDR makes no their parent outside its macrolanguage data.
+    """
+    if not tag:
+        return ""
+    try:
+        language = Language.get(str(tag)).prefer_macrolanguage().language or ""
+    except LanguageTagError:
+        return ""
+    return "no" if language in ("nb", "nn") else language
+
+
+@cache
+def multi_script_languages() -> frozenset[str]:
+    """Return the languages whose likely script changes with the region in CLDR (zh, yue, sr, ...)."""
+    found = set()
+    for tag, likely in LIKELY_SUBTAGS.items():
+        match = re.fullmatch(r"([a-z]{2,3})-(?:[A-Z]{2}|\d{3})", tag)
+        if match and match[1] != "und" and Language.get(likely).script != Language.get(match[1]).maximize().script:
+            found.add(match[1])
+    return frozenset(found)
+
+
+def with_script(language: Language) -> Language:
+    """
+    Add the script a region implies to a subtitle tag, e.g. zh-TW to zh-Hant-TW.
+
+    Only a language written in several scripts gets one, and only when the tag has a region:
+    a bare zh says nothing about the script, so it stays zh.
+    """
+    if language.script or not language.territory or language.language not in multi_script_languages():
+        return language
+    return language.update_dict({"script": language.maximize().script}).simplify_script()
+
+
+def language_name(language: Language) -> Optional[str]:
+    """
+    Return the name of a track language, or None for an unknown or private-use language.
+
+    The name is English, or in the language itself when `muxing.track_names` is `native`. It leaves out a
+    script or region that adds nothing: private use (but XK, Kosovo), 001, the CLDR default region of the
+    language and script (pt-BR, zh-Hant-TW, but not pt-PT), a script named like the language.
+    """
+    code = language.language
+    if not code or not Language.make(language=code).has_name_data():
+        return None
+    script, region = language.script, language.territory
+    if script and (
+        re.fullmatch(r"Qaa[a-z]|Qab[a-x]|Zzzz", script) or language.script_name() == language.language_name()
+    ):
+        script = None
+    if region and (
+        region == "001"
+        or re.fullmatch(r"AA|Q[M-Z]|X[A-JL-Z]|ZZ", region)
+        or Language.make(language=code, script=script).maximize().territory == region
+    ):
+        region = None
+    shown = language.update_dict({"script": script, "territory": region})
+    native = config.muxing.get("track_names") == "native"
+    # names are filed under the full macrolanguage tag (zh-Hant): zh-TW or cmn-Hant named in itself falls back to English
+    full = language.maximize()
+    name = shown.prefer_macrolanguage().display_name(full.prefer_macrolanguage()) if native else shown.display_name()
+    name = name.replace(" SAR China", "")
+    if not native:
+        return name
+    name = re.sub(r"中[国國](香港|澳[门門])特[别別]行政[区區]", r"\1", name)
+    if "（" in name:
+        # the Traditional Chinese data separates with an ASCII comma, the Simplified with a full-width one
+        name = name.replace(", ", "，")
+    # Georgian has capitals (Mtavruli) but never starts a name with one
+    return name[:1].upper() + name[1:] if full.script in ("Latn", "Cyrl", "Grek", "Armn") else name
+
+
 def is_exact_match(language: Union[str, Language], languages: Sequence[Union[str, Language, None]]) -> bool:
     """Examine whether a language exactly matches any of the given languages."""
     languages = [x for x in languages if x]
@@ -241,34 +342,36 @@ def partition_exclusions(tokens: Optional[Sequence[str]]) -> tuple[list[str], li
     return includes, excludes
 
 
-def excluded_language_tags(
-    excludes: Sequence[str],
+def matched_language_tags(
+    tokens: Sequence[str],
     available: Sequence[Union[str, Language, None]],
     exact: bool = False,
+    *,
+    every_variant: bool = False,
 ) -> set[str]:
     """
-    The language tags out of `available` that the exclusion tokens remove.
+    The language tags out of `available` that any of the tokens asks for.
 
-    Matches through matching_languages so an exclusion drops exactly the tracks the same
-    token would select, including its exact-mode string preference. Untagged tracks are
-    never excluded.
+    Matches through matching_languages. An exclusion passes every_variant, so "-es" drops
+    every Spanish track. Untagged tracks never match.
     """
-    return {tag for token in excludes for tag in matching_languages(token, available, exact)}
+    return {tag for token in tokens for tag in matching_languages(token, available, exact, every_variant=every_variant)}
 
 
-def keep_forced_subtitle(
-    forced: bool,
-    language: Union[str, Language],
-    forced_s_lang: Sequence[str],
-    exact: bool = False,
-) -> bool:
-    """The -fsl filter: non-forced tracks always pass, forced tracks only when they match forced_s_lang."""
-    if not forced:
-        return True
-    if not forced_s_lang:
-        return False
-    match_func = is_exact_match if exact else is_close_match
-    return match_func(language, forced_s_lang)
+def plain_subtitle_tags(tokens: Sequence[str], subtitles: Sequence[Any], exact: bool = False) -> set[str]:
+    """
+    The non-forced subtitle tags the -sl tokens select.
+
+    Each token is matched against the plain tracks before the SDH ones, so an SDH track cannot win
+    the string-equal preference over the plain variant: -sl en with plain en-US and SDH en takes
+    en-US. An SDH track then joins when it is the same variant as a chosen tag.
+    """
+    plain = [x.language for x in subtitles if not x.forced and not x.sdh]
+    sdh = [x.language for x in subtitles if not x.forced and x.sdh]
+    tags: set[str] = set()
+    for token in tokens:
+        tags |= matching_languages(token, plain, exact) or matching_languages(token, sdh, exact)
+    return tags | {str(lang) for lang in sdh if tags and matching_languages(lang, list(tags), exact=True)}
 
 
 def kind_only_conflict(params: Mapping[str, Any]) -> Optional[tuple[str, str]]:
@@ -332,9 +435,8 @@ def find_missing_langs(
     exact: bool = False,
 ) -> list[str]:
     """Return the requested language tokens that match no available language."""
-    match_func = is_exact_match if exact else is_close_match
     skip = {"all", "best", "orig"}
-    return [tok for tok in requested if tok not in skip and not match_func(tok, available)]
+    return [tok for tok in requested if tok not in skip and not matching_languages(tok, available, exact)]
 
 
 def missing_required_langs(
@@ -351,7 +453,7 @@ def missing_required_langs(
     token ("-fr") asks for a language to be absent, so it is never a required language.
     """
     wanted, _ = partition_exclusions(list(required))
-    return find_missing_langs(resolve_sort_langs(wanted, original), available, exact=exact)
+    return find_missing_langs(resolve_sort_langs(wanted, original, exact=exact), available, exact=exact)
 
 
 def as_requested(tokens: Sequence[str], orig_token: Optional[str]) -> str:
@@ -363,44 +465,74 @@ def matching_languages(
     language: Union[str, Language],
     available: Sequence[Union[str, Language, None]],
     exact: bool = False,
+    *,
+    every_variant: bool = False,
 ) -> set[str]:
     """
     The languages out of `available` that `language` asks for, by the rules Tracks.by_language uses.
 
-    In exact mode CLDR tag distance is not sufficient on its own: it rates a base language and
-    its "paradigm" regional variant as the same language (distance 0 for en/en-US, pt/pt-BR), so
-    it cannot separate en-US from en. Follow RFC 4647 Lookup: prefer the string-equal tag, and
-    fall back to the distance rating only when no such tag is present (for example, zh matches
-    cmn).
+    A tag asks for the variant it means. A tag with a region (en-US, es-419) gets only that
+    variant. A bare tag gets the variant it implies (pt means pt-BR, es means es-ES) and, when
+    the title has none, every regional form, unless exact or the caller sets every_variant,
+    which always returns every form. A ServiceTag falls back the same way, from its own tag. The meant variant follows RFC 4647 Lookup: the string-equal
+    tag, else CLDR distance 0 (zh matches cmn, en-US matches en). Distance alone cannot do it,
+    because it rates a base language and its paradigm variant (en/en-US) the same.
     """
     tags = {str(x) for x in available if x}
     try:
-        want = Language.get(str(language)).to_tag().casefold()
+        requested = Language.get(str(language))
     except LanguageTagError:
         # e.g. a config typo in language_priority; an unparseable tag matches nothing
         return set()
-    if not exact:
-        return {tag for tag in tags if is_close_match(language, [tag])}
+    want = requested.to_tag().casefold()
+    variants: set[str] = set()
+    if not exact and (isinstance(language, ServiceTag) or not requested.territory):
+        variants = {tag for tag in tags if is_close_match(language, [tag])}
+        if every_variant:
+            return variants
     string_equal = {tag for tag in tags if Language.get(tag).to_tag().casefold() == want}
-    return string_equal or {tag for tag in tags if is_exact_match(language, [tag])}
+    return string_equal or {tag for tag in tags if is_exact_match(language, [tag])} or variants
 
 
-def resolve_sort_langs(tokens: Sequence[str], original: Optional[Union[str, Language]] = None) -> list[str]:
+class ServiceTag(str):
+    """A language the service supplied, such as the title language "orig" becomes.
+
+    matching_languages takes its own variant first and falls back to the close regional forms,
+    because the service, not the user, chose its region.
     """
-    Prepare language tokens for a Tracks.sort_* by_language argument.
 
-    "orig" becomes the title language. This function drops it when the title has none.
-    "all" and "best" pass through, because the sort methods find them among the tracks. The
-    result keeps the first position of each language and drops later repeats.
+
+def original_tag(language: Union[str, Language], exact: bool = False) -> str:
+    """The tag to match a service-supplied language with: a ServiceTag, or the plain tag in exact mode."""
+    return str(language) if exact else ServiceTag(str(language))
+
+
+def resolve_sort_langs(
+    tokens: Sequence[str], original: Optional[Union[str, Language]] = None, *, exact: bool = False
+) -> list[str]:
+    """
+    Resolve language tokens for selection, exclusion and the Tracks.sort_* by_language argument.
+
+    "orig" becomes the title language through original_tag. This function drops it when the
+    title has none. "all" and "best" pass through, because the sort methods find them among
+    the tracks. The result keeps the first position of each language and drops later repeats.
     """
     resolved: list[str] = []
     for token in tokens:
-        language = str(original) if token == "orig" else str(token)
-        if token == "orig" and not original:
+        if token != "orig":
+            language = str(token)
+        elif original:
+            language = original_tag(original, exact)
+        else:
             continue
         if language not in resolved:
             resolved.append(language)
     return resolved
+
+
+# construct 2.8 gives each bit-field struct one shared stream, so two threads in a pymp4
+# parse or build of a box with bit fields (tenc, senc, trun, sidx, ...) read each other's bytes
+PYMP4_LOCK = threading.Lock()
 
 
 def get_boxes(data: bytes, box_type: bytes, as_bytes: bool = False) -> Box:  # type: ignore
@@ -453,14 +585,13 @@ def get_boxes(data: bytes, box_type: bytes, as_bytes: bool = False) -> Box:  # t
         box_start = pos - 4
 
         try:
-            box = Box.parse(data[box_start:])
-            if as_bytes:
-                box = Box.build(box)
+            with PYMP4_LOCK:
+                box = Box.parse(data[box_start:])
+                built = Box.build(box)
 
-            yield box
+            yield built if as_bytes else box
 
-            box_size = len(Box.build(box))
-            offset = box_start + box_size
+            offset = box_start + len(built)
 
         except IOError:
             break
@@ -471,7 +602,7 @@ def get_boxes(data: bytes, box_type: bytes, as_bytes: bool = False) -> Box:  # t
             raise e
 
 
-def ap_case(text: str, keep_spaces: bool = False, stop_words: tuple[str] = None) -> str:
+def ap_case(text: str, keep_spaces: bool = False, stop_words: Optional[tuple[str, ...]] = None) -> str:
     """
     Convert a string to title case using AP/APA style.
     Based on https://github.com/words/ap-style-title-case
@@ -685,6 +816,7 @@ def get_extension(value: Union[str, Path, ParseResult]) -> Optional[str]:
         ext = os.path.splitext(value_parsed.path)[1]
         if ext and ext != ".":
             return ext
+    return None
 
 
 def extract_font_family(font_path: Path) -> Optional[str]:
@@ -737,6 +869,8 @@ def get_windows_fonts() -> dict[str, Path]:
     Returns:
         Dictionary mapping font family names to their file paths
     """
+    if sys.platform != "win32":
+        raise OSError("Windows font registry is only available on Windows")
     import winreg
 
     with winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE) as reg:
@@ -777,7 +911,7 @@ def get_unix_fonts() -> dict[str, Path]:
         Dictionary mapping font family names to their file paths
     """
     log = logging.getLogger("get_system_fonts")
-    fonts = {}
+    fonts: dict[str, Path] = {}
 
     font_dirs = [
         Path("/usr/share/fonts"),
@@ -797,9 +931,10 @@ def get_unix_fonts() -> dict[str, Path]:
     return fonts
 
 
+@cache
 def get_system_fonts() -> dict[str, Path]:
     """
-    Get system fonts as a mapping of font family names to font file paths.
+    Get system fonts as a mapping of font family names to font file paths, scanned once per process.
 
     On Windows: Uses registry to get font display names
     On Linux/macOS: Scans standard font directories and extracts family names using fontTools
@@ -892,7 +1027,7 @@ def find_font_with_fallbacks(font_name: str, system_fonts: dict[str, Path]) -> O
 
 
 # Mapping of font families to system packages that provide them
-FONT_PACKAGES = {
+FONT_PACKAGES: dict[str, dict[str, Any]] = {
     "liberation": {
         "debian": "fonts-liberation fonts-liberation2",
         "fonts": ["Liberation Sans", "Liberation Serif", "Liberation Mono"],
@@ -922,7 +1057,7 @@ def suggest_font_packages(missing_fonts: list[str]) -> dict[str, list[str]]:
     Returns:
         Dictionary mapping package names to lists of fonts they would give
     """
-    suggestions = {}
+    suggestions: dict[str, list[str]] = {}
 
     # Check which fonts from aliases would help
     needed_aliases = set()
@@ -975,7 +1110,7 @@ class DebugLogger:
     This makes it easy to parse, filter, and analyse logs programmatically.
     """
 
-    def __init__(self, log_path: Optional[Path] = None, enabled: bool = False, log_keys: bool = False):
+    def __init__(self, log_path: Optional[Path] = None, enabled: bool = False, log_keys: bool = False) -> None:
         """
         Initialise the debug logger.
 
@@ -990,12 +1125,12 @@ class DebugLogger:
         self.file_handle = None
         self.log_keys = log_keys
 
-        if self.enabled:
+        if self.enabled and self.log_path is not None:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self.file_handle = open(self.log_path, "a", encoding="utf-8")
             self.log_session_start()
 
-    def log_session_start(self):
+    def log_session_start(self) -> None:
         """Log the ``session_start`` entry, with environment information."""
         import platform
 
@@ -1022,13 +1157,13 @@ class DebugLogger:
         message: str = "",
         context: Optional[dict[str, Any]] = None,
         service: Optional[str] = None,
-        error: Optional[Exception] = None,
+        error: Optional[BaseException] = None,
         request: Optional[dict[str, Any]] = None,
         response: Optional[dict[str, Any]] = None,
         duration_ms: Optional[float] = None,
         success: Optional[bool] = None,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """
         Log a structured JSON entry.
 
@@ -1048,7 +1183,7 @@ class DebugLogger:
         if not self.enabled or not self.file_handle:
             return
 
-        entry = {
+        entry: dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "session_id": self.session_id,
             "level": level,
@@ -1146,7 +1281,7 @@ class DebugLogger:
         except Exception:
             return f"[{type(data).__name__}]"
 
-    def log_operation_start(self, operation: str, **kwargs) -> str:
+    def log_operation_start(self, operation: str, **kwargs: Any) -> str:
         """
         Log the start of an operation and return an operation ID.
 
@@ -1168,8 +1303,13 @@ class DebugLogger:
         return op_id
 
     def log_operation_end(
-        self, operation: str, operation_id: str, success: bool = True, duration_ms: Optional[float] = None, **kwargs
-    ):
+        self,
+        operation: str,
+        operation_id: str,
+        success: bool = True,
+        duration_ms: Optional[float] = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Log the end of an operation.
 
@@ -1190,7 +1330,7 @@ class DebugLogger:
             **kwargs,
         )
 
-    def log_service_call(self, method: str, url: str, **kwargs):
+    def log_service_call(self, method: str, url: str, **kwargs: Any) -> None:
         """
         Log a service API call.
 
@@ -1205,7 +1345,7 @@ class DebugLogger:
             level=level, operation="service_call", message=message, request={"method": method, "url": url, **kwargs}
         )
 
-    def log_drm_operation(self, drm_type: str, operation: str, **kwargs):
+    def log_drm_operation(self, drm_type: str, operation: str, **kwargs: Any) -> None:
         """
         Log a DRM operation (PSSH extraction, license request, content key retrieval).
 
@@ -1218,7 +1358,7 @@ class DebugLogger:
         level = kwargs.pop("level", "DEBUG")
         self.log(level=level, operation=f"drm_{operation}", message=message, drm_type=drm_type, **kwargs)
 
-    def log_vault_query(self, vault_name: str, operation: str, **kwargs):
+    def log_vault_query(self, vault_name: str, operation: str, **kwargs: Any) -> None:
         """
         Log a vault query operation.
 
@@ -1237,7 +1377,7 @@ class DebugLogger:
             **kwargs,
         )
 
-    def log_error(self, operation: str, error: Exception, **kwargs):
+    def log_error(self, operation: str, error: Exception, **kwargs: Any) -> None:
         """
         Log an error with full context.
 
@@ -1255,7 +1395,7 @@ class DebugLogger:
             **kwargs,
         )
 
-    def close(self):
+    def close(self) -> None:
         """Close the log file and clean up resources."""
         if self.file_handle:
             self.log(level="INFO", operation="session_end", message="Debug logging session ended")
@@ -1285,7 +1425,7 @@ def log_event(operation: str, *, level: str = "DEBUG", message: str = "", **kwar
 
 
 @contextlib.contextmanager
-def timed_operation(operation: str, *, level: str = "DEBUG", message: str = "", **kwargs: Any):
+def timed_operation(operation: str, *, level: str = "DEBUG", message: str = "", **kwargs: Any) -> Iterator[None]:
     """Time a block and log ``operation`` once it finishes, with ``duration_ms``.
 
     Logs at ``level`` with ``success=True`` on normal exit, or at ERROR with the exception and
@@ -1325,7 +1465,7 @@ def timed_operation(operation: str, *, level: str = "DEBUG", message: str = "", 
     )
 
 
-def init_debug_logger(log_path: Optional[Path] = None, enabled: bool = False, log_keys: bool = False):
+def init_debug_logger(log_path: Optional[Path] = None, enabled: bool = False, log_keys: bool = False) -> None:
     """
     Initialise the global debug logger.
 
@@ -1340,7 +1480,7 @@ def init_debug_logger(log_path: Optional[Path] = None, enabled: bool = False, lo
     debug_logger = DebugLogger(log_path=log_path, enabled=enabled, log_keys=log_keys)
 
 
-def close_debug_logger():
+def close_debug_logger() -> None:
     """Close the global debug logger."""
     global debug_logger
     if debug_logger:
@@ -1354,7 +1494,7 @@ def declared_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str,
     A service licence function that never asked for ``pssh`` or ``session_id`` must not fail
     on them. Filter only against a signature this function can read and call by keyword.
     Anything else, such as the licence function of a compiled service, gets every argument,
-    and the caller handles the TypeError.
+    and ``call_licence`` drops each extra it rejects.
     """
     try:
         params = inspect.signature(fn).parameters
@@ -1363,6 +1503,22 @@ def declared_kwargs(fn: Callable[..., Any], kwargs: dict[str, Any]) -> dict[str,
     if "challenge" not in params or any(p.kind is p.VAR_KEYWORD for p in params.values()):
         return kwargs
     return {k: v for k, v in kwargs.items() if k in params}
+
+
+def call_licence(licence: Callable[..., Any], challenge: Any, **extras: Any) -> Any:
+    """Call ``licence`` with ``challenge`` and ``extras``, and drop each extra the call names as unexpected.
+
+    A TypeError that names no offered extra comes from inside the licence function, so it
+    raises at once, and the challenge does not go to the licence server again.
+    """
+    while True:
+        try:
+            return licence(challenge=challenge, **extras)
+        except TypeError as e:
+            rejected = next((k for k in extras if f"'{k}'" in str(e)), None)
+            if rejected is None:
+                raise
+            del extras[rejected]
 
 
 __all__ = (

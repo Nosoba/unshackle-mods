@@ -15,7 +15,7 @@ When a download finishes, unshackle builds the final path from three pieces:
 - **Output directory**: `directories.downloads` from your config, or whatever you pass to `-o/--output` on the command line for a single run.
 - **Folder template**: an optional per-title subfolder. unshackle **always** puts TV episodes and songs in a folder. Movies only get one if you define a `movies` folder template, or a single-string `folder` template that applies to all title kinds (see [Folder templates](#folder-templates)).
 - **Filename template**: the `output_template` for the title kind (movie, series, or song).
-- **Extension**: chosen by the muxer for a movie or an episode: `.mkv` for video, `.mka` for audio-only, `.mks` for subtitle-only, `.mp4` for [DTS:X Profile 2 audio](#dtsx-profile-2-output). unshackle does not mux a song. It remuxes a song into the container of its codec, such as `.flac`, `.opus`, or `.m4a`. Read [Music output files](#music-output-files).
+- **Extension**: chosen by the muxer for a movie or an episode: `.mkv` for video, `.mka` for audio-only, `.mks` for subtitle-only, `.mp4` for [DTS:X Profile 2 and MPEG-H audio](#dtsx-profile-2-and-mpeg-h-output). unshackle does not mux a song. It remuxes a song into the container of its codec, such as `.flac`, `.opus`, or `.m4a`. Read [Music output files](#music-output-files).
 
 !!! example "A typical episode path"
     ```text
@@ -110,9 +110,15 @@ Every variable below is valid in both output and folder templates. unshackle tak
 | `title` | Title name (movie/show/song name; `$` is rendered as `S`) | `The Show` |
 | `title_type` | Media kind of the title | `movie`, `series`, `music` |
 | `year` | Release year | `2024` |
+<<<<<<< HEAD
 | `source` | Service tag: its first `ALIASES` entry, else the class name (empty with `--no-source`) | `EXAMPLE` |
 | `quality` | Resolution with scan suffix | `1080p`, `2160p`, `576i` |
 | `resolution` | Resolution number only | `1080` |
+=======
+| `source` | Service tag / class name (empty with `--no-source`) | `EXAMPLE` |
+| `quality` | Standard resolution with scan suffix | `1080p`, `2160p`, `576i` |
+| `resolution` | Standard resolution number only | `1080` |
+>>>>>>> upstream/dev
 | `video` | Video codec | `H.264`, `H.265` |
 | `hdr` | Dynamic-range label | `HDR`, `HDR10P`, `DV`, `DV.HDR`, `DV.HDR10P`, `HLG` |
 | `hfr` | High frame rate marker (frame rate > 30) | `HFR` |
@@ -121,8 +127,17 @@ Every variable below is valid in both output and folder templates. unshackle tak
 | `repack` | `REPACK` when the `--repack` flag is used | `REPACK` |
 | `lang_tag` | Result of your `language_tags` rules, if configured | `MULTi` |
 
+!!! note "`quality` and `resolution` use the standard height"
+    unshackle names a video by the nearest standard height (4320, 2160, 1440, 1080, 720, 576, 540,
+    480, 360 or 240) when it is within 10%. It measures the short side and the height that a 16:9
+    picture of the same width has, and uses the larger one. So a cropped 1920x800, a padded
+    1920x1088 and a 1080x1920 portrait video are all `1080p`. A short side within 16 lines of
+    2160, 1440 or 1080 gives that height, so an ultrawide 2560x1080 is `1080p`. A size with no
+    standard height near it, such as 1600x900, keeps its own height. `dl -q` and the
+    `dl --export` file name use the same rule.
+
 !!! note "How `language_tags` rules match"
-    unshackle tries the rules in order, but language comparison is **fuzzy**: a rule condition of `en` matches `en-US`, `en-GB`, and any other `en-*` form. Within a single rule, **all** conditions must match (AND logic) for it to apply. The first rule that fully matches wins. If none match, unshackle removes `{lang_tag?}` from the filename cleanly.
+    unshackle tries the rules in order, and they compare languages with the same [matching rules](downloading.md#exact-vs-fuzzy-matching) as `-l`: a rule condition of `en` matches `en-US`, `en-GB`, and any other `en-*` form, but `es-419` matches only `es-419`. Within a single rule, **all** conditions must match (AND logic) for it to apply. The first rule that fully matches wins. If none match, unshackle removes `{lang_tag?}` from the filename cleanly.
 
 ### Episode-specific
 
@@ -165,13 +180,40 @@ The same holds for a folder template of your own: `{season}` never picks up the 
 
 For custom templates there is also a standalone [`{part}`](../reference/configuration/output.md#output_template) variable. You rarely want it, see the caveat on that page.
 
+### Sports events {#sports-events}
+
+A service can mark an episode as a sports event. That episode then uses the `sports` output template and the `sports` folder template, if you set them. Without them it uses the `series` templates, as before.
+
+```yaml title="unshackle.yaml"
+output_template:
+  sports: "{title}.{year?}.{date?}.{episode_name}.{quality}.{source}.WEB-DL.{audio_full}.{video}-{tag}"
+  folder:
+    sports: "{title}.{year?}"
+```
+
+A `sports` template can use every series variable, with two differences:
+
+- `{date}` holds the air date in the separator style of the template (`2026.11.01`), and is empty when the event has no air date.
+- `{year}` is empty when the event has an air date, because the date holds the year.
+
+An event with a year and no air date, and an event with an air date:
+
+```text
+League.2026/
+  └─ League.2026.City.Grand.Prix.Practice.One.1080p.EXAMPLE.WEB-DL.AAC2.0.H.264-TAG.mkv
+Club.League.2026/
+  └─ Club.League.2026.11.01.Home.Club.vs.Away.Club.1080p.EXAMPLE.WEB-DL.AAC2.0.H.264-TAG.mkv
+```
+
+A `sports` folder template groups by `{year}`, or by the air year when the event has no year. `{season}`, `{episode}` and `{season_episode}` are not useful in a `sports` template. Use `-w S01E02` to select an event: the season and episode numbers stay on the title.
+
 ### Audio
 
 | Variable | Meaning | Example |
 |---|---|---|
-| `audio` | Audio codec | `DDP`, `DD`, `AAC`, `DTS-X` |
+| `audio` | Audio codec; rename it with [`codec_names`](../reference/configuration/output.md#codec_names) | `DDP`, `DD`, `AAC`, `DTS-X` |
 | `audio_channels` | Channel layout; bed.LFE.heights when the track has height channels | `5.1`, `2.0`, `5.1.4` |
-| `audio_full` | Codec + channels combined | `DDP5.1`, `DTS-X.5.1.4` |
+| `audio_full` | Codec + channels combined; a name that ends in a digit gets a separator | `DDP5.1`, `DTS-X.5.1.4`, `AC-4.2.0` |
 | `atmos` | `Atmos` when any track carries JOC | `Atmos` |
 | `dual` | `DUAL` for two audio languages (see [`dual_multi_mode`](../reference/configuration/download.md#dual_multi_mode)) | `DUAL` |
 | `multi` | `MULTi` for more than two audio languages | `MULTi` |
@@ -219,12 +261,12 @@ Folder templates sit under a special `folder` config key inside `output_template
         albums: "{artist} - {album} ({year})"
     ```
 
-The per-kind folder config keys are `movies`, `series`, `songs`, and `albums`. Any other config key gives a startup warning. Folder templates permit path separators (`/` or `\`). unshackle formats each segment independently, so you can assemble nested directory structures like `Show/Season 01`. unshackle reads the separator style from the whole template, so it spaces every segment alike.
+The per-kind folder config keys are `movies`, `series`, `sports`, `songs`, and `albums`. Any other config key gives a startup warning. Folder templates permit path separators (`/` or `\`). unshackle formats each segment independently, so you can assemble nested directory structures like `Show/Season 01`. unshackle reads the separator style from the whole template, so it spaces every segment alike.
 
 **Fallback behaviour:**
 
 - A per-kind folder template wins if present. If there is none, unshackle uses the single `folder` string. If there is no `folder` string either, unshackle falls back to a built-in default.
-- Built-in defaults when no folder template is set. Movies get no folder at all unless a `movies` folder template (or a single-string `folder` template) exists. Series fall back to a folder *derived* from the `series` output template (stripping `{episode}`, `{episode_name}`, and collapsing `{season_episode}` down to `{season}`). Music albums fall back to `{artist} - {album} ({year})`. If the song has no year, the folder name is only `{artist} - {album}`.
+- Built-in defaults when no folder template is set. Movies get no folder at all unless a `movies` folder template (or a single-string `folder` template) exists. Series fall back to a folder *derived* from the `series` output template (stripping `{episode}`, `{episode_name}`, and collapsing `{season_episode}` down to `{season}`). A sports event with no `sports` folder template uses the `series` folder template, or derives its folder from the `sports` output template when there is no folder template. Music albums fall back to `{artist} - {album} ({year})`. If the song has no year, the folder name is only `{artist} - {album}`.
 
 !!! note "Movies are flat by default"
     Episodes and songs are always foldered. unshackle writes movies directly into the output directory *unless* you define a `movies` folder template (or a single-string `folder` template, which folders every kind). Set one if you want each movie in its own directory.
@@ -242,6 +284,7 @@ final path.
 | FLAC | `.flac` |
 | Opus | `.opus` |
 | Vorbis | `.ogg` |
+| MP3 | `.mp3` |
 | AAC, ALAC, and all other codecs | `.m4a` |
 
 unshackle re-encodes FLAC in this step. The audio does not change, but the new file states its
@@ -275,6 +318,10 @@ unshackle writes lyrics when the service supplies them: a `LYRICS` Vorbis commen
 `USLT` frame for MP3, and a `©lyr` atom for M4A. Ogg uses the same `LYRICS` field as
 FLAC. unshackle does not write synchronized lyrics (`SYLT`).
 
+The embedded lyrics are plain text. A service can also save timed lyrics in a file beside
+the audio, for example `08.Get.Lucky.lrc` next to `08.Get.Lucky.m4a`. A music player reads
+the timed lines from that file. The file also comes back to the client from a remote server.
+
 A metadata fault does not stop the run. The file is already in place, so unshackle writes a
 warning and continues.
 
@@ -286,11 +333,104 @@ warning and continues.
 !!! note "Height channels"
     A track with height channels is named bed.LFE.heights, such as `5.1.4`.
 
-### DTS:X Profile 2 output
+### Track names and language tags
 
-A title whose audio holds a `dtsx` or `dtsy` sample entry (DTS:X Profile 2, DTS-UHD) muxes
-to MP4 with [MP4Box](../getting-started/installation.md), because Matroska has no CodecID
-for it. Without MP4Box installed the mux stops.
+When the service gives a track no name, unshackle names it with the English name of its language,
+such as `English`, `Portuguese (Portugal)` or `Spanish (Latin America)`. The name leaves out the
+region that is the default for the language, so `en-US` is `English` and `pt-BR` is `Portuguese`,
+but `en-GB` is `English (United Kingdom)`. A name from the service is kept as is. unshackle adds the SDH, CC, Forced or Descriptive label after either name.
+
+A subtitle in a language with more than one script gets the script from its region:
+
+| Service tag | Tag in the file | Track name |
+|-------------|-----------------|------------|
+| `zh-TW` | `zh-Hant-TW` | Chinese (Traditional) |
+| `zh-HK` | `zh-Hant-HK` | Chinese (Traditional, Hong Kong) |
+| `zh-CN` | `zh-Hans-CN` | Chinese (Simplified) |
+| `sr-ME` | `sr-Latn-ME` | Serbian (Latin, Montenegro) |
+| `zh` | `zh` | Chinese |
+
+A tag without a region, such as `zh`, gets no script because the region is what tells the script.
+unshackle writes audio tags as the service gives them, because a script applies only to written text.
+Track selection, `--list` tags and file names use the service tag.
+
+A service that knows the spoken language, such as Mandarin or Cantonese, gives the title language and
+the audio a region and no script, and gives the subtitles a script:
+
+| Tracks | Mandarin, Taiwan | Cantonese, Hong Kong |
+|--------|------------------|----------------------|
+| Title language and audio | `cmn-TW` | `yue-HK` |
+| Subtitles | `zh-Hant` or `cmn-Hant` | `yue-Hant` |
+
+With these tags, `-l orig` selects the audio and `-sl orig` selects the Traditional subtitles. Do not
+mix the forms. A bare `cmn` implies Simplified Chinese, so a `cmn` title language makes `-sl orig`
+select Simplified subtitles. A `zh-TW` title language with `cmn` audio selects no audio, because
+`zh-TW` implies Traditional Chinese. Cantonese and Chinese never match, so `-sl orig` on a `yue-HK`
+title does not select `zh-Hant` subtitles; select them with `-sl zh-Hant`.
+
+The `{dual}`, `{multi}` and `{dubbed}` file name tags count `cmn` as `zh` and keep `yue` separate
+(see [`dual_multi_mode`](../reference/configuration/download.md#dual_multi_mode)).
+
+Set `muxing.track_names` to `native` to name each track in its own language. The same rules apply
+to the script and the region:
+
+```yaml title="unshackle.yaml"
+muxing:
+  track_names: native
+```
+
+| Service tag | Track name |
+|-------------|------------|
+| `zh-TW` subtitle | 中文（繁體） |
+| `zh-HK` subtitle | 中文（繁體，香港） |
+| `pt-PT` | Português (Portugal) |
+| `es-419` | Español (Latinoamérica) |
+| `ja-JP` | 日本語 |
+
+Set `muxing.track_names` to `none` to leave a track unnamed when the service gives it no name. An
+SDH, CC, Forced or Descriptive track then has only that label as its name.
+
+The option also changes the names in `--list` and in the `track_name` field of the REST API.
+
+Set `muxing.original_label` to add a label after the name of each audio and subtitle track in the
+title's original language. unshackle also sets the Matroska original flag on these tracks, but some
+players show only the name. MP4 output has no original flag, so there the label is the only marker:
+
+```yaml title="unshackle.yaml"
+muxing:
+  original_label: "[Original]"
+```
+
+| Track | Track name |
+|-------|------------|
+| Japanese audio, original language | Japanese [Original] |
+| Japanese SDH subtitle, original language | Japanese [Original] (SDH) |
+| Korean subtitle | Korean |
+
+The label can be any text, for example `"| Original"` or a label in another language. Put it in
+quotes: YAML reads an unquoted `[Original]` as a list, and an unquoted `| Original` stops the config
+from loading. unshackle ignores a value that is not text.
+
+The label also applies to a name that the service sets, and to audio that a service keeps inside the
+video file. unshackle does not add the label when the name already contains its words, so a service
+name `Original` or `Japanese (original)` stays as it is.
+
+!!! tip "Use an English label with Jellyfin 12"
+    Jellyfin 12 adds its own "Original" to an original-language audio track from the flag, unless the
+    name already contains the word. It adds none to a subtitle. A label in another language, such as `[원어]`, then shows next to Jellyfin's
+    "Original".
+
+!!! note "Players that show the language next to the name"
+    Some players, such as Jellyfin, show the track name and the language name together. They leave
+    out the language when the name already contains it, so an English name shows once. A native name
+    such as `日本語` shows next to `Japanese` in an English interface.
+
+### DTS:X Profile 2 and MPEG-H output
+
+A title whose audio holds a `dtsx` or `dtsy` sample entry (DTS:X Profile 2, DTS-UHD), or an
+MPEG-H sample entry (`mha1`, `mha2`, `mhm1`, `mhm2`), muxes to MP4 with
+[MP4Box](../getting-started/installation.md), because Matroska has no CodecID for it.
+Without MP4Box installed the mux stops.
 
 DTS:X Profile 1 is DTS-HD Master Audio and muxes to MKV as usual.
 
@@ -342,6 +482,22 @@ A few muxing behaviors are automatic and not configurable:
 - unshackle writes the chapters from the title's chapter list (see [Chapters](#chapters-naming) below).
 
 The `--no-mux` flag skips muxing entirely and writes the individual track files, each with a track-type suffix, into the same output/folder structure.
+
+## Sample files
+
+[`--sample`](cli-reference.md#output-muxing-files) and `--include-sample` write a sample into a
+`Sample` folder inside the output folder of the title. The sample keeps the filename of the
+title, with a `SAMPLE` tag at the end. The tag uses the separator of the output template.
+
+```text title="A movie with --include-sample"
+Some.Movie.2026.1080p.EXAMPLE.WEB-DL.H.264-TAG/
+├── Some.Movie.2026.1080p.EXAMPLE.WEB-DL.H.264-TAG.mkv
+└── Sample/
+    └── Some.Movie.2026.1080p.EXAMPLE.WEB-DL.H.264-TAG.SAMPLE.mkv
+```
+
+With `--sample`, the `Sample` folder holds the only output file. If the run makes no title
+folder, the `Sample` folder is in the downloads directory.
 
 ## Tags & group naming
 

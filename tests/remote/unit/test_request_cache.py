@@ -4,8 +4,10 @@ The directory holds only what the client sent, goes back to the client when it l
 itself, and is always removed when the request ends.
 """
 
+import asyncio
 import base64
 import json
+import types
 import zlib
 
 import click
@@ -124,6 +126,17 @@ async def test_cache_dir_removed_on_error(seen, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_search_answers_a_service_sys_exit_with_an_error(seen, tmp_path, monkeypatch):
+    def search(self):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(_CacheService, "search", search)
+    response = await handlers.search_handler({"service": "EXAMPLE", "query": "q"})
+    assert json.loads(response.body)["error_code"] == "SERVICE_ERROR"
+    assert not request_dirs(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_invalid_client_cache_still_removes_the_dir(seen, tmp_path):
     data = {"service": "EXAMPLE", "query": "q", "cache": {"tokens": 1}}
     with pytest.raises(handlers.APIError):
@@ -142,6 +155,27 @@ async def test_server_account_uses_its_own_cache_and_returns_none(seen, tmp_path
     assert not seen["seeded"]
     assert seen["cache_dir"] == tmp_path / "_accounts" / "EXAMPLE" / "acct"
     assert not (tmp_path / "_requests").exists()
+
+
+@pytest.mark.asyncio
+async def test_anonymous_search_skips_the_login_and_keeps_the_account_cache(seen, tmp_path, monkeypatch):
+    def search(self):
+        seen["search_cache_dir"] = self.cache.get("tokens").path.parent
+        return iter(())
+
+    def no_login_material(*args):
+        raise AssertionError("an anonymous search must not read login material")
+
+    handlers.Services.load("EXAMPLE").ANONYMOUS_SEARCH = True
+    monkeypatch.setattr(_CacheService, "search", search)
+    monkeypatch.setattr(handlers, "resolve_server_account", lambda *args: "acct")
+    monkeypatch.setattr(handlers, "server_login_material", no_login_material)
+    response = await handlers.search_handler({"service": "EXAMPLE", "query": "q", **CREDENTIALS})
+
+    assert json.loads(response.body)["results"] == []
+    assert "seeded" not in seen
+    assert seen["parent_params"]["cookies_supplied"] is False
+    assert seen["search_cache_dir"] == tmp_path / "_accounts" / "EXAMPLE" / "acct"
 
 
 @pytest.mark.asyncio
@@ -171,3 +205,24 @@ async def test_list_tracks_service_sees_dl_params(seen):
 async def test_search_service_gets_no_dl_params(seen):
     await handlers.search_handler({"service": "EXAMPLE", "query": "q", "dl_params": {"a_lang": ["es-419"]}})
     assert "a_lang" not in seen["parent_params"]
+
+
+@pytest.mark.asyncio
+async def test_samples_answers_a_service_exit_in_decrypts_samples(monkeypatch):
+    class Service:
+        def decrypts_samples(self, track):
+            raise SystemExit(1)
+
+    session = types.SimpleNamespace(
+        tracks={"t": object()}, service_instance=Service(), service_tag="EXAMPLE", lock=asyncio.Lock()
+    )
+
+    async def get_session(session_id, request=None):
+        return session
+
+    monkeypatch.setattr(handlers, "get_validated_session", get_session)
+    monkeypatch.setattr(handlers, "require_authenticated", lambda s: None)
+    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
+    with pytest.raises(handlers.APIError) as e:
+        await handlers.session_samples_handler("sid", "t", "1", b"")
+    assert e.value.error_code.value == "SERVICE_ERROR"

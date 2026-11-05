@@ -27,10 +27,12 @@ from requests.adapters import HTTPAdapter, Retry
 from rich import filesize
 
 from unshackle.core.constants import DOWNLOAD_CANCELLED, DownloadCancelled
-from unshackle.core.utilities import get_debug_logger, get_extension
+from unshackle.core.utilities import get_debug_logger, get_extension, log_event
+from unshackle.core.utils import run_proxy
 
 MAX_ATTEMPTS = 5
 RETRY_WAIT = 2
+GAVE_UP_NOTE = "gave up after"
 # a cut that still delivered bytes is resumable and refreshes the attempt budget; bound it
 # so a server that sends a little and closes, over and over, still terminates
 MAX_RESUMES = 50
@@ -152,7 +154,7 @@ def parse_speed_limit(value: Union[str, int, float, None]) -> Optional[float]:
         return None
     match = re.fullmatch(r"(\d*\.?\d+)\s*([kmg]b?|b)?", text)
     if not match:
-        raise ValueError(f"Invalid speed limit {value!r}: use e.g. 500k, 5M, 1.5G, plain bytes/sec, or 'off'.")
+        raise ValueError(f"Invalid speed limit {value!r}: expected 500k, 5M, 1.5G, bytes per second or 'off'")
     return float(match.group(1)) * SPEED_UNITS[match.group(2) or ""]
 
 
@@ -323,15 +325,12 @@ class AdaptiveWorkerController:
 def permanent_status(exc: BaseException) -> Optional[int]:
     """HTTP status of ``exc`` when it is a client error that no retry can fix.
 
-    Both session types raise requests' HTTPError; RnetSession wraps it in MaxRetriesError
-    as ``__cause__``, so unwrap one level like retry_sleep does. 408 and 429 do not count:
-    they are transient, and a fan-out that trips a per-client rate limit can still succeed
-    over one sequential connection.
+    408 and 429 do not count: they are transient, and a fan-out that trips a per-client rate
+    limit can still succeed over one sequential connection.
     """
-    response = getattr(exc, "response", None)
-    if response is None:
-        response = getattr(getattr(exc, "__cause__", None), "response", None)
-    status = getattr(response, "status_code", None)
+    from unshackle.core.session import failure_response
+
+    status = getattr(failure_response(exc), "status_code", None)
     if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429):
         return status
     return None
@@ -357,12 +356,9 @@ def retry_sleep(exc: Exception, attempts: int) -> float:
     else exponential growth from RETRY_WAIT with jitter so concurrently rate-limited
     segments do not retry in lockstep. Capped at ``session.MAX_BACKOFF`` either way.
     """
-    from unshackle.core.session import MAX_BACKOFF
+    from unshackle.core.session import MAX_BACKOFF, failure_response
 
-    response = getattr(exc, "response", None)
-    if response is None:
-        # RnetSession wraps forcelist failures in MaxRetriesError with the HTTPError as __cause__
-        response = getattr(getattr(exc, "__cause__", None), "response", None)
+    response = failure_response(exc)
     if response is not None:
         try:
             retry_after = response.headers.get("Retry-After")
@@ -386,6 +382,11 @@ def retry_sleep(exc: Exception, attempts: int) -> float:
     return min(backoff + random.uniform(0, backoff * 0.1), MAX_BACKOFF)
 
 
+def retries_exhausted(exc: BaseException) -> bool:
+    """Whether ``exc`` is the error download() re-raised after it spent every attempt."""
+    return any(str(note).startswith(GAVE_UP_NOTE) for note in getattr(exc, "__notes__", ()))
+
+
 def is_requests_session(session: Any) -> bool:
     """Whether the HTTP session is a standard requests.Session (it has ``resp.raw``)."""
     return isinstance(session, Session)
@@ -403,7 +404,7 @@ def no_retry_session(session: Session) -> Session:
     view.adapters = OrderedDict()
     for prefix, adapter in session.adapters.items():
         twin = copy(adapter)
-        twin.max_retries = Retry(0, read=False)
+        twin.max_retries = Retry(0, read=False)  # type: ignore[attr-defined]
         if isinstance(adapter, HTTPAdapter) and isinstance(twin, HTTPAdapter):
             twin.poolmanager = adapter.poolmanager
             twin.proxy_manager = adapter.proxy_manager
@@ -813,6 +814,9 @@ def download(
     item_range = has_range_header(kwargs)
 
     attempts = 1
+    # attempts resets on progress, so the give-up note counts failures on their own
+    failures = 0
+    started = _time()
     written = 0
     resumes = 0
     request_limit: Optional[int] = None
@@ -865,7 +869,7 @@ def download(
                     req_headers["Range"] = f"bytes={resume_offset}-"
             request_kwargs["headers"] = req_headers
 
-            stream = session.get(url, stream=True, **request_kwargs)
+            stream: Any = session.get(url, stream=True, **request_kwargs)
 
             if (not part_mode) and (not item_range) and resume_offset > 0 and stream.status_code == 416:
                 complete = parse_content_range_unsatisfied(
@@ -1026,7 +1030,7 @@ def download(
             # (unsatisfiable Range on retry, silent zero-padded corruption). part_mode still
             # pre-truncates in dispatch_parts because its workers seek to fixed offsets.
             with open(save_path if part_mode else tmp_file, file_mode, buffering=file_buffering) as f:
-                if part_mode:
+                if part_mode and part_offset is not None:  # spelled so mypy narrows
                     f.seek(part_offset + written)
 
                 _write = f.write
@@ -1140,11 +1144,13 @@ def download(
             # a superseded loser's error must not retry or kill the batch
             if claimed is not None and claimed():
                 return
+            failures += 1
             cancelled = DOWNLOAD_CANCELLED.is_set() or (abort is not None and abort.is_set())
             if cancelled or attempts == MAX_ATTEMPTS:
                 # cancel/abort is not an error, but a genuine retry-exhaustion is, so surface it
                 # so the caller fails fast instead of hitting a missing segment at merge time
                 if not cancelled:
+                    exc.add_note(f"{GAVE_UP_NOTE} {failures} failed attempts over {_time() - started:.0f}s")
                     raise
                 return
             if not part_mode:
@@ -1168,6 +1174,13 @@ def download(
                 except Exception:
                     pass
             delay = retry_sleep(exc, max(1, attempts))
+            from unshackle.core.session import failure_reason
+
+            log_event(
+                "segment_retry",
+                message=f"{failure_reason(exc)}, retry {max(1, attempts)}/{MAX_ATTEMPTS - 1} in {delay:.1f}s",
+                context={"file": save_path.name, "failures": failures, "resumes": resumes},
+            )
             if abort is not None:
                 # interruptible nap: backoff can reach MAX_BACKOFF, and teardown always
                 # sets the batch abort, so a parked worker must wake and exit at once
@@ -1215,6 +1228,7 @@ def build_session_spec(session: Optional[Any]) -> Optional[dict[str, Any]]:
             "headers": dict(session.headers),
             "cookies": session.cookies,  # RequestsCookieJar pickles cleanly
             "proxies": dict(session.proxies),
+            "trust_env": session.trust_env,
             "params": copy(session.params),
             "verify": session.verify,
             "cert": session.cert,
@@ -1233,7 +1247,7 @@ def build_session_spec(session: Optional[Any]) -> Optional[dict[str, Any]]:
             "kind": "rnet",
             "impersonate": name,
             "headers": dict(session.headers),
-            "cookies": session.cookies.get_dict_by_domain(),
+            "cookies": session.cookies.snapshot(),  # stdlib Cookies pickle with their paths
             "origin_cookies": session.export_origin_cookies(),
             "proxy": session.proxies.get("all") or session.proxies.get("https") or session.proxies.get("http"),
         }
@@ -1260,6 +1274,7 @@ def rebuild_session(spec: dict[str, Any], max_workers: int) -> Optional[Any]:
             rs.cookies.update(spec["cookies"])
         if spec.get("proxies"):
             rs.proxies.update(spec["proxies"])
+        rs.trust_env = spec.get("trust_env", True)
         if spec.get("params"):
             rs.params = spec["params"]
         rs.verify = spec.get("verify", True)
@@ -1275,13 +1290,7 @@ def rebuild_session(spec: dict[str, Any], max_workers: int) -> Optional[Any]:
         ns = make_session(spec["impersonate"])
         if spec.get("headers"):
             ns.headers.update(spec["headers"])
-        for domain, jar in spec.get("cookies", {}).items():
-            if domain:
-                for name, value in jar.items():
-                    ns.cookies.set(name, value, domain=domain)
-            else:
-                # no domain to scope to; update() reproduces the parent's localhost-scoped state
-                ns.cookies.update(jar)
+        ns.cookies.update(spec.get("cookies") or [])
         if spec.get("proxy"):
             ns.proxies.update({"all": spec["proxy"]})
         ns.import_origin_cookies(spec.get("origin_cookies") or {})
@@ -1312,8 +1321,13 @@ def mp_worker(queue: Any, kwargs: dict[str, Any]) -> None:
         for event in requests(**kwargs):
             queue.put(event)
     except Exception as exc:
-        summary = " ".join(f"{type(exc).__name__}: {exc}".split())
-        queue.put({"__mp_error__": f"{summary}\n{traceback.format_exc()}"})
+        queue.put(
+            {
+                "__mp_error__": " ".join(f"{type(exc).__name__}: {exc}".split()),
+                "__mp_traceback__": traceback.format_exc(),
+                "__mp_notes__": [str(note) for note in getattr(exc, "__notes__", ())],
+            }
+        )
     finally:
         queue.put({"__mp_done__": True})
 
@@ -1429,7 +1443,11 @@ def download_multiprocess(
                 if "__mp_error__" in event:
                     for p in procs:
                         p.terminate()
-                    raise RuntimeError(f"segment download child failed: {event['__mp_error__']}")
+                    log_event("segment_child_failed", level="ERROR", message=event.get("__mp_traceback__", ""))
+                    child_error = RuntimeError(f"segment download child failed: {event['__mp_error__']}")
+                    for note in event.get("__mp_notes__", ()):
+                        child_error.add_note(note)
+                    raise child_error
                 if "total" in event:
                     continue
                 if "downloaded" in event:
@@ -1469,7 +1487,7 @@ def download_multiprocess(
 
 
 def requests(
-    urls: Union[str, list[str], dict[str, Any], list[dict[str, Any]]],
+    urls: Union[str, dict[str, Any], list[str], list[dict[str, Any]], list[Union[str, dict[str, Any]]]],
     output_dir: Path,
     filename: str,
     headers: Optional[MutableMapping[str, Union[str, bytes]]] = None,
@@ -1649,6 +1667,7 @@ def requests(
             session.cookies.update(cookies)
         if proxy:
             session.proxies.update({"all": proxy})
+            run_proxy.pin(session)
         adapter = HTTPAdapter(pool_connections=max_workers, pool_maxsize=max_workers, pool_block=True)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
@@ -2081,16 +2100,16 @@ def requests(
 
                 completed, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
                 for future in completed:
-                    exc = future.exception()
-                    if isinstance(exc, KeyboardInterrupt):
+                    err = future.exception()
+                    if isinstance(err, KeyboardInterrupt):
                         raise KeyboardInterrupt()
-                    elif isinstance(exc, TailPartFailed) and permanent_status(exc) is None:
-                        if exc.index not in tail_skipped:
-                            tail_boosted.discard(exc.index)
-                            tail_skipped.add(exc.index)
-                            remaining.appendleft((exc.index, urls[exc.index]))
+                    elif isinstance(err, TailPartFailed) and permanent_status(err) is None:
+                        if err.index not in tail_skipped:
+                            tail_boosted.discard(err.index)
+                            tail_skipped.add(err.index)
+                            remaining.appendleft((err.index, urls[err.index]))
                         continue
-                    elif exc:
+                    elif err:
                         DOWNLOAD_CANCELLED.set()
                         yield dict(downloaded="[red]FAILING")
                         pool.shutdown(wait=False, cancel_futures=True)
@@ -2099,14 +2118,14 @@ def requests(
                             debug_logger.log(
                                 level="ERROR",
                                 operation="downloader_failed",
-                                message=f"Download failed: {exc}",
-                                error=exc,
+                                message=f"Download failed: {err}",
+                                error=err,
                                 context={
                                     "url_count": len(urls),
                                     "output_dir": str(output_dir),
                                 },
                             )
-                        raise exc
+                        raise err
         except KeyboardInterrupt:
             DOWNLOAD_CANCELLED.set()
             yield dict(downloaded="[yellow]CANCELLING")

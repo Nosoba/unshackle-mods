@@ -4,10 +4,13 @@ import logging
 import math
 import shutil
 import sys
+import unicodedata
 from datetime import datetime
+from functools import lru_cache
 from types import ModuleType
-from typing import IO, Any, Callable, Iterable, List, Literal, Mapping, Optional, TextIO, Union
+from typing import IO, Any, Callable, Iterable, List, Literal, Mapping, Optional, Sized, TextIO, Union, cast
 
+import rich.cells
 from rich import box
 from rich._log_render import FormatTimeCallable, LogRender
 from rich.color import Color, blend_rgb
@@ -210,7 +213,7 @@ class ComfyConsole(Console):
         get_time: Optional[Callable[[], float]] = None,
         _environ: Optional[Mapping[str, str]] = None,
         log_renderer: Optional[LogRender] = None,
-    ):
+    ) -> None:
         super().__init__(
             color_system=color_system,
             force_terminal=force_terminal,
@@ -244,12 +247,12 @@ class ComfyConsole(Console):
         if log_renderer:
             self._log_render = log_renderer
 
-    def status(
+    def status(  # type: ignore[override]
         self,
         status: RenderableType,
         *,
         spinner: str = "dots",
-        spinner_style: str = "status.spinner",
+        spinner_style: StyleType = "status.spinner",
         speed: float = 1.0,
         refresh_per_second: float = 12.5,
         pad: PaddingDimensions = (0, 5),
@@ -279,8 +282,8 @@ class ComfyConsole(Console):
         if pad:
             top, right, bottom, left = Padding.unpack(pad)
 
-            renderable_width = len(status_renderable.status)
-            spinner_width = len(status_renderable.renderable.text)
+            renderable_width = len(cast(Sized, status_renderable.status))
+            spinner_width = len(cast(Sized, status_renderable.renderable.text))
             status_width = spinner_width + renderable_width
 
             available_width = self.width - status_width
@@ -324,8 +327,8 @@ class ComfyConsole(Console):
                 live.start()
 
 
-primary_scheme = resolve_palette(config.theme)
-if primary_scheme is None:
+primary_scheme: dict[str, str] = resolve_palette(config.theme) or {}
+if not primary_scheme:
     logging.getLogger("console").warning(
         "Unknown theme %r, falling back to %s (available: %s)",
         config.theme,
@@ -413,6 +416,34 @@ def force_utf8_streams() -> None:
 
 
 force_utf8_streams()
+
+_rich_cell_size = rich.cells.get_character_cell_size
+
+
+@lru_cache(maxsize=4096)
+def _cell_size(character: str, *args: str) -> int:
+    """Count a spacing combining mark (Mc, e.g. Devanagari ि) as one cell, as terminals draw it; Rich's table says 0."""
+    return 1 if unicodedata.category(character) == "Mc" else _rich_cell_size(character, *args)
+
+
+# the viramas that join the next consonant into one cluster (Unicode InCB=Linker); Tamil and Kannada do not
+_JOINING_VIRAMAS = frozenset("्্્୍్്")
+_rich_cell_len = rich.cells._cell_len
+
+
+def _cell_len(text: str, unicode_version: str) -> int:
+    """Count a consonant joined by a virama (the न्द in हिन्दी) as no cell: terminals draw the conjunct in one."""
+    width = _rich_cell_len(text, unicode_version)
+    if _JOINING_VIRAMAS.isdisjoint(text):
+        return width
+    return width - sum(
+        prev in _JOINING_VIRAMAS and unicodedata.category(char) == "Lo" for prev, char in zip(text, text[1:])
+    )
+
+
+rich.cells.get_character_cell_size = _cell_size
+rich.cells._cell_len = _cell_len
+rich.cells.cached_cell_len.cache_clear()
 
 console = ComfyConsole(
     log_time=False,
@@ -554,6 +585,21 @@ def prompt_user(prompt: str) -> str:
     return console.input(body)
 
 
+_notice_handler: Optional[Callable[[Optional[str]], None]] = None
+
+
+def set_notice_handler(handler: Optional[Callable[[Optional[str]], None]]) -> None:
+    """Route every :func:`show_notice` call to *handler*, for a process whose log output no user reads."""
+    global _notice_handler
+    _notice_handler = handler
+
+
+def show_notice(message: Optional[str]) -> None:
+    """Give *message* to the notice handler, or None to clear it. Without a handler this does nothing."""
+    if _notice_handler is not None:
+        _notice_handler(message)
+
+
 __all__ = (
     "ComfyLogRenderer",
     "ComfyRichHandler",
@@ -566,5 +612,7 @@ __all__ = (
     "listing_table",
     "print_wide",
     "prompt_user",
+    "set_notice_handler",
     "set_prompt_handler",
+    "show_notice",
 )

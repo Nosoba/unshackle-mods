@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from langcodes import Language
+from rich.markup import escape
 from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn, TimeRemainingColumn
 from rich.table import Table
 from rich.tree import Tree
@@ -24,16 +26,19 @@ from unshackle.core.tracks.attachment import Attachment
 from unshackle.core.tracks.audio import Audio
 from unshackle.core.tracks.chapters import Chapter, Chapters
 from unshackle.core.tracks.subtitle import Subtitle
-from unshackle.core.tracks.track import Track, has_dts_uhd_sample_entry, strip_duplicate_init_boxes
+from unshackle.core.tracks.track import Track, has_mp4_only_audio_entry, strip_duplicate_init_boxes
 from unshackle.core.tracks.video import Video
 from unshackle.core.utilities import (
     is_close_match,
     log_event,
     matching_languages,
+    original_tag,
     sanitize_filename,
+    standard_resolution,
     valid_language,
 )
 from unshackle.core.utils.collections import as_list, flatten
+from unshackle.core.utils.subprocess import run_step
 
 MP4BOX_PROGRESS = re.compile(r"\((\d{1,3})/100\)")
 MP4BOX_OPEN_FAILED = re.compile(r"error while opening|Error opening file|Invalid IsoMedia File", re.I)
@@ -84,6 +89,30 @@ MANUAL_TRANSLATIONS = {
 }
 
 
+def at_resolution(video: Video, res: int) -> bool:
+    """Whether a track has this height, this height from a 16:9 width, or this standard resolution (a padded encode)."""
+    return (
+        video.height == res
+        or bool(video.width and int(video.width * 9 / 16) == res)
+        or standard_resolution(video.width, video.height) == res
+    )
+
+
+def file_track_ids(path: Path) -> dict[str, int]:
+    """Return the mkvmerge ID of the first track of each type in a file. A TS file can hold its audio first."""
+    res = subprocess.run(
+        [str(binaries.MKVToolNix), "-J", str(path)], capture_output=True, text=True, encoding="utf-8", errors="replace"
+    )
+    ids: dict[str, int] = {}
+    for track in json.loads(res.stdout or "{}").get("tracks") or []:
+        ids.setdefault(track["type"], track["id"])
+    if not ids:
+        logging.getLogger("Tracks").debug(
+            f"mkvmerge found no tracks in {path.name}, so it is addressed as video 0, audio 1"
+        )
+    return ids or {"video": 0, "audio": 1}
+
+
 class Tracks:
     """
     Video, Audio, Subtitle, Chapter, and Attachment Track Store.
@@ -98,7 +127,7 @@ class Tracks:
             Tracks, Sequence[Union[AnyTrack, Chapter, Chapters, Attachment]], Track, Chapter, Chapters, Attachment
         ],
         manifest_url: Optional[str] = None,
-    ):
+    ) -> None:
         self.videos: list[Video] = []
         self.audio: list[Audio] = []
         self.subtitles: list[Subtitle] = []
@@ -130,7 +159,7 @@ class Tracks:
         )
 
     def __str__(self) -> str:
-        rep = {Video: [], Audio: [], Subtitle: [], Chapter: [], Attachment: []}
+        rep: dict[type, list[str]] = {Video: [], Audio: [], Subtitle: [], Chapter: [], Attachment: []}
         tracks = [*list(self), *self.chapters]
 
         for track in sorted(tracks, key=lambda t: self.TRACK_ORDER_MAP[type(t)]):
@@ -146,14 +175,11 @@ class Tracks:
                 )
             rep[type(track)].append(str(track))
 
-        for type_ in list(rep):
-            if not rep[type_]:
-                del rep[type_]
-                continue
-            rep[type_] = "\n".join([rep[type_][0]] + [f"├─ {x}" for x in rep[type_][1:-1]] + [f"└─ {rep[type_][-1]}"])
-        rep = "\n".join(list(rep.values()))
-
-        return rep
+        return "\n".join(
+            "\n".join([lines[0]] + [f"├─ {x}" for x in lines[1:-1]] + [f"└─ {lines[-1]}"])
+            for lines in rep.values()
+            if lines
+        )
 
     def tree(self, add_progress: bool = False) -> tuple[Tree, list[Callable[..., None]]]:
         all_tracks = [*list(self), *self.chapters, *self.attachments]
@@ -212,11 +238,19 @@ class Tracks:
 
                         progress_callables.append(update_track_progress)
                         track_table = Table.grid()
+<<<<<<< HEAD
                         track_table.add_row(gradient_text(str(track)[6:]))
                         track_table.add_row(progress)
                         tracks_tree.add(track_table)
                     else:
                         tracks_tree.add(gradient_text(str(track)[6:]))
+=======
+                        track_table.add_row(escape(str(track)[6:]), style="text2")
+                        track_table.add_row(progress)
+                        tracks_tree.add(track_table)
+                    else:
+                        tracks_tree.add(escape(str(track)[6:]), style="text2")
+>>>>>>> upstream/dev
 
             # Show Closed Captions right after Subtitles (even if no subtitle tracks exist)
             if track_type is Subtitle:
@@ -260,7 +294,12 @@ class Tracks:
     def add(
         self,
         tracks: Union[
-            Tracks, Sequence[Union[AnyTrack, Chapter, Chapters, Attachment]], Track, Chapter, Chapters, Attachment
+            Tracks,
+            Sequence[Union[Tracks, Sequence[Any], Track, Chapter, Chapters, Attachment]],
+            Track,
+            Chapter,
+            Chapters,
+            Attachment,
         ],
         warn_only: bool = False,
     ) -> None:
@@ -278,14 +317,7 @@ class Tracks:
         for track in flatten(tracks):
             if self.exists(by_id=track.id):
                 if not warn_only:
-                    raise ValueError(
-                        "One or more of the provided Tracks is a duplicate. "
-                        "Track IDs must be unique but accurate using static values. The "
-                        "value should stay the same no matter when you request the same "
-                        "content. Use a value that has relation to the track content "
-                        "itself and is static or permanent and not random/RNG data that "
-                        "wont change each refresh or conflict in edge cases."
-                    )
+                    raise ValueError(f"Duplicate track ID {track.id}: track IDs must be unique and stable")
                 duplicates += 1
                 continue
 
@@ -307,6 +339,53 @@ class Tracks:
         if duplicates:
             log.debug(f" - Found and skipped {duplicates} duplicate tracks...")
 
+    @staticmethod
+    def signature(track: AnyTrack) -> tuple:
+        """The attributes that listing and selection read. Two tracks with one signature look and select the same."""
+        if isinstance(track, Video):
+            return Video, track.codec, track.range, track.width, track.height, track.fps, track.bitrate, track.name
+        if isinstance(track, Audio):
+            return (
+                Audio,
+                str(track.language),
+                track.codec,
+                track.channels,
+                track.joc,
+                track.descriptive,
+                track.bitrate,
+                track.name,
+            )
+        return type(track), str(track.language), track.codec, track.forced, track.sdh, track.cc, track.name
+
+    def dedupe(self) -> None:
+        """Drop each video, audio or subtitle track whose signature matches an earlier track."""
+        seen: set[tuple] = set()
+        for kind in ("videos", "audio", "subtitles"):
+            kept = []
+            for track in getattr(self, kind):
+                key = self.signature(track)
+                if key not in seen:
+                    seen.add(key)
+                    kept.append(track)
+            setattr(self, kind, kept)
+
+    def dedupe_subtitle_codecs(self, priority: Sequence[Subtitle.Codec]) -> None:
+        """
+        Drop a subtitle when the same language, flag set and name exists in a codec earlier in priority.
+        A subtitle in an unlisted codec is always kept.
+        """
+        rank = {codec: i for i, codec in reversed(list(enumerate(priority)))}
+
+        def variant(sub: Subtitle) -> tuple:
+            signature = self.signature(sub)
+            return signature[:2] + signature[3:]  # the signature without its codec
+
+        best: dict[tuple, int] = {}
+        for sub in self.subtitles:
+            if sub.codec in rank:
+                best[variant(sub)] = min(best.get(variant(sub), rank[sub.codec]), rank[sub.codec])
+        self.subtitles = [s for s in self.subtitles if s.codec not in rank or rank[s.codec] == best[variant(s)]]
+
     def sort_videos(
         self, by_language: Optional[Sequence[Union[str, Language]]] = None, exact_match: bool = False
     ) -> None:
@@ -317,12 +396,14 @@ class Tracks:
         self.videos.sort(key=lambda x: (x.height or 0, float(x.bitrate or 0.0)), reverse=True)
         for language in reversed(by_language or []):
             if str(language) in ("all", "best"):
-                language = next((x.language for x in self.videos if x.is_original_lang), "")
+                language = self._original_language(self.videos, exact_match)
             if not language:
                 continue
-            wanted = matching_languages(language, [x.language for x in self.videos], exact_match)
+            langs = [x.language for x in self.videos]
+            wanted = matching_languages(language, langs, exact_match)
+            related = matching_languages(language, langs, exact_match, every_variant=True)
             self.videos.sort(key=lambda x: str(x.language))
-            self.videos.sort(key=lambda x: str(x.language) not in wanted)
+            self.videos.sort(key=lambda x: (str(x.language) not in related, str(x.language) not in wanted))
 
     def sort_audio(
         self,
@@ -345,11 +426,13 @@ class Tracks:
         self.audio.sort(key=lambda x: x.descriptive)
         for language in reversed(by_language or []):
             if str(language) in ("all", "best"):
-                language = next((x.language for x in self.audio if x.is_original_lang), "")
+                language = self._original_language(self.audio, exact_match)
             if not language:
                 continue
-            wanted = matching_languages(language, [x.language for x in self.audio], exact_match)
-            self.audio.sort(key=lambda x: str(x.language) not in wanted)
+            langs = [x.language for x in self.audio]
+            wanted = matching_languages(language, langs, exact_match)
+            related = matching_languages(language, langs, exact_match, every_variant=True)
+            self.audio.sort(key=lambda x: (str(x.language) not in related, str(x.language) not in wanted))
 
     def sort_subtitles(
         self,
@@ -412,11 +495,13 @@ class Tracks:
             by_type()
         for language in reversed(by_language or []):
             if str(language) in ("all", "best"):
-                language = next((x.language for x in self.subtitles if x.is_original_lang), "")
+                language = self._original_language(self.subtitles, exact_match)
             if not language:
                 continue
-            wanted = matching_languages(language, [x.language for x in self.subtitles], exact_match)
-            self.subtitles.sort(key=lambda x: str(x.language) in wanted, reverse=True)
+            langs = [x.language for x in self.subtitles]
+            wanted = matching_languages(language, langs, exact_match)
+            related = matching_languages(language, langs, exact_match, every_variant=True)
+            self.subtitles.sort(key=lambda x: (str(x.language) not in related, str(x.language) not in wanted))
 
     def select_video(self, x: Callable[[Video], bool]) -> None:
         self.videos = list(filter(x, self.videos))
@@ -474,37 +559,64 @@ class Tracks:
 
         A track that the caller also selected as an explicit deliverable (same track in both
         selections) stays unflagged, and the standalone mux loop muxes it alongside the hybrid.
+        A ``native_hybrid`` track is the hybrid itself, so it stays unflagged too.
         """
         for video in hybrid_selected:
-            if video not in non_hybrid_selected:
+            if video not in non_hybrid_selected and not video.native_hybrid:
                 video.hybrid_base_only = True
 
-    def select_hybrid(self, tracks, quality, worst: bool = False):
-        # Prefer HDR10+ over HDR10 as the base layer (preserves dynamic metadata)
+    def select_hybrid(
+        self, tracks: list[Video], quality: list[int], worst: bool = False, generate_dv: bool = False
+    ) -> Callable[[Video], bool]:
+        """A filter for the hybrid ingredients of each resolution. It sets ``native_hybrid`` on every track.
+
+        A track that already carries DV and an HDR10 or HDR10+ base (DV+HDR10P, HDR10+DV, HDR10P+DV) is a finished
+        hybrid, so its resolution takes that track and no base. One that carries HDR10+ comes first. The other
+        resolutions get a base only when a DV track can give it an RPU, or with ``generate_dv``.
+        """
+        pick = min if worst else max
+        natives = {}
+        for res in quality:
+            candidates = [v for v in tracks if v.finished_hybrid and at_resolution(v, res)]
+            if candidates:
+                with_hdr10plus = [v for v in candidates if v.carries_hdr10plus]
+                natives[res] = pick(with_hdr10plus or candidates, key=lambda v: v.bitrate or 0)
+        for video in tracks:
+            video.native_hybrid = any(video is v for v in natives.values())
+        dv_tracks = [v for v in tracks if v.range == Video.Range.DV]
+        if natives and not dv_tracks and not generate_dv:
+            quality = []  # no DV track to take an RPU from
+        else:
+            quality = [res for res in quality if res not in natives]
+
+        # Prefer HDR10+ over HDR10 as the base layer (preserves dynamic metadata).
+        # Only an HEVC base qualifies, because dovi_tool injects the RPU into an HEVC stream.
         base_ranges = (Video.Range.HDR10P, Video.Range.HDR10)
         base_tracks = []
         for range_type in base_ranges:
             base_tracks = [
                 v
                 for v in tracks
-                if v.range == range_type and (v.height in quality or (v.width and int(v.width * 9 / 16) in quality))
+                if v.range == range_type
+                and v.codec in (Video.Codec.HEVC, None)
+                and any(at_resolution(v, res) for res in quality)
             ]
             if base_tracks:
                 break
 
-        pick = min if worst else max
         base_selected = []
         for res in quality:
-            candidates = [v for v in base_tracks if v.height == res or (v.width and int(v.width * 9 / 16) == res)]
+            candidates = [v for v in base_tracks if at_resolution(v, res)]
             if candidates:
-                chosen = pick(candidates, key=lambda v: v.bitrate)
+                chosen = pick(candidates, key=lambda v: v.bitrate or 0)
                 base_selected.append(chosen)
 
-        dv_tracks = [v for v in tracks if v.range == Video.Range.DV]
-        lowest_dv = min(dv_tracks, key=lambda v: v.height) if dv_tracks else None
+        lowest_dv = (
+            min(dv_tracks, key=lambda v: v.height or 0) if dv_tracks and (base_selected or not natives) else None
+        )
 
-        def select(x):
-            if x in base_selected:
+        def select(x: Video) -> bool:
+            if x in base_selected or x.native_hybrid:
                 return True
             if lowest_dv and x is lowest_dv:
                 return True
@@ -522,7 +634,7 @@ class Tracks:
             for group in groups.values():
                 matches = [x for x in group if x.height == resolution]
                 if not matches:
-                    matches = [x for x in group if x.width and int(x.width * (9 / 16)) == resolution]
+                    matches = [x for x in group if at_resolution(x, resolution)]
                 keep.update(id(x) for x in matches[: per_resolution or None])
         self.videos = [x for x in self.videos if id(x) in keep]
 
@@ -544,6 +656,7 @@ class Tracks:
         return selected
 
     @staticmethod
+<<<<<<< HEAD
     def _generate_auto_name(track: Union[Audio, Subtitle]) -> str:
         """
         Build the track name a player shows, e.g. `Nihongo [\u30aa\u30ea\u30b8\u30ca\u30eb]` or `English`.
@@ -569,6 +682,28 @@ class Tracks:
             suffix_text = MANUAL_TRANSLATIONS.get(lang_code.split("-")[0])
 
         return f"{native_name} [{suffix_text or 'Original'}]"
+=======
+    def _original_language(tracks: Sequence[AnyTrack], exact: bool) -> str:
+        """The language "all" and "best" sort first: the original-language track's, through original_tag."""
+        language = next((x.language for x in tracks if x.is_original_lang), None)
+        return original_tag(language, exact) if language else ""
+
+    @staticmethod
+    def first_match_index(tracks: Sequence[AnyTrack], language: Optional[str]) -> Optional[int]:
+        """The index of the first track that `language` asks for, matched against every track at once.
+
+        Matching the whole list lets the RFC 4647 string preference pick en-US over en.
+        """
+        if not language:
+            return None
+        wanted = matching_languages(language, [t.language for t in tracks])
+        return next((idx for idx, t in enumerate(tracks) if str(t.language) in wanted), None)
+
+    @property
+    def sample_base(self) -> float:
+        """The earliest ``sample_start`` of the video and audio tracks, which a sample mux uses as time zero."""
+        return min((t.sample_start for t in (*self.videos, *self.audio)), default=0.0)
+>>>>>>> upstream/dev
 
     def _mux_mp4(
         self,
@@ -581,7 +716,7 @@ class Tracks:
         """
         Multiplex the Tracks into an MP4 Container with MP4Box.
 
-        Only used for a codec Matroska cannot name, currently DTS-UHD, because MP4 carries
+        Only used for a codec Matroska cannot carry, DTS-UHD or MPEG-H, because MP4 carries
         far less: it drops the forced, hearing-impaired and original flags, holds no
         attachments at all, and leaves out a subtitle it has no format for rather than
         mangling it. Losing those beats shipping audio no player can name.
@@ -590,15 +725,12 @@ class Tracks:
         """
         mp4box = getattr(binaries, "MP4Box", None)
         if not mp4box:
-            raise RuntimeError(
-                "MP4Box (GPAC) is required to mux DTS-UHD (DTS:X Profile 2) audio but was not found. "
-                "Install it with your package manager (e.g. `apt install gpac`), then check it with "
-                "`unshackle env check`."
-            )
+            raise RuntimeError("MP4Box (GPAC) not found, muxing DTS-UHD or MPEG-H audio needs it")
 
         progress = progress or partial(lambda **kwargs: None)
 
         cl = [str(mp4box)]
+        sample_base = self.sample_base
         names: list[str] = []
         cleaned: list[Path] = []
         track_id = 0
@@ -632,10 +764,15 @@ class Tracks:
             elif candidate.exists():
                 candidate.unlink()
 
+<<<<<<< HEAD
             if not isinstance(track, Video):
                 track.name = self._generate_auto_name(track)
 
             cl.extend(["-add", f"{source}:lang={track.language}"])
+=======
+            delay = round((track.sample_start - sample_base) * 1000) if config.sample else 0
+            cl.extend(["-add", f"{source}:lang={track.mux_language}" + (f":delay={delay}" if delay else "")])
+>>>>>>> upstream/dev
             name = "" if isinstance(track, Video) else (track.get_track_name() or "")
             if name:
                 names.extend(["-name", f"{track_id}={name}"])
@@ -646,7 +783,7 @@ class Tracks:
         cl.extend(names)
 
         chapters_path = None
-        if self.chapters:
+        if self.chapters and not config.sample:
             chapters_path = config.directories.temp / config.filenames.chapters.format(
                 title=sanitize_filename(title), random=f"{self.chapters.id}_{os.getpid()}_{threading.get_ident()}"
             )
@@ -681,7 +818,7 @@ class Tracks:
                 "muxer": str(mp4box),
                 "command": full_command,
                 "container": "mp4",
-                "reason": "DTS-UHD audio has no Matroska CodecID",
+                "reason": "DTS-UHD or MPEG-H audio has no Matroska CodecID",
             },
         )
 
@@ -710,6 +847,19 @@ class Tracks:
             returncode = p.wait()
             if returncode < 2 and any(MP4BOX_OPEN_FAILED.search(line) for line in errors):
                 returncode = 2
+            if config.sample and returncode == 0:
+                start, end = (seconds - sample_base for seconds in config.sample)
+                cut_path = output_path.with_suffix(".cut.mp4")
+                try:
+                    run_step(
+                        [mp4box, "-splitx", f"{start:.3f}:{end:.3f}", output_path, "-out", cut_path],
+                        output=cut_path,
+                        label="MP4Box sample cut",
+                    )
+                    os.replace(cut_path, output_path)
+                except RuntimeError as e:
+                    returncode = 2
+                    errors.append(f"MP4Box could not cut the sample window: {e}")
             mux_duration_ms = round((time.monotonic() - mux_start_time) * 1000, 1)
             output_size = output_path.stat().st_size if output_path.exists() else 0
 
@@ -781,16 +931,13 @@ class Tracks:
             video_track = video_track or self.videos[0]
             if video_track.language.is_valid():
                 lang_code = str(video_track.language)
-                lang_name = video_track.language.display_name()
-
                 for video in self.videos:
                     if video.data.get("audio_language"):
                         continue
                     video.needs_repack = True
                     video.data["audio_language"] = lang_code
-                    video.data["audio_language_name"] = lang_name
 
-        if any(at.path and at.path.exists() and has_dts_uhd_sample_entry(at.path) for at in self.audio):
+        if any(at.path and at.path.exists() and has_mp4_only_audio_entry(at.path) for at in self.audio):
             return self._mux_mp4(
                 title=title,
                 delete=delete,
@@ -807,6 +954,16 @@ class Tracks:
             "--no-date",  # remove dates from the output for security
         ]
 
+        sample_base = self.sample_base
+
+        def sample_sync(start: float) -> list[str]:
+            shift = round((start - sample_base) * 1000)
+            return ["--sync", f"-1:{shift}"] if config.sample and shift else []
+
+        if config.sample:
+            start, end = (seconds - sample_base for seconds in config.sample)
+            cl.extend(["--split", f"parts:{start:.3f}s-{end:.3f}s"])
+
         if config.muxing.get("set_title", True):
             cl.extend(["--title", title])
 
@@ -820,26 +977,11 @@ class Tracks:
         preferred_audio_lang = valid_language(default_language.get("audio"))
         preferred_subtitle_lang = valid_language(default_language.get("subtitle"))
 
-        preferred_video_idx: Optional[int] = None
-        if preferred_video_lang:
-            preferred_video_idx = next(
-                (idx for idx, v in enumerate(self.videos) if is_close_match(v.language, [preferred_video_lang])),
-                None,
-            )
-
-        preferred_audio_idx: Optional[int] = None
-        if preferred_audio_lang:
-            preferred_audio_idx = next(
-                (idx for idx, a in enumerate(self.audio) if is_close_match(a.language, [preferred_audio_lang])),
-                None,
-            )
-
-        preferred_subtitle_idx: Optional[int] = None
-        if preferred_subtitle_lang and not skip_subtitles:
-            preferred_subtitle_idx = next(
-                (idx for idx, s in enumerate(self.subtitles) if is_close_match(s.language, [preferred_subtitle_lang])),
-                None,
-            )
+        preferred_video_idx = self.first_match_index(self.videos, preferred_video_lang)
+        preferred_audio_idx = self.first_match_index(self.audio, preferred_audio_lang)
+        preferred_subtitle_idx = (
+            None if skip_subtitles else self.first_match_index(self.subtitles, preferred_subtitle_lang)
+        )
 
         for i, vt in enumerate(self.videos):
             if not vt.path or not vt.path.exists():
@@ -855,15 +997,22 @@ class Tracks:
             else:
                 is_default = i == 0
 
+            ids = file_track_ids(vt.path)
+            v = ids.get("video", 0)
             video_args = [
                 "--language",
-                f"0:{vt.language}",
+                f"{v}:{vt.mux_language}",
                 "--default-track",
-                f"0:{is_default}",
+                f"{v}:{is_default}",
                 "--original-flag",
+<<<<<<< HEAD
                 f"0:{vt.is_original_lang and original_flag}",
+=======
+                f"{v}:{vt.is_original_lang}",
+>>>>>>> upstream/dev
                 "--compression",
-                "0:none",
+                f"{v}:none",
+                *sample_sync(vt.sample_start),
             ]
 
             # Add FPS fix if needed (typically for hybrid mode to prevent sync issues)
@@ -871,29 +1020,32 @@ class Tracks:
                 video_args.extend(
                     [
                         "--default-duration",
-                        f"0:{vt.fps}fps" if isinstance(vt.fps, str) else f"0:{vt.fps:.3f}fps",
+                        f"{v}:{vt.fps}fps" if isinstance(vt.fps, str) else f"{v}:{vt.fps:.3f}fps",
                         "--fix-bitstream-timing-information",
-                        "0:1",
+                        f"{v}:1",
                     ]
                 )
 
-            if hasattr(vt, "range") and vt.range == Video.Range.HLG:
+            if vt.codec == Video.Codec.VP9:
+                video_args.extend(vt.vp9_colour_args(v))
+            elif hasattr(vt, "range") and vt.range == Video.Range.HLG:
                 video_args.extend(
                     [
                         "--color-transfer-characteristics",
-                        "0:18",  # ARIB STD-B67 (HLG)
+                        f"{v}:18",  # ARIB STD-B67 (HLG)
                     ]
                 )
 
-            if hasattr(vt, "data") and vt.data.get("audio_language"):
-                audio_lang = vt.data["audio_language"]
-                audio_name = vt.data.get("audio_language_name", audio_lang)
+            a = ids.get("audio")
+            if vt.data.get("audio_language") and a is not None:
                 video_args.extend(
                     [
                         "--language",
-                        f"1:{audio_lang}",
+                        f"{a}:{vt.data['audio_language']}",
                         "--track-name",
-                        f"1:{audio_name}",
+                        f"{a}:{vt.embedded_audio_name()}",
+                        "--original-flag",
+                        f"{a}:{vt.is_original_lang}",
                     ]
                 )
 
@@ -913,7 +1065,7 @@ class Tracks:
                     "--track-name",
                     f"0:{at.get_track_name() or ''}",
                     "--language",
-                    f"0:{at.language}",
+                    f"0:{at.mux_language}",
                     "--default-track",
                     f"0:{audio_default}",
                     "--visual-impaired-flag",
@@ -922,6 +1074,7 @@ class Tracks:
                     f"0:{at.is_original_lang and original_flag}",
                     "--compression",
                     "0:none",
+                    *sample_sync(at.sample_start),
                     "(",
                     str(at.path),
                     ")",
@@ -943,7 +1096,7 @@ class Tracks:
                         "--track-name",
                         f"0:{st.get_track_name() or ''}",
                         "--language",
-                        f"0:{st.language}",
+                        f"0:{st.mux_language}",
                         "--sub-charset",
                         "0:UTF-8",
                         "--forced-track",
@@ -956,6 +1109,7 @@ class Tracks:
                         f"0:{st.is_original_lang and original_flag}",
                         "--compression",
                         "0:none",
+                        *sample_sync(st.sample_start),
                         "(",
                         str(st.path),
                         ")",
@@ -967,6 +1121,8 @@ class Tracks:
                 title=sanitize_filename(title), random=f"{self.chapters.id}_{os.getpid()}_{threading.get_ident()}"
             )
             self.chapters.dump(chapters_path, fallback_name=config.chapter_fallback_name)
+            if config.sample and sample_base:
+                cl.extend(["--chapter-sync", str(round(-sample_base * 1000))])
             cl.extend(["--chapter-charset", "UTF-8", "--chapters", str(chapters_path)])
         else:
             chapters_path = None
@@ -990,13 +1146,13 @@ class Tracks:
         if output_path is None:
             output_path = (
                 self.videos[0].path.with_suffix(".muxed.mkv")
-                if self.videos
+                if self.videos and self.videos[0].path
                 else self.audio[0].path.with_suffix(".muxed.mka")
-                if self.audio
+                if self.audio and self.audio[0].path
                 else self.subtitles[0].path.with_suffix(".muxed.mks")
-                if self.subtitles
+                if self.subtitles and self.subtitles[0].path
                 else chapters_path.with_suffix(".muxed.mkv")
-                if self.chapters
+                if self.chapters and chapters_path
                 else None
             )
         if not output_path:
@@ -1036,12 +1192,13 @@ class Tracks:
             warnings = []
             mux_start_time = time.monotonic()
             p = subprocess.Popen(full_command, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE)
+            assert p.stdout is not None
             for line in iter(p.stdout.readline, ""):
                 if line.startswith("#GUI#error") or line.startswith("#GUI#warning"):
                     errors.append(line)
                     if line.startswith("#GUI#warning"):
                         warnings.append(line.strip())
-                if "progress" in line:
+                if progress and "progress" in line:
                     progress(total=100, completed=int(line.strip()[14:-1]))
 
             returncode = p.wait()

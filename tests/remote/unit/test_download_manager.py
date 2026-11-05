@@ -135,27 +135,14 @@ def test_job_status_values() -> None:
     }
 
 
-def test_normalize_sub_format_preserves_original_sentinel() -> None:
-    """An API job asking for sub_format="original" must keep the "original" sentinel.
-
-    dl.py treats "original" as "keep source format" (skip conversion). If it were normalized to
-    None (as to_enum(["original"]) yields, since there is no such enum member), dl.py would fall
-    into the default branch and re-encode TTML -> WebVTT, contradicting the CLI.
-    """
-    from unshackle.core.api.download_manager import normalize_sub_format
+def test_api_sub_format_keeps_the_original_sentinel() -> None:
+    """sub_format "original" keeps the source format, so the API cast must not turn it into a codec or None."""
+    from unshackle.commands.dl import dl
+    from unshackle.core.api.handlers import cast_dl_params
     from unshackle.core.tracks import Subtitle
-    from unshackle.core.utils.click_types import SubtitleCodecChoice
 
-    # API path keeps the sentinel, case-insensitively.
-    assert normalize_sub_format("original") == "original"
-    assert normalize_sub_format("ORIGINAL") == "original"
-
-    # The CLI produces the exact same sentinel value, so dl.py's `== "original"` branch handles both.
-    assert SubtitleCodecChoice(Subtitle.Codec).convert("original") == "original"
-
-    # A real codec still maps to its enum member; unknowns collapse to None.
-    assert normalize_sub_format("srt") is Subtitle.Codec.SubRip
-    assert normalize_sub_format("nonsense") is None
+    assert cast_dl_params(dl.cli, {"sub_format": "ORIGINAL"})["sub_format"] == "original"
+    assert cast_dl_params(dl.cli, {"sub_format": "srt"})["sub_format"] is Subtitle.Codec.SubRip
 
 
 def test_worker_write_result_retries_denied_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -192,11 +179,23 @@ class _CapturedCtx(Exception):
 @pytest.mark.parametrize(
     ("params", "expected"),
     [
+<<<<<<< HEAD
         # mods: dl's --lang defaults to "best", not upstream's "orig"
         ({}, (["best"], [], [], [], False)),
+=======
+        ({}, (["orig"], [], [], ["all"], [], False, False)),
+>>>>>>> upstream/dev
         (
-            {"lang": ["es-419"], "v_lang": ["en"], "a_lang": ["ja"], "acodec": "AAC,EC3", "forced_subs": True},
-            (["es-419"], ["en"], ["ja"], ["AAC", "EC3"], True),
+            {
+                "lang": ["es-419"],
+                "v_lang": ["en"],
+                "a_lang": ["ja"],
+                "s_lang": ["ko"],
+                "acodec": "AAC,EC3",
+                "forced_subs": True,
+                "exact_lang": True,
+            },
+            (["es-419"], ["en"], ["ja"], ["ko"], ["AAC", "EC3"], True, True),
         ),
     ],
 )
@@ -211,7 +210,7 @@ def test_perform_download_puts_the_lang_selection_in_the_service_ctx(
     from unshackle.core.services import Services
 
     class FakeDl:
-        cli = click.Command("dl")
+        cli = dl_module.dl.cli
 
         def __init__(self, ctx: click.Context, **kwargs: object) -> None:
             raise _CapturedCtx(ctx)
@@ -225,7 +224,9 @@ def test_perform_download_puts_the_lang_selection_in_the_service_ctx(
 
     ctx = exc.value.args[0]
     p = ctx.params
-    assert (p["lang"], p["v_lang"], p["a_lang"], [c.name for c in p["acodec"]], p["forced_subs"]) == expected
+    acodec = [c.name for c in p["acodec"]]
+    selection = (p["lang"], p["v_lang"], p["a_lang"], p["s_lang"], acodec, p["forced_subs"], p["exact_lang"])
+    assert selection == expected
 
 
 def test_perform_download_passes_latest_episodes_to_dl_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -236,7 +237,7 @@ def test_perform_download_passes_latest_episodes_to_dl_result(tmp_path: Path, mo
     from unshackle.core.services import Services
 
     class FakeDl:
-        cli = click.Command("dl")
+        cli = dl_module.dl.cli
 
         def __init__(self, ctx: click.Context, **kwargs: object) -> None:
             pass
@@ -257,6 +258,79 @@ def test_perform_download_passes_latest_episodes_to_dl_result(tmp_path: Path, mo
         download_manager.perform_download("job-1", "EXAMPLE", "t1", {"latest_episodes": 3})
 
     assert exc.value.args[0]["latest_episodes"] == 3
+
+
+def test_perform_download_gives_dl_the_defaults_for_null_and_empty_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import click
+
+    import unshackle.commands.dl as dl_module
+    from unshackle.core.api import download_manager, handlers
+    from unshackle.core.services import Services
+
+    seen: dict[str, dict] = {}
+
+    class FakeDl:
+        cli = dl_module.dl.cli
+
+        def __init__(self, ctx: click.Context, **kwargs: object) -> None:
+            seen["init"] = kwargs
+
+        def result(self, **kwargs: object) -> None:
+            seen["result"] = kwargs
+            raise RuntimeError("stop")
+
+    class FakeService:
+        def __init__(self, ctx: click.Context) -> None:
+            seen["parent"] = dict(ctx.parent.params)
+
+    monkeypatch.setattr(dl_module, "dl", FakeDl)
+    monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
+    monkeypatch.setattr(Services, "load", staticmethod(lambda s: FakeService))
+    monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: None)
+
+    params: dict[str, object] = {"quality": None, "vcodec": None, "acodec": None, "lang": None, "output_dir": ""}
+    with pytest.raises(RuntimeError, match="stop"):
+        download_manager.perform_download("job-1", "EXAMPLE", "t1", params)
+
+    assert seen["init"]["output_dir"] is None
+    for view in (seen["parent"], seen["result"]):
+        assert view["quality"] == [] and view["vcodec"] == [] and view["acodec"] == [] and view["lang"] == ["orig"]
+
+
+def test_perform_download_casts_service_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import click
+
+    import unshackle.commands.dl as dl_module
+    from unshackle.core.api import download_manager, handlers
+    from unshackle.core.services import Services
+
+    class FakeDl:
+        cli = dl_module.dl.cli
+
+        def __init__(self, ctx: click.Context, **kwargs: object) -> None:
+            pass
+
+    class FakeService:
+        cli = click.Command(
+            "svc", params=[click.Option(["--episodes"], type=int), click.Option(["--tag"], multiple=True)]
+        )
+
+        def __init__(self, ctx: click.Context, episodes: object = None, tag: object = ()) -> None:
+            raise _CapturedCtx(episodes, tag)
+
+    monkeypatch.setattr(dl_module, "dl", FakeDl)
+    monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
+    monkeypatch.setattr(Services, "load", staticmethod(lambda s: FakeService))
+    monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: None)
+
+    with pytest.raises(_CapturedCtx) as exc:
+        download_manager.perform_download(
+            "job-1", "EXAMPLE", "t1", {"service_params": {"episodes": "2", "tag": ["a", "b"]}}
+        )
+
+    assert exc.value.args == (2, ("a", "b"))
 
 
 def test_worker_relays_a_prompt_and_reads_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -285,6 +359,30 @@ def test_worker_relays_a_prompt_and_reads_the_answer(monkeypatch: pytest.MonkeyP
         set_prompt_handler(None)
         os.close(write_fd)
     assert updates == [{"input_prompt": "Enter PIN"}, {"input_prompt": None}]
+
+
+def test_worker_relays_a_notice_as_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A show_notice() message reaches the parent as ``notice`` progress, and None clears it."""
+    import os
+    import sys
+    from types import SimpleNamespace
+
+    from unshackle.core.api import download_worker
+    from unshackle.core.console import set_notice_handler, set_prompt_handler, show_notice
+
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: read_fd))
+    updates: list[dict] = []
+
+    download_worker.relay_prompts(updates.append)
+    try:
+        show_notice("Enter pair code ABCD")
+        show_notice(None)
+    finally:
+        set_prompt_handler(None)
+        set_notice_handler(None)
+        os.close(write_fd)
+    assert updates == [{"notice": "Enter pair code ABCD"}, {"notice": None}]
 
 
 def test_a_prompt_discards_an_answer_sent_before_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -419,6 +517,46 @@ async def test_a_repeated_prompt_reaches_an_event_listener(
     await asyncio.wait_for(answer_next_prompt("222222"), timeout=20)
     assert await asyncio.wait_for(run, timeout=20) == ["111111", "222222"]
     assert job.input_prompt is None
+
+
+async def test_a_notice_reaches_the_job_and_an_event_listener(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manager: DownloadQueueManager
+) -> None:
+    """The job carries the worker's notice while the worker waits, and drops it at the end."""
+    import asyncio
+
+    from unshackle.core.api import download_manager
+
+    worker = tmp_path / "worker.py"
+    # The prompt holds the worker open until the test has seen the notice.
+    source = FAKE_PROMPT_WORKER.replace("import prompt_user", "import prompt_user, show_notice").replace(
+        'answers = [prompt_user("Enter OTP"), prompt_user("Enter OTP")]',
+        'show_notice("Enter pair code ABCD")\nanswers = [prompt_user("Continue")]',
+    )
+    assert source.count("show_notice") == 2, "FAKE_PROMPT_WORKER changed; update the replacements"
+    worker.write_text(source, encoding="utf-8")
+    spawn = asyncio.create_subprocess_exec
+
+    async def spawn_fake_worker(executable: str, *args: str, **kwargs: Any) -> Any:
+        return await spawn(executable, str(worker), *args[2:], **kwargs)
+
+    monkeypatch.setattr(download_manager.asyncio, "create_subprocess_exec", spawn_fake_worker)
+    job = manager.create_job("EXAMPLE", "t")
+    events = manager.subscribe(job.job_id)
+    run = asyncio.create_task(manager.run_download_async(job))
+
+    async def answer_after_notice() -> None:
+        while True:
+            event = await events.get()
+            if event and event["data"]["input_prompt"]:
+                assert event["data"]["notice"] == "Enter pair code ABCD"
+                assert job.to_dict()["notice"] == "Enter pair code ABCD"
+                assert manager.submit_input(job, "ok") is True
+                return
+
+    await asyncio.wait_for(answer_after_notice(), timeout=20)
+    assert await asyncio.wait_for(run, timeout=20) == ["ok"]
+    assert job.notice is None
 
 
 async def test_input_handler_rejects_bad_requests(

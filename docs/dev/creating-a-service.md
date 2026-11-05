@@ -100,6 +100,7 @@ Declared at class level to configure framework behaviour:
 | `GEOBLOCK` | `tuple[str, ...]` | IP region codes where the service refuses to work. Every other region is allowed. Default `()`. |
 | `VAULT_TAG` | `Optional[str]` | Overrides the key-vault namespace so sibling services can share one vault. Default `None` (use the service's own tag). |
 | `AUTH_METHODS` | `Optional[tuple[str, ...]]` | Auth methods accepted (`"cookies"` / `"credentials"`). When `None`, the REST `/services` endpoint infers them from `authenticate()`. |
+| `ANONYMOUS_SEARCH` | `bool` | Set `True` when `search()` needs no login and no state from `authenticate()`. A search then skips the cookie load, `authenticate()` and the cookie save. Default `False`. |
 | `NO_SUBTITLES` | `bool` | Set `True` on a service with no subtitle tracks to skip subtitle handling entirely. |
 | `ANIME` | `bool` | Set `True` when the catalogue is anime, so metadata lookups prefer AniList. A title's own `anime` flag overrides it. |
 | `DAILY` | `bool` | Set `True` when the catalogue is daily/date-based (talk shows, news, sports), so unshackle names episodes by air date. A title's own `daily` flag overrides it. |
@@ -136,9 +137,9 @@ will use throughout the service:
 
 | Attribute | What it is |
 |---|---|
-| `self.config` | This service's `config.yaml` contents (a dict), or `None` if absent. |
+| `self.config` | A dict: this service's `config.yaml`, with the user's `services.<TAG>` block from `unshackle.yaml` merged over it. Without a `config.yaml`, it holds only the user's block. See [Services & authentication](../reference/configuration/services.md) for the override keys. |
 | `self.log` | A `logging.Logger` named after your class. |
-| `self.session` | A prepared `requests.Session` with config headers and a retry adapter (5 retries, backoff 0.2, retries on 429/500/502/503/504). |
+| `self.session` | A prepared `requests.Session` with config headers and a retry adapter (5 retries, backoff 0.2, retries on 429/500/502/503/504). Send every request through it: with a proxy active, a request from service code that does not go through the proxy logs a warning. A separate HTTP session that goes direct on purpose sets `proxy_exempt = True`. |
 | `self.cache` | A `Cacher` for arbitrary key/value data, for example authentication tokens. |
 | `self.title_cache` | A region/account-aware `TitleCacher` used by `get_titles_cached`. |
 | `self.cache_dir` | `config.directories.cache / <ClassName>`. |
@@ -155,7 +156,14 @@ class TrackRequest:
     codecs: list[Video.Codec] = []            # empty == accept any codec
     ranges: list[Video.Range] = [Video.Range.SDR]
     best_available: bool = False
+    generate_dv: bool = False                 # --generate-dv: make Dolby Vision from HDR10+
 ```
+
+!!! note "`generate_dv` and a hand-made HYBRID"
+    A service that fetches the HYBRID variants itself (HDR10 and DV) must also fetch
+    HDR10P when `track_request.generate_dv` is set and the title has no DV track.
+    The conversion needs an HEVC HDR10+ track as its base.
+    `get_tracks_for_variants` does this for you.
 
 !!! note "Read the request, don't second-guess the user"
     Services may narrow `track_request` for hard technical constraints (e.g.
@@ -255,6 +263,28 @@ client: a remote-dl session gets it through the attached `InputBridge`, and a
 REST download job shows it as `input_prompt`. Locally it routes through the
 shared Rich console (`prompt_user`) so the prompt renders correctly alongside
 progress and log output.
+
+For a login that the user approves on another device (a pair code, a QR code),
+use `self.wait_for_approval(message, check, timeout)`, never a hand-written
+loop. It shows the message, then calls `check` at each interval until `check`
+returns a value. `check` returns `None` while the approval is pending.
+
+```python
+token = self.wait_for_approval(
+    f"Open {self.config['endpoints']['pair']} and enter code {code}",
+    check=lambda: self.poll_pair_token(code),
+    timeout=expires_in,
+)
+```
+
+It raises `TimeoutError` after `timeout` seconds. Under `serve` mode it also stops
+when the client deletes the remote session, so the loop does not continue on the
+server with no client. The message goes out as a log line, so a remote
+session shows it. A REST download job shows it in its `notice` field until the wait ends.
+
+The wait sees a cancel only between two `check` calls, so `check` must return within a few
+seconds. A `check` that reads a socket keeps the socket open across calls and returns `None`
+after each short idle wait.
 
 !!! warning "Make each token cache entry unique"
     The cache above uses `tokens_{device}_{profile}` on purpose. A token cache
@@ -461,19 +491,41 @@ def get_tracks(self, title: Title_T) -> Tracks:
     return self.get_tracks_for_variants(title, fetch_variant)
 ```
 
+!!! note "What the helper merges"
+    The helper adds the video, audio and subtitle tracks of every manifest.
+    From a later manifest, it skips a track that has the ID of a held track. It
+    also skips a track whose `Tracks.signature` matches a held track, because
+    the same track can have a different ID in each manifest. Chapters and
+    attachments come from the first manifest only.
+
+    - `signature` holds the attributes that the track list and selection
+      read: codec, range, resolution, frame rate, bitrate and name for video;
+      language, codec, channels, JOC, descriptive, bitrate and name for audio;
+      language, codec, flags and name for subtitles.
+    - The helper does not remove copies inside one manifest. To remove them,
+      call `tracks.dedupe()`. Two tracks that differ only in a value outside
+      the signature, such as a dialogue-boost mix, become one track, so remove the
+      track you do not want before you call it.
+    - The audio that `dl` selects can come from a different manifest than the
+      video. Keep licence data on each track (`track.data`), not in one value
+      per title that the next fetch overwrites.
+
 After parsing, you may **correct** track metadata the manifest gets wrong:
 stamp the real `video.range`, fix odd audio channel counts, mark descriptive
 audio, add hand-built subtitles or an `Attachment` (e.g. cover art). Do *not*
 filter for resolution/bitrate. See `fetch_dash_manifest` in the EXAMPLE service
 for a thorough demonstration.
 
-!!! note "Flip HDR10 → HDR10+ by hand when you know the platform embeds it"
-    HDR10+ is a **bitstream (SEI)** feature. The HLS parser intentionally does
-    not sniff it from the bitstream, so a manifest that embeds HDR10+ SEI but labels
-    the variant plain HDR10 will parse as HDR10. The label is the only signal
-    the parser has, and it is wrong. Only the service author knows the platform
-    embeds HDR10+, so it is on you to correct `video.range` to HDR10+ here for
-    those services.
+!!! note "HDR10+ in tracks labelled HDR10"
+    HDR10+ is a **bitstream (SEI)** feature, and many manifests label an HDR10+
+    variant as plain HDR10. Before unshackle lists or selects tracks, the
+    [`hdr10plus_probe`](../reference/configuration/download.md#hdr10plus_probe)
+    reads the first fragment of each HEVC HDR10 track and changes `video.range` to
+    HDR10+ when the fragment carries HDR10+ metadata. Set `video.range` yourself
+    only when the probe cannot read the fragment, for example an ISM track whose
+    SEI is encrypted, or when the platform gives a reliable signal of its own.
+    If the playback API has no HDR10+ value, request HDR10 for an HDR10+ request
+    and let the probe relabel the tracks.
 
 !!! warning "`get_tracks` is your only chance to capture license inputs"
     The license callbacks (`get_widevine_license` and the others) fire **much later**, in
@@ -534,6 +586,8 @@ current `title` and `track`:
 | `get_playready_license` | PlayReady | The license response. Defaults to delegating to `get_widevine_license`. |
 | `get_clearkey_license` | DASH `org.w3.clearkey` | The JWK Set (dict/JSON/bytes), or `None` to let the framework POST the challenge to the manifest's Laurl. |
 
+A license callback can also declare optional keyword arguments. `get_widevine_license` can ask for `pssh` and `session_id`. `get_playready_license` can ask for `pssh_b64` and `session_id`. `session_id` is the open CDM session. A callback gets only the arguments that its signature declares.
+
 ```python
 def get_widevine_license(self, *, challenge: bytes, title, track):
     response = self.session.post(
@@ -562,7 +616,7 @@ def get_widevine_license(self, *, challenge: bytes, title, track):
        `get_clearkey_license` to do the POST yourself.
     3. **Keys arrive obfuscated or through a bespoke channel**: fetch and unwrap
        the content key in `get_tracks` and pre-populate
-       `drm.content_keys[kid] = key_hex` on the track's `ClearKeyCENC`. The
+       `drm.signatures[kid] = key_hex` on the track's `ClearKeyCENC`. The
        non-obvious payoff: when every KID is already keyed, the framework skips
        the license round-trip entirely.
 
@@ -586,6 +640,12 @@ Override any of these to react to pipeline stages (all no-ops by default):
 `on_segment_downloaded`, `on_track_downloaded`, `on_track_decrypted`,
 `on_track_repacked`, `on_track_multiplex`. Also override `search()` to yield
 `SearchResult` objects for `unshackle search`.
+
+!!! warning "Set `ANONYMOUS_SEARCH` only for a search that needs no account"
+    With `ANONYMOUS_SEARCH = True`, `search()` operates on an HTTP session with no cookies, and
+    `authenticate()` does not run. Set it only when the search results do not depend on the
+    account, and when `search()` does its own setup. A `search()` that reads a token, a header
+    or a region from `authenticate()` fails or gives results for the wrong region.
 
 ```python
 def search(self) -> Generator[SearchResult, None, None]:

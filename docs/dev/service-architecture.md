@@ -66,6 +66,7 @@ Declared at the top of your service class, these are static descriptors:
 | `GEOBLOCK` | `tuple[str, ...]` | ISO region codes where the service refuses to work; every other region is allowed. Use it for a service that works worldwide except in its home market. |
 | `VAULT_TAG` | `Optional[str]` | Overrides the key-vault namespace; defaults to the service's own tag. |
 | `AUTH_METHODS` | `Optional[tuple[str, ...]]` | Accepted auth methods (`"cookies"` / `"credentials"`). When `None`, the REST `/services` endpoint infers them from `authenticate()`. |
+| `ANONYMOUS_SEARCH` | `bool` | `search()` needs no login and no state from `authenticate()`. A search then skips the cookie load, `authenticate()` and the cookie save. Default `False`. |
 | `ANIME` | `bool` | The catalogue is anime, so metadata lookups prefer AniList. A title's own `anime` flag overrides it. |
 | `DAILY` | `bool` | The catalogue is daily/date-based, so unshackle names episodes by air date. A title's own `daily` flag overrides it. |
 
@@ -83,21 +84,20 @@ These are abstract. A service will not load unless it defines all three:
   `CookieJar` into `self.session.cookies` and stores `self.credential`. Override it to
   do a real login handshake.
 - **`search()`**: raises `NotImplementedError` by default. Write it so that the
-  `search` command can operate.
+  `search` command can operate. unshackle calls `authenticate()` first, unless the
+  service sets `ANONYMOUS_SEARCH`.
 - **DRM license hooks**: `get_widevine_service_certificate`, `get_widevine_license`,
   `get_playready_license` (delegates to Widevine by default), and
   `get_clearkey_license` (returns `None` by default). See [DRM hooks](#drm-hooks) below.
 - **`request_input(prompt)`**: prompts the user. It goes through the remote-dl input
   bridge, the REST download job relay, or the rich console.
+- **`wait_for_approval(message, check, timeout, interval=3.0)`**: shows a message, then
+  calls `check` until it returns a value. Use it for a login that the user approves on
+  another device, such as a pair code. A remote-dl session shows the message as a log
+  line, and a REST download job shows it as the job's `notice`.
 - **Event callbacks**: `on_segment_downloaded`, `on_track_downloaded`,
   `on_track_decrypted`, `on_track_repacked`, `on_track_multiplex` let a service react to
-  pipeline events (for example, MonaLisa decrypts each segment in `on_segment_downloaded`).
-- **`resolve_server_keys(title)`**: an escape hatch for services whose decryption keys are
-  resolved server-side *ahead of* the normal per-track license flow. Unlike everything else
-  here it is **not declared on the `Service` base class at all**: `dl.py` probes for it with
-  `hasattr` and calls it (once, after track selection) only if your service defines it. Use
-  it when your service must fetch or inject keys in bulk before download, separate from
-  the per-track license callbacks below.
+  pipeline events.
 
 ### What `__init__` wires up for you
 
@@ -106,9 +106,9 @@ up the objects your methods rely on:
 
 | Attribute | What it is |
 |---|---|
-| `self.config` | The per-service config slice (see [Request and HTTP session objects](#request-and-http-session-objects)). |
+| `self.config` | The merged service config (see [Request and HTTP session objects](#request-and-http-session-objects)). |
 | `self.log` | A `logging.Logger` named after your class. |
-| `self.session` | A ready-to-use HTTP session (headers, retries, and proxy applied). |
+| `self.session` | A ready-to-use HTTP session (headers, retries, and proxy applied). Send every request through it: with a proxy active, a request from service code that does not go through the proxy logs a warning. A separate HTTP session that goes direct on purpose sets `proxy_exempt = True`. |
 | `self.cache` | A generic key/value `Cacher` namespaced to the service. |
 | `self.title_cache` | A region- and account-aware `TitleCacher`. |
 | `self.cache_dir` | `config.directories.cache / <ServiceName>`. |
@@ -127,8 +127,10 @@ See [Proxies and VPN](../guide/proxies-and-vpn.md).
 !!! note "`TrackRequest`"
     `self.track_request` is a small dataclass built from the CLI: `codecs`
     (from `--vcodec`, empty means "accept any"), `ranges` (from `--range`, default
-    `[Video.Range.SDR]`), and `best_available`. Use it in `get_tracks` to decide which
-    variants to fetch.
+    `[Video.Range.SDR]`), `best_available`, and `generate_dv` (from `--generate-dv`).
+    Use it in `get_tracks` to decide which variants to fetch. A service that fetches
+    the HYBRID variants itself must also fetch HDR10P when `generate_dv` is set and
+    the title has no DV track, because the conversion needs an HEVC HDR10+ base.
 
 ## Titles and the `Title` hierarchy
 
@@ -191,8 +193,12 @@ Each subclass adds its own required fields on top of `id_` and `service`:
 
     A `Song` also takes optional metadata keywords that the tagger and the naming templates
     read: `album_artist`, `release_type`, `total_tracks`, `total_discs`, `genre`,
-    `explicit`, `isrc`, `upc`, `copyright`, `label`, `lyrics`, and `artwork_url`. Read the
-    class for the current list.
+    `explicit`, `isrc`, `upc`, `copyright`, `label`, `lyrics`, `synced_lyrics`,
+    `lyrics_suffix`, and `artwork_url`. Read the class for the current list. Give `lyrics` as
+    plain text: the tagger embeds it as is. With `synced_lyrics` (timed LRC or TTML) and
+    `lyrics_suffix` (`".lrc"`, `".ttml"`), unshackle also saves the timed lyrics beside the
+    final audio file under that suffix.
+    You can set these fields in `get_tracks()` too, and a remote client gets them back.
 
     The tagger also falls back to `Song.data` for fields the constructor did not get, such
     as the composer or a full release date. It reads the top level of that dict and a
@@ -272,7 +278,7 @@ do not give a `name`, unshackle derives a human-readable name from the language.
 `Video` adds `codec`, `range`, `bitrate`, `width`, `height`, `fps`, `scan_type`, and
 closed-caption descriptors. The relevant enums:
 
-- **`Video.Codec`**: `AVC` (H.264), `HEVC` (H.265), `VC1`, `VP8`, `VP9`, `AV1`.
+- **`Video.Codec`**: `AVC` (H.264), `HEVC` (H.265), `VC1`, `VP8`, `VP9`, `AV1`, `LCEVC`.
 - **`Video.Range`**: `SDR`, `HLG`, `HDR10`, `HDR10P` (HDR10+), `DV` (Dolby Vision), and
   `HYBRID`. `HYBRID` is special: it tells the pipeline to select both an HDR10(+) base and
   a DV track and merge the DV RPU onto the HDR10 track with `dovi_tool` (see
@@ -286,7 +292,7 @@ closed-caption descriptors. The relevant enums:
 
 `Audio` adds `bitrate`, `channels`, `joc` (Joint Object Coding, the Atmos indicator),
 and `descriptive`. `Audio.Codec` covers `AAC`, `AC3` (`DD`), `EC3` (`DD+`), `AC4`,
-`OPUS`, `OGG` (Vorbis), `DTS`, `DTSX`, `ALAC`, and `FLAC`. The `atmos` property is `True` when
+`OPUS`, `OGG` (Vorbis), `DTS`, `DTSX`, `DTSHD`, `MPEGH`, `ALAC`, `FLAC`, and `MP3`. The `atmos` property is `True` when
 `joc` is set (or when `extra` flags it).
 
 ### `Subtitle`
@@ -307,7 +313,9 @@ all documented for users in [Subtitles](../guide/subtitles.md).
 - **`Chapters`**: a sorted collection that auto-inserts a `00:00:00.000` chapter and
   reads/writes OGM Simple format.
 - **`Attachment`**: a font or image attached to the mux (for example, fonts an ASS subtitle
-  references), built from a local `path` or a `url`.
+  references), built from a local `path` or a `url`. A `url` attachment downloads through
+  the same downloader as a track, with the same retries. If it still fails, `dl` stops the
+  run with a one-line error.
 
 ### Selection, sorting, and muxing
 
@@ -376,7 +384,7 @@ A typical `get_tracks` therefore looks like fetching the manifest text with
 ## DRM hooks
 
 If a track carries DRM, the framework licenses and decrypts it, but it needs your
-service to talk to the platform's license server. unshackle recognizes five DRM systems:
+service to talk to the platform's license server. unshackle recognizes six DRM systems:
 
 | DRM class | System | License flow |
 |---|---|---|
@@ -385,6 +393,7 @@ service to talk to the platform's license server. unshackle recognizes five DRM 
 | `ClearKeyCENC` | W3C `org.w3.clearkey` over CENC | JSON KID request → JWK set; no CDM |
 | `ClearKey` | HLS AES-128 | content key fetched directly from a URI; no CDM, no challenge |
 | `MonaLisa` | Proprietary WASM DRM | keys extracted locally; no license server |
+| `BlowfishStripe` | Blowfish CBC stripe cipher | the service gives the per-track key; no CDM, no license server |
 
 !!! warning "`ClearKey` vs `ClearKeyCENC`"
     Despite the shared prefix these are entirely different systems. `ClearKey` is HLS
@@ -408,6 +417,25 @@ You do not open CDM sessions or operate shaka-packager yourself. The `Widevine`/
 classes drive the CDM handshake and call the decryption backend. Your hook is only the
 "send this challenge, give me back the license" step.
 
+### Decrypting a cbcs file yourself
+
+Some tracks cannot use the framework's decryption: a single cbcs file whose sample entries share
+a zero default KID, or a sample entry whose content key no CDM can license and only a separate
+process can use. For these, set no `drm` on the track and override two methods:
+
+- `decrypts_samples(track)` returns `True` for such a track.
+- `get_sample_decrypter(track, entry)` returns, for the 1-based `stsd` entry, the 16-byte
+  content key or a `cbcs.SampleDecrypter`. A `SampleDecrypter` gets the protected bytes of each sample of
+  one fragment, cut to whole AES blocks, and returns plaintexts of the same lengths. It handles
+  full-sample cbcs only, not pattern encryption.
+
+When the download of the track ends, unshackle calls `unshackle.core.drm.cbcs.decrypt_file`, and
+the progress row shows "Decrypting". Your `on_track_downloaded` runs before this and gets the
+encrypted file. `decrypt_file` writes the plaintext back in place and removes the
+protection boxes, so the muxer reads a clear file. In a remote session `get_sample_decrypter`
+runs on the server: the client sends the samples through the `samples` route, so a decrypter
+that needs a process on the server also works for a remote client.
+
 ### How unshackle chooses a CDM and finds keys
 
 CDM selection is config-driven: the `cdm` map resolves a service tag (and optionally the
@@ -423,7 +451,9 @@ the API surface.
 ### Dolby Vision and hybrid
 
 Two DV mechanisms sit on top of the track model. **DV fixup** re-exposes DV signalling on
-HLS streams that carry a valid DV RPU but advertise plain HEVC (`dv_compatible_bitstream`).
+HLS and DASH streams that carry a valid DV RPU but advertise plain HEVC, with DV only in the
+supplemental codecs (`dv_compatible_bitstream`). `--list` shows such a track as `HDR10+DV` or `HDR10P+DV`.
+A service sets `hdr10_base` on a DV track that has an HDR10 base layer (DV profile 8.1), and `--list` shows it as `DV+HDR10`.
 **Hybrid** processing (`Video.Range.HYBRID`) selects an HDR10(+) base and a DV donor,
 extracts the RPU with `dovi_tool`, and injects it onto the base layer, to make a single
 track that carries both HDR10 metadata and the DV RPU. Both are automatic once the
@@ -439,10 +469,11 @@ the container file.
 Everything a service does over the network flows through objects the base constructor
 prepared, all derived from the Click context (`ctx`) that `dl` passes in.
 
-- **`self.config`**: your service's slice of `unshackle.yaml`, i.e.
-  `config.services[<ServiceName>]`. This is a plain dict. Use it for per-service settings
-  like base URLs, an API key, or a `title_map`. See
-  [Configuration](../getting-started/configuration-file.md).
+- **`self.config`**: a plain dict. unshackle loads the service's own `config.yaml`, then merges
+  the user's `services.<TAG>` block from `unshackle.yaml` over it. Nested keys merge one by one,
+  the user's value wins, and a list in the user's block replaces the whole list. Use it for
+  per-service settings like base URLs, an API key, or a `title_map`. See
+  [Services & authentication](../reference/configuration/services.md) for the override keys.
 - **`self.session`**: a `requests.Session` with `config.headers` applied, a retry policy
   (`total=5`, backoff, retry on 429/5xx), and any resolved proxy already mounted. Pass this
   HTTP session into the manifest parsers and DRM calls so headers, cookies, and proxies flow

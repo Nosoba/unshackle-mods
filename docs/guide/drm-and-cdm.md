@@ -41,7 +41,7 @@ then decrypts the file with those keys.
 
 ## Supported DRM systems
 
-unshackle implements five DRM systems. Only the first two need a device file and a
+unshackle implements six DRM systems. Only the first two need a device file and a
 license-server handshake. The rest are special cases.
 
 | System | Device file | License flow | Decryption |
@@ -51,6 +51,7 @@ license-server handshake. The rest are special cases.
 | **ClearKey (CENC)**, W3C EME `org.w3.clearkey` | none | JSON `{"kids":[...],"type":"temporary"}` → license server returns a JWK Set. No CDM. | shaka-packager / mp4decrypt |
 | **ClearKey (HLS)**, AES-128 `EXT-X-KEY` | none | Key fetched directly from a URI or `data:` URL. No CDM, no challenge. | in-process AES-CBC |
 | **MonaLisa** (proprietary, WASM) | `.mld` | Ticket from the service API; keys extracted locally via WASM. No license server. | ML-Worker binary + AES-ECB, per segment |
+| **Blowfish stripe** | none | The service gives the per-track key. No CDM, no license server. | in-process Blowfish-CBC on every third 2048-byte chunk |
 
 !!! warning "Two different ClearKeys"
     "ClearKey (HLS)" and "ClearKey (CENC)" are entirely different systems that happen
@@ -495,6 +496,9 @@ unshackle dl --skip-dl --all-drm --export EXAMPLE 81234567
 
 - The `cdm` mapping must name a device for each system. A single device name, or `--cdm`,
   stops the run with an error that names the missing system.
+- The order of the `widevine` and `playready` config keys in the `cdm` entry sets the order
+  of the two systems, as in a run without the flag. Each track licenses first with the
+  system of the first config key.
 - A Key Vault is read first, as in a run without the flag. A DRM system sends a challenge
   only for a KID that no Key Vault and no earlier track of the run gave a content key
   for. When the first system returns all the KIDs of the second, the second sends no

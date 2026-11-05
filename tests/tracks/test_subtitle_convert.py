@@ -16,11 +16,13 @@ import pathlib
 import re
 import struct
 
+import pycaption
 import pytest
 
 from unshackle.core import binaries
 from unshackle.core.tracks import subtitle_convert as sc
 from unshackle.core.tracks.subtitle import Subtitle
+from unshackle.core.tracks.track import Track
 
 Codec = Subtitle.Codec
 
@@ -47,6 +49,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1}Hello{\\i0}
 Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,World
 """
+
+
+LAYERED_ASS_SAMPLE = ASS_SAMPLE.replace(
+    "Dialogue: 0,0:00:01.00", "Dialogue: 1,0:00:05.00,0:00:06.00,Default,,0,0,0,,Sign\nDialogue: 0,0:00:01.00"
+)
+
+# Read before the autouse fixture below hides it.
+INSTALLED_SUBTITLEEDIT = binaries.SubtitleEdit
 
 
 @pytest.fixture(autouse=True)
@@ -145,6 +155,30 @@ def test_ass_to_srt_converts_when_forced(tmp_path, monkeypatch):
     assert out.suffix == ".srt"
     assert cue_count(out) == 2
     assert "{\\" not in out.read_text("utf8")  # override tags stripped
+
+
+@pytest.mark.parametrize("target", [Codec.SubRip, Codec.WebVTT])
+@pytest.mark.parametrize("backend", ["pysubs2", "subtitleedit"])
+def test_layered_ass_converts_in_start_time_order(tmp_path, monkeypatch, backend, target):
+    if backend == "subtitleedit":
+        if not INSTALLED_SUBTITLEEDIT:
+            pytest.skip("SubtitleEdit is not installed")
+        monkeypatch.setattr(binaries, "SubtitleEdit", INSTALLED_SUBTITLEEDIT)
+    monkeypatch.setattr("unshackle.core.config.config.subtitle", {"conversion_method": backend}, raising=False)
+    sub = make_sub(tmp_path, "x.ass", LAYERED_ASS_SAMPLE, Codec.SubStationAlphav4)
+    out = sub.convert(target, forced=True)
+    starts = re.findall(r"(\d+:\d\d:\d\d[.,]\d{3}) -->", out.read_text("utf-8-sig"))
+    assert len(starts) == 3
+    assert starts == sorted(starts)
+    assert [p.name for p in tmp_path.iterdir()] == [out.name]  # sorted copy removed
+
+
+def test_ass_to_ssa_keeps_file_order(tmp_path, monkeypatch):
+    monkeypatch.setattr("unshackle.core.config.config.subtitle", {}, raising=False)
+    sub = make_sub(tmp_path, "x.ass", LAYERED_ASS_SAMPLE, Codec.SubStationAlphav4)
+    out = sub.convert(Codec.SubStationAlpha, forced=True)
+    text = out.read_text("utf8")
+    assert text.index("Sign") < text.index("Hello")
 
 
 def test_webvtt_to_srt_conversion(tmp_path, monkeypatch):
@@ -278,7 +312,7 @@ def test_sdh_stripping_ass_without_subtitleedit_content_matches_codec(tmp_path, 
     assert "door creaks" not in text  # bracketed effect removed
 
 
-# Segmented fVTT (wvtt) / fTTML (stpp) ship from DASH/HLS as fragmented MP4 (e.g. HBO Max). The
+# Segmented fVTT (wvtt) / fTTML (stpp) ship from DASH/HLS as fragmented MP4. The
 # downloader concatenates init + media segments into one file; parse() reads the MP4 boxes directly.
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
@@ -317,6 +351,38 @@ def test_segmented_fvtt_parses_and_converts(tmp_path, monkeypatch):
     assert cue_count(out) == 2
 
 
+def with_mdhd_timescale(data: bytes, timescale: int) -> bytes:
+    """The fixture with its version-0 mdhd timescale replaced; sample times stay in the same units."""
+    at = data.index(b"mdhd") + 16
+    return data[:at] + struct.pack(">I", timescale) + data[at + 4 :]
+
+
+@pytest.mark.parametrize("timescale", [1000, 2000, 90000])
+def test_segmented_fvtt_cue_times_follow_the_media_timescale(timescale):
+    data = (FIXTURES / "segmented.wvtt.mp4").read_bytes()
+    assert with_mdhd_timescale(data, 1000) == data  # the helper's offset hits the fixture's timescale
+
+    captions, _ = Subtitle.merge_segmented_wvtt(with_mdhd_timescale(data, timescale))
+
+    # the fixture's cues span 1000-2000 and 3000-4000 media units
+    times = [t for c in captions for t in (c.start, c.end)]
+    assert times == pytest.approx([t * 1_000_000 / timescale for t in (1000, 2000, 3000, 4000)])
+
+
+def test_segmented_fttml_joins_a_cue_split_at_a_segment_boundary():
+    data = build_stpp_mp4(
+        ttml_fragment(("00:00:01.000", "00:00:02.000", "Carried")),
+        ttml_fragment(("00:00:02.000", "00:00:03.500", "Carried"), ("00:00:03.500", "00:00:04.000", "Next")),
+    )
+
+    captions = Subtitle.parse(data, Codec.fTTML).get_captions("en")
+
+    assert [(c.start / 1e6, c.end / 1e6, c.get_text()) for c in captions] == [
+        (1.0, 3.5, "Carried"),
+        (3.5, 4.0, "Next"),
+    ]
+
+
 def test_segmented_fttml_parses_and_converts(tmp_path, monkeypatch):
     monkeypatch.setattr("unshackle.core.config.config.subtitle", {}, raising=False)
     frag = (
@@ -339,3 +405,181 @@ def test_segmented_fttml_parses_and_converts(tmp_path, monkeypatch):
     assert sub.codec == Codec.TimedTextMarkupLang
     out = sub.convert(Codec.SubRip, forced=True)
     assert cue_count(out) == 2
+
+
+def downloaded_subtitle(tmp_path, monkeypatch, codec, data: bytes, descriptor: Track.Descriptor, track_data: dict):
+    """A Subtitle whose base download is a no-op, so download() runs only the post-processing on data."""
+    monkeypatch.setattr("unshackle.core.config.config.subtitle", {}, raising=False)
+    monkeypatch.setattr(Track, "download", lambda *args, **kwargs: None)
+    sub = Subtitle(url="https://example.test/x", language="en", codec=codec, descriptor=descriptor, data=track_data)
+    sub.path = tmp_path / f"seg.{codec.extension}"
+    sub.path.write_bytes(data)
+    return sub
+
+
+def dash_subtitle(tmp_path, monkeypatch, codec, data: bytes, template: str):
+    from lxml import etree
+
+    track_data = {
+        "dash": {
+            "adaptation_set": etree.fromstring(f"<AdaptationSet>{template}</AdaptationSet>"),
+            "representation": etree.fromstring("<Representation/>"),
+            "segment_durations": [],
+        }
+    }
+    return downloaded_subtitle(tmp_path, monkeypatch, codec, data, Track.Descriptor.DASH, track_data)
+
+
+STPP_CUE = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter"'
+    ' ttp:timeBase="media" xml:lang="en"><body><div>'
+    '<p begin="00:06:02.000" end="00:06:02.839">Line</p>'
+    "</div></body></tt>"
+)
+
+
+@pytest.mark.parametrize(
+    "template, offset, times",
+    [
+        (
+            '<SegmentTemplate timescale="90000" presentationTimeOffset="180000">'
+            '<SegmentTimeline><S t="180000" d="540000" r="10"/></SegmentTimeline></SegmentTemplate>',
+            (2000, 6000),
+            (360_000_000, 360_839_000),
+        ),
+        # cues already on presentation time stay where they are
+        (
+            '<SegmentTemplate timescale="1000" presentationTimeOffset="3600000" duration="6000"/>',
+            (3_600_000, 6000),
+            (362_000_000, 362_839_000),
+        ),
+    ],
+)
+def test_dash_fttml_cues_lose_the_presentation_time_offset(tmp_path, monkeypatch, template, offset, times):
+    sub = dash_subtitle(tmp_path, monkeypatch, Codec.fTTML, build_stpp_mp4(STPP_CUE), template)
+    assert sub.dash_offset_ms() == offset
+
+    sub.download(None, None)  # type: ignore[arg-type]
+
+    assert sub.codec == Codec.TimedTextMarkupLang
+    (caption,) = Subtitle.parse(sub.path.read_bytes(), Codec.TimedTextMarkupLang).get_captions("en")
+    assert (caption.start, caption.end) == times
+
+
+@pytest.mark.parametrize("method", ["subby", "pycaption"])
+@pytest.mark.parametrize(
+    "mdhd_timescale, pto, cues",
+    [
+        (1000, 1000, ("00:00:00.000 --> 00:00:01.000", "00:00:02.000 --> 00:00:03.000")),
+        (2000, 500, ("00:00:00.000 --> 00:00:00.500", "00:00:01.000 --> 00:00:01.500")),
+    ],
+)
+def test_dash_fvtt_cues_lose_the_presentation_time_offset(tmp_path, monkeypatch, method, mdhd_timescale, pto, cues):
+    template = f'<SegmentTemplate timescale="1000" presentationTimeOffset="{pto}" duration="2000"/>'
+    data = with_mdhd_timescale((FIXTURES / "segmented.wvtt.mp4").read_bytes(), mdhd_timescale)
+    sub = dash_subtitle(tmp_path, monkeypatch, Codec.fVTT, data, template)
+    monkeypatch.setattr("unshackle.core.config.config.subtitle", {"conversion_method": method}, raising=False)
+
+    sub.download(None, None)  # type: ignore[arg-type]
+
+    assert sub.codec == Codec.WebVTT
+    text = sub.path.read_text("utf8")
+    assert all(cue in text for cue in cues)
+
+
+def ttml_fragment(*cues: tuple[str, ...]) -> str:
+    body = "".join(f'<p begin="{cue[0]}" end="{cue[1]}">{cue[2] if len(cue) > 2 else "Line"}</p>' for cue in cues)
+    return f'<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="en"><body><div>{body}</div></body></tt>'
+
+
+def test_dash_fttml_with_no_cues_converts(tmp_path, monkeypatch):
+    template = '<SegmentTemplate timescale="1000" presentationTimeOffset="2000" duration="6000"/>'
+    sub = dash_subtitle(tmp_path, monkeypatch, Codec.fTTML, build_stpp_mp4(ttml_fragment()), template)
+
+    sub.download(None, None)  # type: ignore[arg-type]
+
+    assert sub.codec == Codec.TimedTextMarkupLang
+
+
+@pytest.mark.parametrize(
+    "fragments, expected",
+    [
+        # timed from each fragment's start, as Smooth Streaming packagers write it
+        (
+            [
+                ttml_fragment(),
+                ttml_fragment(("00:00:06.000", "00:00:07.000")),
+                ttml_fragment(("00:00:00.500", "00:00:01.000")),
+            ],
+            [(14.0, 15.0), (16.5, 17.0)],
+        ),
+        # already on the stream timeline
+        (
+            [
+                ttml_fragment(),
+                ttml_fragment(("00:00:14.000", "00:00:15.000")),
+                ttml_fragment(("00:00:16.500", "00:00:17.000")),
+            ],
+            [(14.0, 15.0), (16.5, 17.0)],
+        ),
+        # one cue carried across a fragment boundary comes out whole
+        (
+            [
+                ttml_fragment(),
+                ttml_fragment(("00:00:07.000", "00:00:08.000")),
+                ttml_fragment(("00:00:00.000", "00:00:01.000")),
+            ],
+            [(15.0, 17.0)],
+        ),
+    ],
+)
+def test_ism_fttml_cues_land_on_the_stream_timeline(tmp_path, monkeypatch, fragments, expected):
+    times = [0, 80_000_000, 160_000_000]
+    track_data = {"ism": {"segment_times": times, "fragment_times": times, "timescale": 10_000_000}}
+    sub = downloaded_subtitle(
+        tmp_path, monkeypatch, Codec.fTTML, build_stpp_mp4(*fragments), Track.Descriptor.ISM, track_data
+    )
+
+    sub.download(None, None)  # type: ignore[arg-type]
+
+    assert sub.codec == Codec.TimedTextMarkupLang
+    captions = Subtitle.parse(sub.path.read_bytes(), Codec.TimedTextMarkupLang).get_captions("en")
+    assert [(c.start / 1e6, c.end / 1e6) for c in captions] == expected
+
+
+def test_fttml_with_viewport_units_converts(tmp_path, monkeypatch):
+    """TTML2 ``vw``/``vh`` and ``rw``/``rh`` sizes, which pycaption rejects, still parse and convert.
+
+    Only the size attributes pycaption parses are rewritten: a negative one becomes 0, while an ``rh``
+    font size and the same units in cue text stay as they are.
+    """
+    monkeypatch.setattr("unshackle.core.config.config.subtitle", {}, raising=False)
+    frag = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling"'
+        ' xmlns:ttp="http://www.w3.org/ns/ttml#parameter" xml:lang="ja" ttp:version="2">'
+        '<head><styling><style xml:id="s1" tts:fontSize="5.33rh"/></styling><layout>'
+        '<region xml:id="bottom" tts:extent="80vw 15vh" tts:position="center bottom 10vh"/>'
+        '<region xml:id="side" tts:extent="15rw 80rh" tts:position="right 10vw center" tts:writingMode="tbrl"/>'
+        "<region xml:id='edge' tts:origin='-5vw 80vh' tts:extent='90vw 10vh' tts:padding='1vh 2vw'/>"
+        "</layout></head>"
+        '<body region="bottom"><div>'
+        '<p begin="00:00:01.000" end="00:00:02.000" style="s1">Speed 10vw</p>'
+        '<p begin="00:00:03.000" end="00:00:04.000" region="side">Line 2</p>'
+        '<p begin="00:00:05.000" end="00:00:06.000" region="edge">Line 3</p>'
+        "</div></body></tt>"
+    )
+    # The fTTML merge keeps no style sheet, so the font size is checked on a plain TTML read.
+    styled = pycaption.DFXPWriter().write(Subtitle.parse(frag.encode(), Codec.TimedTextMarkupLang))
+    assert 'tts:fontSize="5.33rh"' in styled
+
+    seg = tmp_path / "seg.stpp"
+    seg.write_bytes(build_stpp_mp4(frag))
+    sub = Subtitle(url="https://example.test/x", language="ja", codec=Codec.fTTML)
+    sub.path = seg
+
+    sub.convert(Codec.TimedTextMarkupLang)
+    out = sub.convert(Codec.SubRip, forced=True)
+    assert cue_count(out) == 3
+    assert "Speed 10vw" in out.read_text("utf8")

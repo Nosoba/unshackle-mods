@@ -19,7 +19,7 @@ import pytest
 from unshackle.core import binaries
 from unshackle.core.tracks import Audio, Subtitle, Tracks, Video
 from unshackle.core.tracks.track import (
-    has_dts_uhd_sample_entry,
+    has_mp4_only_audio_entry,
     iter_top_level_boxes,
     strip_duplicate_init_boxes,
 )
@@ -36,9 +36,9 @@ def write_mp4(path: Path, sample_entry: bytes) -> Path:
     return path
 
 
-@pytest.mark.parametrize("fourcc", [b"dtsx", b"dtsy"])
-def test_dts_uhd_sample_entries_are_detected(tmp_path: Path, fourcc: bytes) -> None:
-    assert has_dts_uhd_sample_entry(write_mp4(tmp_path / "a.mp4", fourcc)) is True
+@pytest.mark.parametrize("fourcc", [b"dtsx", b"dtsy", b"mha1", b"mha2", b"mhm1", b"mhm2"])
+def test_dts_uhd_and_mpeg_h_sample_entries_are_detected(tmp_path: Path, fourcc: bytes) -> None:
+    assert has_mp4_only_audio_entry(write_mp4(tmp_path / "a.mp4", fourcc)) is True
 
 
 @pytest.mark.parametrize("fourcc", [b"dtsc", b"dtse", b"dtsh", b"dtsl", b"ec-3", b"mp4a"])
@@ -47,13 +47,13 @@ def test_other_dts_profiles_stay_in_matroska(tmp_path: Path, fourcc: bytes) -> N
     DTS:X Profile 1 is DTS-HD Master Audio underneath and Matroska stores it as
     A_DTS, so it must not be pulled out of Matroska by the DTS:X container rule.
     """
-    assert has_dts_uhd_sample_entry(write_mp4(tmp_path / "a.mp4", fourcc)) is False
+    assert has_mp4_only_audio_entry(write_mp4(tmp_path / "a.mp4", fourcc)) is False
 
 
 def test_a_file_with_no_moov_is_not_detected(tmp_path: Path) -> None:
     path = tmp_path / "a.mp4"
     path.write_bytes(box(b"ftyp", b"isom") + box(b"mdat", b"dtsx" * 8))
-    assert has_dts_uhd_sample_entry(path) is False, "a 4CC in mdat is not a sample entry"
+    assert has_mp4_only_audio_entry(path) is False, "a 4CC in mdat is not a sample entry"
 
 
 def build_tracks(tmp_path: Path, audio_entry: bytes) -> Tracks:
@@ -115,10 +115,10 @@ def test_other_audio_still_muxes_with_mkvmerge(tmp_path: Path, monkeypatch: pyte
         tracks.mux("Title", delete=False, output_path=tmp_path / "out.muxed.mkv")
 
 
-def test_a_missing_mp4box_names_the_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_missing_mp4box_names_the_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(binaries, "MP4Box", None, raising=False)
     tracks = build_tracks(tmp_path, b"dtsx")
-    with pytest.raises(RuntimeError, match="gpac"):
+    with pytest.raises(RuntimeError, match="MP4Box"):
         tracks.mux("Title", delete=False, output_path=tmp_path / "out.muxed.mkv")
 
 
@@ -148,6 +148,30 @@ def test_substation_alpha_subtitles_are_left_out(tmp_path: Path, monkeypatch: py
     command = " ".join(captured[0].args)
     assert "s.ass" not in command
     assert "s.vtt:lang=es" in command
+
+
+def test_mp4_subtitles_get_the_script_their_region_implies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[FakePopen] = []
+
+    def fake_popen(args: list[str], **kwargs: object) -> FakePopen:
+        p = FakePopen(args, **kwargs)
+        captured.append(p)
+        Path(args[-1]).write_bytes(b"muxed")
+        return p
+
+    monkeypatch.setattr(binaries, "MP4Box", Path("MP4Box"), raising=False)
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    tracks = build_tracks(tmp_path, b"dtsx")
+    vtt = Subtitle(id_="s1", url="https://x/s", codec=Subtitle.Codec.WebVTT, language="zh-TW")
+    vtt.path = tmp_path / "s.vtt"
+    vtt.path.write_text("WEBVTT\n")
+    tracks.add(vtt)
+
+    tracks.mux("Title", delete=False, output_path=tmp_path / "out.muxed.mkv")
+    command = captured[0].args
+    assert f"{tmp_path / 's.vtt'}:lang=zh-Hant-TW" in command
+    assert any(arg.endswith("=Chinese (Traditional)") for arg in command)
 
 
 def test_mp4box_errors_come_back_to_the_caller(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
