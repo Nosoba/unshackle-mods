@@ -29,6 +29,8 @@ CLI_ONLY = {
     "speed_limit",
     # dl_sub copies a server path into the output, so the API refuses to take it from a client.
     "dl_sub",
+    # dl_sub_proxy would route a subtitle fetch through a proxy the client picks; CLI only.
+    "dl_sub_proxy",
 }
 
 # The API keeps a_lang empty so a client's lang cascades to audio; see test_api_language_defaults.py.

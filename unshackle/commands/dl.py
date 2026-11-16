@@ -880,49 +880,82 @@ class dl:
                 self.log.warning(f"Failed to delete temp file {temp_path}: {e}")
         temp_files.clear()
 
-    def external_subtitle_proxy(self, source: str, service: Service) -> Optional[str]:
-        """The proxy URI to fetch an external subtitle (-dls) URL through, or None to go direct.
+    def external_subtitle_proxies(self, source: str, service: Service) -> list[Optional[str]]:
+        """The proxies to try for an external subtitle (-dls) URL, in order, ending with None (direct).
 
         Precedence:
-          1. The proxy this run is already using (``--proxy``), so an explicit choice wins and
+          1. ``--dl-sub-proxy``, an explicit choice for subtitles alone.
+          2. The proxy this run is already using (``--proxy``), so an explicit choice wins and
              no second request is made to the proxy provider.
-          2. For a region-locked host (see ``REGION_LOCKED_HOSTS``), a freshly resolved proxy in
-             that region, matching what ``--proxy <region>`` would have given.
-          3. Otherwise no proxy.
+          3. For a region-locked host (see ``REGION_LOCKED_HOSTS``), one proxy per provider that
+             can serve that region, so a provider that is down or lacks it hands over to the next.
+          4. Otherwise no proxy.
 
-        Never raises: a provider that cannot serve the region is logged and the fetch is attempted
-        directly, rather than failing the whole download.
+        An explicit URI (``--dl-sub-proxy <uri>``) is used alone: falling back to direct would leak this
+        machine's IP. A region query still tries every provider. Never raises.
         """
+        candidates: list[Optional[str]] = []
+        if self.dl_sub_proxy:
+            # An explicit URI is the only attempt: falling back to direct would leak this machine's IP.
+            return [self.dl_sub_proxy]
+        if self.dl_sub_proxy_query:
+            # An explicit region or provider query: still try every provider that can serve it.
+            region = self.dl_sub_proxy_query
+            for provider in self.proxy_providers:
+                name = provider.__class__.__name__
+                try:
+                    uri = provider.get_proxy(region)
+                except Exception as e:
+                    self.log.error(f" - The {name} proxy provider failed for {region}: {e}")
+                    continue
+                if uri and uri not in candidates:
+                    self.log.debug(f" - Using {region} proxy from {name} for the external subtitle")
+                    candidates.append(uri)
+            if not candidates:
+                self.log.error(f" - Could not get a {region} proxy for the external subtitle")
+            candidates.append(None)
+            return candidates
+
         session_proxies = getattr(getattr(service, "session", None), "proxies", None) or {}
         active = session_proxies.get("all") or session_proxies.get("https") or session_proxies.get("http")
         if active:
             self.log.debug(f" - Fetching external subtitle via the run's proxy: {mask_proxy(active)}")
-            return active
+            return [*candidates, active]
 
         region = region_lock_for(source)
         if not region:
-            return None
+            return candidates or [None]
 
         if not self.proxy_providers:
             self.log.warning(
                 f" - {urlparse(source).hostname} is region locked to {region.upper()} but no proxy provider is "
                 f"available; the subtitle fetch will likely fail."
             )
-            return None
+            return candidates or [None]
 
         self.log.info(f" - External subtitle host is region locked; getting a {region.upper()} proxy.")
-        try:
-            proxy = resolve_proxy(region, self.proxy_providers)
-        except ValueError as e:
-            self.log.error(f" - Could not get a {region.upper()} proxy for the external subtitle: {e}")
-            return None
-        except Exception as e:
-            self.log.error(f" - Failed to resolve a {region.upper()} proxy for the external subtitle: {e}")
-            return None
+        for provider in self.proxy_providers:
+            name = provider.__class__.__name__
+            try:
+                uri = provider.get_proxy(region)
+            except Exception as e:
+                self.log.error(
+                    f" - The {name} proxy provider failed for a {region.upper()} proxy for the external "
+                    f"subtitle, so the next one is tried: {e}"
+                )
+                continue
+            if uri and uri not in candidates:
+                self.log.debug(f" - Using {region.upper()} proxy from {name} for the external subtitle")
+                candidates.append(uri)
+        if not candidates:
+            self.log.error(f" - Could not get a {region.upper()} proxy for the external subtitle")
 
-        if proxy:
-            self.log.debug(f" - Using {region.upper()} proxy for the external subtitle: {mask_proxy(proxy)}")
-        return proxy
+        candidates.append(None)
+        return candidates
+
+    def external_subtitle_proxy(self, source: str, service: Service) -> Optional[str]:
+        """The first proxy from ``external_subtitle_proxies``, or None to go direct."""
+        return next(iter(self.external_subtitle_proxies(source, service)), None)
 
     def process_external_subtitle(self, title: Title_T, source: str, service: Service, temp_files_list: list = None) -> None:
         """
@@ -1025,7 +1058,8 @@ class dl:
 
         # 2. URL PROCESSING
         if source.startswith("http"):
-            sub_proxy = self.external_subtitle_proxy(source, service)
+            proxies_to_try = self.external_subtitle_proxies(source, service)
+            sub_proxy = proxies_to_try[0]
 
             # A. TVer Episode URL Logic -> Use yt-dlp
             if (urlparse(source).hostname or "").lower().endswith("tver.jp"):
@@ -1061,13 +1095,23 @@ class dl:
                     "--sub-lang", "all",    # Ambil semua bahasa (biasanya ja)
                     "--output", str(out_tmpl),
                 ]
-                if sub_proxy:
-                    cmd += ["--proxy", sub_proxy]
-                cmd.append(source)
 
                 try:
                     self.log.debug(f"Running yt-dlp: {[mask_proxy(x) for x in cmd]}")
-                    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    for attempt, proxy in enumerate(proxies_to_try):
+                        attempt_cmd = [*cmd, *(["--proxy", proxy] if proxy else []), source]
+                        try:
+                            subprocess.run(
+                                attempt_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                            )
+                            break
+                        except subprocess.CalledProcessError as e:
+                            if attempt == len(proxies_to_try) - 1:
+                                raise
+                            self.log.warning(
+                                f" - yt-dlp failed through this proxy, trying the next one: "
+                                f"{e.stderr.decode('utf-8', errors='ignore')}"
+                            )
 
                     found_subs = list(config.directories.temp.glob(f"tver_sub_{run_id}*"))
                     # every file yt-dlp wrote is temporary, not just the ones we turn into tracks
@@ -1117,10 +1161,20 @@ class dl:
 
             else:
                 try:
-                    req_proxies = {"http": sub_proxy, "https": sub_proxy} if sub_proxy else None
-
-                    res = requests.get(source, proxies=req_proxies, timeout=15)
-                    res.raise_for_status()
+                    res = None
+                    for attempt, proxy in enumerate(proxies_to_try):
+                        req_proxies = {"http": proxy, "https": proxy} if proxy else None
+                        try:
+                            res = requests.get(source, proxies=req_proxies, timeout=15)
+                            res.raise_for_status()
+                            break
+                        except Exception as e:
+                            if attempt == len(proxies_to_try) - 1:
+                                raise
+                            self.log.warning(
+                                f" - Subtitle fetch failed through this proxy, trying the next one: {e}"
+                            )
+                    assert res is not None
 
                     filename = source.split("/")[-1].split("?")[0]
                     if "." not in filename: filename = "external.srt"
@@ -1694,6 +1748,13 @@ class dl:
         help="Path to local subtitle file OR URL (Direct/TVer) to include in download."
     )
     @click.option(
+        "--dl-sub-proxy",
+        type=str,
+        default=None,
+        help="Proxy for fetching -dls subtitles only, in the same form as --proxy (e.g. jp, nordvpn:jp, or a URI). "
+        "Defaults to the run's --proxy, else a proxy provider that serves the subtitle host's region.",
+    )
+    @click.option(
         "--generate-dv",
         is_flag=True,
         default=False,
@@ -2211,6 +2272,7 @@ class dl:
         worst: bool,
         best_available: bool,
         dl_sub: Optional[str],
+        dl_sub_proxy: Optional[str],
         speed_limit: Optional[str] = None,
         split_audio: Optional[bool] = None,
         merge_video: Optional[bool] = None,
@@ -2350,6 +2412,20 @@ class dl:
             except ValueError as e:
                 self.log.error(f"--proxy-download: {e}")
                 sys.exit(1)
+
+        # -dls subtitle fetches: a provider that fails hands over to the next one, so a
+        # region query keeps the providers it can try instead of one resolved URI.
+        self.dl_sub_proxy: Optional[str] = None
+        self.dl_sub_proxy_query: Optional[str] = None
+        if not no_proxy and dl_sub_proxy:
+            if re.fullmatch(rf"(?:[a-z]+:){{0,2}}{REGION}", dl_sub_proxy, re.I):
+                self.dl_sub_proxy_query = dl_sub_proxy.lower()
+            else:
+                try:
+                    self.dl_sub_proxy = resolve_proxy(dl_sub_proxy, self.proxy_providers)
+                except ValueError as e:
+                    self.log.error(f"--dl-sub-proxy: {e}")
+                    sys.exit(1)
 
         if export:
             config.directories.exports.mkdir(parents=True, exist_ok=True)

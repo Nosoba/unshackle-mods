@@ -33,10 +33,12 @@ class DummyLog:
 
 
 def make_dl(providers):
-    """A dl instance with only the attributes external_subtitle_proxy touches."""
+    """A dl instance with only the attributes external_subtitle_proxies touches."""
     command = dl.__new__(dl)
     command.log = DummyLog()
     command.proxy_providers = providers
+    command.dl_sub_proxy = None
+    command.dl_sub_proxy_query = None
     return command
 
 
@@ -129,6 +131,68 @@ def test_a_provider_that_raises_does_not_fail_the_download():
 
     assert command.external_subtitle_proxy(TVER_URL, service_with_proxies({})) is None
     assert any("provider is down" in m for m in command.log.messages["error"])
+
+
+def test_every_provider_that_can_serve_the_region_is_tried_in_order():
+    """A provider that is down or lacks the region hands over to the next one."""
+
+    class Broken:
+        def get_proxy(self, query):
+            raise RuntimeError("provider is down")
+
+    class NoJP:
+        def get_proxy(self, query):
+            return None
+
+    class JPOne:
+        def get_proxy(self, query):
+            return "socks5://jp1.example:1080"
+
+    class JPTwo:
+        def get_proxy(self, query):
+            return "socks5://jp2.example:1080"
+
+    command = make_dl([Broken(), NoJP(), JPOne(), JPTwo()])
+
+    assert command.external_subtitle_proxies(TVER_URL, service_with_proxies({})) == [
+        "socks5://jp1.example:1080",
+        "socks5://jp2.example:1080",
+        None,
+    ]
+
+
+def test_dl_sub_proxy_picks_the_provider_for_subtitles_alone():
+    class JPProvider:
+        def get_proxy(self, query):
+            return "socks5://jp.example:1080"
+
+    class Other:
+        def get_proxy(self, query):  # pragma: no cover - must not be reached
+            raise AssertionError("the run's provider was asked despite --dl-sub-proxy")
+
+    command = make_dl([Other()])
+    command.dl_sub_proxy = "socks5://sub.example:1080"
+
+    assert command.external_subtitle_proxies(TVER_URL, service_with_proxies({})) == ["socks5://sub.example:1080"]
+
+
+def test_dl_sub_proxy_region_query_still_tries_every_provider():
+    class Broken:
+        def get_proxy(self, query):
+            raise RuntimeError("down")
+
+    class JPProvider:
+        def get_proxy(self, query):
+            assert query == "jp"
+            return "socks5://jp.example:1080"
+
+    command = make_dl([Broken(), JPProvider()])
+    command.dl_sub_proxy_query = "jp"
+
+    assert command.external_subtitle_proxies("https://cdn.example.com/subs/ja.srt", service_with_proxies({})) == [
+        "socks5://jp.example:1080",
+        None,
+    ]
 
 
 def test_a_service_without_a_session_is_tolerated():

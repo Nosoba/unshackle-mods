@@ -528,6 +528,7 @@ def perform_download(
                 **{**ctx.params, "select_titles": False, "list_": False, "list_titles": False},
                 # Never accept a client path: dl_sub copies a server file into the output.
                 dl_sub=None,
+                dl_sub_proxy=None,
                 progress_sink=progress_callback,
             )
 
