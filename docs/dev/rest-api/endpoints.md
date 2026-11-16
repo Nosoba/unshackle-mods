@@ -439,7 +439,7 @@ Make a download job. It requires `service` and `title_id`. Every other field is 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `profile` | string | `null` | Credential/cookie profile. |
-| `quality` | int[] | `[]` | Target resolution(s); best available if empty. |
+| `quality` | int[] | `[]` | Target resolution(s); best available if empty, or the lowest with `worst`. |
 | `vcodec` | string/string[] | `[]` | Video codec filter. |
 | `acodec` | string/string[] | `[]` | Audio codec filter. |
 | `vbitrate` / `abitrate` | int | `null` | Video / audio bitrate in kbps (positive). |
@@ -480,7 +480,7 @@ Make a download job. It requires `service` and `title_id`. Every other field is 
 | `adaptive_workers` | boolean | `false` | Scale segment workers to measured CDN throughput, up to the `workers` cap. |
 | `download_processes` | int | `1` | Split a track's segments across this many processes. Only engages for large batches. |
 | `downloads` | int | `1` | Concurrent tracks. |
-| `worst` | boolean | `false` | Lowest bitrate within quality. |
+| `worst` | boolean | `false` | Pick the lowest-bitrate video at each resolution in `quality`, or at the lowest resolution if `quality` is empty. |
 | `best_available` | boolean | `false` | Fall back to best available. With `all_drm`, a DRM system that does not license is a warning. |
 | `generate_dv` | boolean | `false` | With `HYBRID` in `range`, make Dolby Vision from the HDR10+ metadata or the decoded video when a title has no DV track. With `HDR10` or `HDR10P` in `range` and no `HYBRID`, make it for that base and ignore a DV track. With none of the three in `range`, the field has no effect. |
 | `repack` | boolean | `false` | Add REPACK tag. |
@@ -493,7 +493,7 @@ Make a download job. It requires `service` and `title_id`. Every other field is 
 | `output_dir` | string | `null` | Output directory, relative to the server's downloads directory. The server rejects a path that resolves outside it with `400`. |
 | `no_cache` / `reset_cache` | boolean | `false` | Title cache controls. |
 
-**Validation.** Invalid values return `400 INVALID_PARAMETERS`. `vcodec`, `acodec` and `sub_format` take the same spellings as the CLI options of the same name (`unshackle dl --help` prints each list). The API and the CLI read one list, so they cannot disagree. `range` must be one of SDR/HDR10/HDR10P/DV/HLG/HYBRID, and `HDR10+` is also valid. The bitrate, download worker, and download counts must be positive integers. You may set at most one of the `*_only` flags. You cannot combine `no_subs` with `subs_only`, or `no_audio` with `audio_only`. The language fields (`lang`, `v_lang`, `a_lang`, `s_lang`, `forced_s_lang` and the `require_*` fields) must be arrays of strings: a single string such as `"en"` returns `400`. The server checks every other field with the type of its `dl` option. A `null` or an empty string gets the default from the table.
+**Validation.** Invalid values return `400 INVALID_PARAMETERS`. `vcodec`, `acodec` and `sub_format` take the same spellings as the CLI options of the same name (`unshackle dl --help` prints each list). The API and the CLI read one list, so they cannot disagree. `range` must be one of SDR/HDR10/HDR10P/VIVID/DV/HLG/HYBRID, and `HDR10+` and `HDR Vivid` are also valid. The bitrate, download worker, and download counts must be positive integers. You may set at most one of the `*_only` flags. You cannot combine `no_subs` with `subs_only`, or `no_audio` with `audio_only`. The language fields (`lang`, `v_lang`, `a_lang`, `s_lang`, `forced_s_lang` and the `require_*` fields) must be arrays of strings: a single string such as `"en"` returns `400`. The server checks every other field with the type of its `dl` option. A `null` or an empty string gets the default from the table.
 
 **Service options.** A service's own CLI options travel in the same body. Send them in a nested
 `service_params` object, or as flat top-level keys. When the body has `service_params`, the server

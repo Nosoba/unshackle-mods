@@ -163,7 +163,7 @@ class Title:
                     if base_layer and base_layer != "DV":
                         context["hdr"] += f".{base_layer}"
                 elif (primary_video_track.hdr_format or "").startswith("HDR Vivid"):
-                    context["hdr"] = "HDR"
+                    context["hdr"] = DYNAMIC_RANGE_MAP["HDR Vivid"]
                 else:
                     context["hdr"] = DYNAMIC_RANGE_MAP.get(hdr_format, "")
                     if context["hdr"] == "HDR" and any(v.range == Video.Range.HDR10P for v in self.tracks.videos[:1]):
@@ -200,7 +200,8 @@ class Title:
                 channels_str = f"{len(positions) - heights - lfe}.{lfe}.{heights}"
             else:
                 channels_str = f"{channels:.1f}"
-            builtin = AUDIO_CODEC_MAP.get(codec, codec)
+            profile = getattr(primary_audio_track, "format_profile", None)
+            builtin = AUDIO_CODEC_MAP.get(f"{codec} {profile}") or AUDIO_CODEC_MAP.get(codec, codec)
             audio = rename(builtin)
             spacer = " " if builtin in SPACED_AUDIO_CODECS or audio[-1:].isdigit() else ""
 

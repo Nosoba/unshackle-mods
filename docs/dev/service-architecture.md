@@ -202,7 +202,9 @@ Each subclass adds its own required fields on top of `id_` and `service`:
 
     The tagger also falls back to `Song.data` for fields the constructor did not get, such
     as the composer or a full release date. It reads the top level of that dict and a
-    nested `metadata` sub-dict, with the nested keys winning, so either shape works.
+    nested `metadata` sub-dict, with the nested keys winning, so either shape works. The keys
+    that a remote client gets back are `MUSIC_DATA_KEYS` in `unshackle/core/titles/music.py`,
+    for example `artists` (a list) and `replaygain_track_gain`.
 
     From `get_tracks()`, a music service gives **one `Audio` track for each codec and
     bitrate it offers for a `Song`**. The framework then selects one with its usual audio
@@ -216,13 +218,9 @@ Each subclass adds its own required fields on top of `id_` and `service`:
     `GROUP_AUDIO_DOWNLOADS` flag, `get_music_track_options` and `get_music_collection_label`
     no longer exist, and a music service does not need them.
 
-    !!! warning "Restore the container in `on_track_downloaded`"
-        Every track downloads to a temp file named `Audio_<id>.mp4` whatever it holds, and
-        the final move keeps that suffix. A `Song` skips the muxer, so its download **is**
-        the delivered file, and the tagger picks its metadata format from the suffix.
-        Rename the track path to the true container in `on_track_downloaded`, or a FLAC
-        lands as an untaggable `.mp4`. The event fires twice, once before decryption and
-        once at the end, so wait until `track.drm` is clear before you rename.
+    Core picks the container of a `Song` from the codec in the downloaded file, so a music
+    service does not rename the track path. Read
+    [Music output files](../guide/output-and-naming.md#music-output-files).
 
     The **MUSIC_EXAMPLE** reference service, at `unshackle/services/MUSIC_EXAMPLE/`, shows
     the full music surface.
@@ -279,8 +277,8 @@ do not give a `name`, unshackle derives a human-readable name from the language.
 closed-caption descriptors. The relevant enums:
 
 - **`Video.Codec`**: `AVC` (H.264), `HEVC` (H.265), `VC1`, `VP8`, `VP9`, `AV1`, `LCEVC`.
-- **`Video.Range`**: `SDR`, `HLG`, `HDR10`, `HDR10P` (HDR10+), `DV` (Dolby Vision), and
-  `HYBRID`. `HYBRID` is special: it tells the pipeline to select both an HDR10(+) base and
+- **`Video.Range`**: `SDR`, `HLG`, `HDR10`, `HDR10P` (HDR10+), `VIVID` (HDR Vivid), `DV` (Dolby
+  Vision), and `HYBRID`. `HYBRID` is special: it tells the pipeline to select both an HDR10(+) base and
   a DV track and merge the DV RPU onto the HDR10 track with `dovi_tool` (see
   [Dolby Vision hybrid](#dolby-vision-and-hybrid)).
 
@@ -292,7 +290,7 @@ closed-caption descriptors. The relevant enums:
 
 `Audio` adds `bitrate`, `channels`, `joc` (Joint Object Coding, the Atmos indicator),
 and `descriptive`. `Audio.Codec` covers `AAC`, `AC3` (`DD`), `EC3` (`DD+`), `AC4`,
-`OPUS`, `OGG` (Vorbis), `DTS`, `DTSX`, `DTSHD`, `MPEGH`, `ALAC`, `FLAC`, and `MP3`. The `atmos` property is `True` when
+`OPUS`, `OGG` (Vorbis), `DTS`, `DTSX`, `DTSHD`, `MPEGH`, `AV3A` (Audio Vivid), `ALAC`, `FLAC`, and `MP3`. The `atmos` property is `True` when
 `joc` is set (or when `extra` flags it).
 
 ### `Subtitle`

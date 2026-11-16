@@ -107,7 +107,9 @@ def offline_run(monkeypatch, tmp_path):
     monkeypatch.setattr(dl_module.console, "print", lambda *args, **kwargs: None)
     monkeypatch.setattr(dl_module.providers, "resolve_by_ids", lambda *args, **kwargs: None)
     monkeypatch.setattr(dl_module, "grow_session_pool", lambda *args: None)
-    monkeypatch.setattr(dl_module.MediaInfo, "parse", lambda *args: SimpleNamespace(video_tracks=[], audio_tracks=[]))
+    monkeypatch.setattr(
+        dl_module.MediaInfo, "parse", lambda *args: SimpleNamespace(video_tracks=[], audio_tracks=[], general_tracks=[])
+    )
     monkeypatch.setattr(dl_module.tags, "tag_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(dl_module.tags, "apply_container_metadata", lambda *args, **kwargs: None)
 

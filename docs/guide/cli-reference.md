@@ -79,11 +79,11 @@ unshackle dl [OPTIONS] SERVICE [SERVICE ARGS...]
 | `-ab`, `--abitrate` | highest | Exact audio bitrate in kbps. |
 | `-vb-range`, `--vbitrate-range` | - | Video bitrate range in kbps, e.g. `6000-7000`; picks highest within. Mutually exclusive with `--vbitrate`. |
 | `-ab-range`, `--abitrate-range` | - | Audio bitrate range in kbps, e.g. `128-256`. Mutually exclusive with `--abitrate`. |
-| `-r`, `--range` | `SDR` | Colour range(s): `SDR`, `HLG`, `HDR10`, `HDR10P` (HDR10+), `DV`, `HYBRID`. |
+| `-r`, `--range` | `SDR` | Colour range(s): `SDR`, `HLG`, `HDR10`, `HDR10P` (HDR10+), `VIVID` (HDR Vivid), `DV`, `HYBRID`. |
 | `--generate-dv` | off | With `-r HYBRID`, make Dolby Vision from the HDR10+ metadata or the decoded video when a title has no Dolby Vision track. With `-r HDR10` or `-r HDR10P`, make it for that base and ignore a Dolby Vision track. See [Dolby Vision without a DV track](downloading.md#dolby-vision-without-a-dv-track). |
 | `-c`, `--channels` | - | Audio channels; matches sub-layouts (5.1 ≈ 6.0). |
 | `-naa`, `--noatmos` | off | Exclude Dolby Atmos audio tracks. |
-| `--worst` | off | Pick the lowest bitrate within the requested quality. **Requires `-q`.** |
+| `--worst` | off | Pick the lowest-bitrate video at each requested resolution, or at the lowest resolution if none is set. |
 | `--best-available`, `--warn-only` | off | Warn and continue when a requested resolution, range, video language, or audio language is absent, instead of failing. With `--all-drm`, also when one DRM system does not license. |
 | `-rvb`, `--real-video-bitrate` | off | Probe real media size for true video bitrates, overriding the manifest. |
 | `-rab`, `--real-audio-bitrate` | off | Same for audio (slower). |
@@ -234,7 +234,7 @@ order the service used, then renumbers the episodes into the order you asked for
 | `--slow` | - | Inter-title delay. Bare `--slow` = 60-120s; `--slow 20-40` = custom range (minimum 20s). |
 
 !!! warning "Some flags cannot be combined"
-    `--select-titles` and `--wanted` are mutually exclusive. `--worst` needs `--quality`. `--vbitrate` and `--vbitrate-range` (and the audio equivalents) are mutually exclusive.
+    `--select-titles` and `--wanted` are mutually exclusive. `--vbitrate` and `--vbitrate-range` (and the audio equivalents) are mutually exclusive.
 
 ---
 

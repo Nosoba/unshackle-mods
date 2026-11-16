@@ -73,7 +73,8 @@ filtering. `--skip-dl` runs the license step but skips the actual segment downlo
 ### Resolution
 
 `-q` / `--quality` takes one or more target resolutions (heights) as a comma-separated
-list. Without it, unshackle picks the **best available** resolution.
+list. Without it, unshackle picks the **best available** resolution, or the lowest resolution with
+`--worst`.
 
 ```shell title="Single resolution"
 unshackle dl -q 1080 EXAMPLE 81234567
@@ -98,7 +99,11 @@ By default a missing requested resolution is an error. Two flags change that:
 | Flag | Behaviour |
 | --- | --- |
 | `--best-available` (`--warn-only`) | If the requested resolution(s) are not present, continue with the best that *is* available instead of failing. Also softens missing video and audio languages and hybrid fallbacks, and with `--all-drm` a DRM system that does not license. |
-| `--worst` | Within the specified quality, pick the **lowest** bitrate rendition. **Requires `-q/--quality`.** |
+| `--worst` | Pick the lowest-bitrate video at each requested resolution. With no requested resolution, pick the lowest-bitrate video at the lowest resolution. |
+
+A `quality` in the config counts as a requested resolution. When `--best-available` finds none of the
+requested resolutions, `--worst` also picks from the lowest resolution. In hybrid mode, that is the
+lowest resolution that has an HDR10 or HDR10+ base.
 
 ```shell title="Never fail on a missing resolution"
 unshackle dl -q 2160 --best-available EXAMPLE 0ABC123
@@ -142,6 +147,7 @@ unshackle dl -v hevc,avc EXAMPLE 81234567
 | `HLG` | Hybrid Log-Gamma |
 | `HDR10` | HDR10 |
 | `HDR10P` | HDR10+ (`-r HDR10+` also works) |
+| `VIVID` | HDR Vivid (`-r "HDR Vivid"` also works) |
 | `DV` | Dolby Vision |
 | `HYBRID` | Fetch both an HDR10/HDR10+ base and a DV track, then merge them |
 
@@ -260,7 +266,9 @@ measured for each pixel.
 ## Bitrate selection
 
 By default unshackle keeps the highest-bitrate rendition for each selected
-resolution/codec/range/language combination. You can constrain this.
+resolution/codec/range/language combination. One requested video language is one
+language here, also when it matches more than one regional tag (`en` can match
+`en-AU` and `en-GB`). You can constrain this.
 
 | Flag | Purpose |
 | --- | --- |
@@ -298,6 +306,8 @@ bitrate for the top renditions, overriding the manifest value:
     declared-bitrate renditions of each quality tier, in parallel (video grouped by codec
     and range, audio by codec, channels, language, and descriptive flag). It extends a
     group downward while a lower unprobed rendition could still outrank a probed one.
+    The lowest renditions are often not probed, so `--worst` usually compares their
+    manifest bitrates.
     This keeps probing fast even when a service exposes dozens of renditions. A track
     whose duration unshackle cannot find falls back to `ffprobe`. A probe failure is
     non-fatal: the manifest value stays in place.
@@ -320,6 +330,7 @@ bitrate for the top renditions, overriding the manifest value:
 | `DTSX` | `DTS-X` | DTS:X Profile 2 (DTS-UHD) |
 | `DTSHD` | `DTS-HD` | DTS-HD High Resolution, Master Audio and Express |
 | `MPEGH` | `MPEG-H` | MPEG-H 3D Audio |
+| `AV3A` | `Audio Vivid` | Audio Vivid (AVS3-P3) |
 | `ALAC` | `ALAC` | Apple Lossless |
 | `FLAC` | `FLAC` | FLAC |
 | `MP3` | `MP3` | MPEG-1 Audio Layer III |
@@ -865,8 +876,8 @@ By default, `mkvmerge` muxes the tracks of a movie or an episode into a single M
     window, or the whole file when the track is one file.
 
 !!! note "Music is never muxed"
-    A song skips the muxer. unshackle keeps the container that the service
-    delivered, such as `.flac`, `.m4a`, or `.mp3`, and writes the metadata into that file.
+    A song skips the muxer. unshackle remuxes it into the container of its codec,
+    such as `.flac`, `.m4a`, or `.mp3`, and writes the metadata into that file.
     Read [Music output files](output-and-naming.md#music-output-files).
 
 ### After the download
@@ -874,7 +885,8 @@ By default, `mkvmerge` muxes the tracks of a movie or an episode into a single M
 `--postscript "<command>"` runs your own command once per output file, with unshackle's
 metadata substituted into `{variable}` placeholders. It is repeatable, and it replaces the
 `post_scripts` config for that run. No `success` post-script operates under `--no-mux`, because
-that run writes no muxed output. A `failure` post-script still operates if the download fails.
+that run writes no muxed output; a song is the exception, because `--no-mux` does not apply to it.
+A `failure` post-script still operates if the download fails.
 
 ```shell title="Hand each finished file to an uploader"
 unshackle dl --postscript "python /opt/upload.py {filepath} --service={service}" EXAMPLE 81234567
@@ -1222,7 +1234,7 @@ authoritative list.
 | `--latest-episodes N` | | Only the N newest episodes. |
 | `--video-only` / `--audio-only` / `--subs-only` | `-V` / `-A` / `-S` | Restrict track types. |
 | `--no-video` / `--no-audio` / `--no-subs` / `--no-chapters` / `--no-attachments` | `-nv` / `-na` / `-ns` / `-nc` / `-nt` | Skip track types. |
-| `--worst` | | Lowest bitrate within `-q`. |
+| `--worst` | | Lowest-bitrate video at each requested resolution, or at the lowest resolution if none is set. |
 | `--require-audio` | | Audio languages that must exist. The title fails if one is missing. |
 | `--require-video` | | Video languages that must exist. The title fails if one is missing. |
 | `--best-available` | | Degrade gracefully instead of failing. |

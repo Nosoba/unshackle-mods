@@ -937,7 +937,7 @@ async def download(request: web.Request) -> web.Response:
                 items:
                   type: integer
                 description: >-
-                  Download resolution(s) (default - best available). An API key with a
+                  Download resolution(s) (default - best available; lowest with worst). An API key with a
                   server_cdm_max_height for the service must pass a quality at or under that height.
               vcodec:
                 oneOf:
@@ -952,7 +952,7 @@ async def download(request: web.Request) -> web.Response:
                   - type: array
                     items:
                       type: string
-                description: Audio codec(s) to download (e.g., "AAC" or ["AAC", "EC3"]) - accepts AAC, AC3, DD, EC3, DD+, EAC3, DDP, AC4, AC-4, OPUS, OGG, VORB, VORBIS, DTS, DTSX, DTS-X, DTSHD, DTS-HD, MPEGH, MPEG-H, ALAC, FLAC, MP3 (default - [])
+                description: Audio codec(s) to download (e.g., "AAC" or ["AAC", "EC3"]) - accepts AAC, AC3, DD, EC3, DD+, EAC3, DDP, AC4, AC-4, OPUS, OGG, VORB, VORBIS, DTS, DTSX, DTS-X, DTSHD, DTS-HD, MPEGH, MPEG-H, AV3A, Audio Vivid, ALAC, FLAC, MP3 (default - [])
               vbitrate:
                 type: integer
                 description: Video bitrate in kbps (default - None)
@@ -964,7 +964,7 @@ async def download(request: web.Request) -> web.Response:
                 items:
                   type: string
                 description: >-
-                  Video colour range (SDR, HDR10, HDR10+, HLG, DV, HYBRID) (default - ["SDR"]).
+                  Video colour range (SDR, HDR10, HDR10+, VIVID, HLG, DV, HYBRID) (default - ["SDR"]).
                   An API key with a server_cdm_max_height for the service cannot set HYBRID.
               channels:
                 type: number
@@ -1176,7 +1176,9 @@ async def download(request: web.Request) -> web.Response:
                   three in range, the field has no effect.
               worst:
                 type: boolean
-                description: Select the lowest bitrate track within the specified quality. Requires `quality` (default - false)
+                description: >-
+                  Select the lowest bitrate track within the specified quality, or at the lowest resolution if no
+                  quality is set (default - false)
               repack:
                 type: boolean
                 description: Add REPACK tag to the output filename (default - false)
