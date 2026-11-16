@@ -49,6 +49,7 @@ class InputBridge:
 
     _prompt: Optional[str] = field(default=None, init=False, repr=False)
     _response: Optional[str] = field(default=None, init=False, repr=False)
+    _answered: bool = field(default=False, init=False, repr=False)
     _status: AuthStatus = field(default=AuthStatus.AUTHENTICATING, init=False)
     _cancelled: bool = field(default=False, init=False, repr=False)
     _cdm_call: Optional[dict[str, Any]] = field(default=None, init=False, repr=False)
@@ -175,6 +176,8 @@ class InputBridge:
             if not self._awaiting_answer():
                 return False
             self._response = response
+            if self._cdm_call is None:
+                self._answered = True
         self._picked_up.set()
         self._response_ready.set()
         return True
@@ -202,6 +205,12 @@ class InputBridge:
                 raise RuntimeError("Session was cancelled")
 
     @property
+    def answered(self) -> bool:
+        """Whether the client has answered a user prompt, excluding CDM calls."""
+        with self._lock:
+            return self._answered
+
+    @property
     def status(self) -> AuthStatus:
         with self._lock:
             return self._status
@@ -223,8 +232,15 @@ class StatelessInputBridge(InputBridge):
         # Do not echo the prompt: services may include private account information in it.
         raise APIError(
             APIErrorCode.AUTH_FAILED,
-            "Service requested interactive input, but this request cannot handle interactive prompts.",
+            "Authentication requires interactive input, which stateless list/search requests cannot answer. "
+            "Start a download job or remote session to provide the OTP or other login input.",
+            details={"reason": "interactive_auth_required"},
         )
+
+    def ensure_active(self) -> None:
+        self.ensure_input_supported()
+
+
 NO_USER_MESSAGE = "This login needs the user, and only a download job or a remote session can reach the user"
 
 
@@ -236,4 +252,3 @@ class NoUserBridge(InputBridge):
 
     def ensure_active(self) -> None:
         raise RuntimeError(NO_USER_MESSAGE)
->>>>>>> upstream/dev

@@ -163,7 +163,8 @@ def test_embedded_audio_takes_the_original_label(monkeypatch: pytest.MonkeyPatch
 def test_track_list_shows_a_bracketed_label_as_text(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config, "muxing", {"original_label": "[/]"})
     tree = Tracks([sub("ja", original=True)]).tree()[0]
-    labels = [Text.from_markup(node.label).plain for node in tree.children[0].children]
+    # mods lists each track as gradient Text, which Rich shows as is instead of parsing it as markup
+    labels = [node.label.plain for node in tree.children[0].children if isinstance(node.label, Text)]
     assert labels == ["[VTT] | ja | Japanese [/]"]
 
 
@@ -205,7 +206,8 @@ def test_mkvmerge_gets_the_subtitle_script_and_name(tmp_path: Path, mux_args: Ca
         return before[len(before) - before[::-1].index(flag)]
 
     assert last_option("s.vtt", "--language") == "0:zh-Hant-TW"
-    assert last_option("s.vtt", "--track-name") == "0:Chinese (Traditional)"
+    # mods names an audio or subtitle track at mux time, in its own language
+    assert last_option("s.vtt", "--track-name") == f"0:{Tracks._generate_auto_name(subtitle)}"
     assert last_option("a.mp4", "--language") == "0:zh-TW"
 
 

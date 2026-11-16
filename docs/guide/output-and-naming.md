@@ -15,7 +15,7 @@ When a download finishes, unshackle builds the final path from three pieces:
 - **Output directory**: `directories.downloads` from your config, or whatever you pass to `-o/--output` on the command line for a single run.
 - **Folder template**: an optional per-title subfolder. unshackle **always** puts TV episodes and songs in a folder. Movies only get one if you define a `movies` folder template, or a single-string `folder` template that applies to all title kinds (see [Folder templates](#folder-templates)).
 - **Filename template**: the `output_template` for the title kind (movie, series, or song).
-- **Extension**: chosen by the muxer for a movie or an episode: `.mkv` for video, `.mka` for audio-only, `.mks` for subtitle-only, `.mp4` for [DTS:X Profile 2 and MPEG-H audio](#dtsx-profile-2-and-mpeg-h-output). unshackle does not mux a song. It remuxes a song into the container of its codec, such as `.flac`, `.opus`, or `.m4a`. Read [Music output files](#music-output-files).
+- **Extension**: chosen by the muxer for a movie or an episode: `.mkv` for video, `.mka` for audio-only, `.mks` for subtitle-only, `.mp4` for [DTS:X Profile 2 and MPEG-H audio](#dtsx-profile-2-and-mpeg-h-output) and [3D video](#3d-output). unshackle does not mux a song. It remuxes a song into the container of its codec, such as `.flac`, `.opus`, or `.m4a`. Read [Music output files](#music-output-files).
 
 !!! example "A typical episode path"
     ```text
@@ -110,18 +110,13 @@ Every variable below is valid in both output and folder templates. unshackle tak
 | `title` | Title name (movie/show/song name; `$` is rendered as `S`) | `The Show` |
 | `title_type` | Media kind of the title | `movie`, `series`, `music` |
 | `year` | Release year | `2024` |
-<<<<<<< HEAD
 | `source` | Service tag: its first `ALIASES` entry, else the class name (empty with `--no-source`) | `EXAMPLE` |
-| `quality` | Resolution with scan suffix | `1080p`, `2160p`, `576i` |
-| `resolution` | Resolution number only | `1080` |
-=======
-| `source` | Service tag / class name (empty with `--no-source`) | `EXAMPLE` |
 | `quality` | Standard resolution with scan suffix | `1080p`, `2160p`, `576i` |
 | `resolution` | Standard resolution number only | `1080` |
->>>>>>> upstream/dev
 | `video` | Video codec | `H.264`, `H.265` |
 | `hdr` | Dynamic-range label | `HDR`, `HDR10P`, `DV`, `DV.HDR`, `DV.HDR10P`, `HLG` |
 | `hfr` | High frame rate marker (frame rate > 30) | `HFR` |
+| `3d` | Stereoscopic 3D marker (MV-HEVC video) | `3D` |
 | `edition` | Edition label from the track, if any | `Directors Cut` |
 | `tag` | Release-group tag (from `config.tag` or `--tag`) | `TAG` |
 | `repack` | `REPACK` when the `--repack` flag is used | `REPACK` |
@@ -436,10 +431,27 @@ DTS:X Profile 1 is DTS-HD Master Audio and muxes to MKV as usual.
 
 An MP4 title loses:
 
-- the forced, hearing-impaired and original track flags
+- the default, forced, hearing-impaired and original track flags
 - attachments, such as subtitle fonts
 - SubStation Alpha (`.ass`) subtitles
 - container tags (`mkvpropedit`)
+
+### 3D output
+
+A stereoscopic 3D (MV-HEVC) video track also muxes to MP4 with MP4Box, because Matroska has no
+mapping for its second view and `mkvmerge` drops it. There is no 3D Matroska output. unshackle
+finds a 3D track from the manifest, or from a second video layer in the downloaded file. The MP4
+title loses the same items as above. For a 3D title, unshackle also:
+
+- decrypts the track with mp4decrypt, whatever [`decryption`](../reference/configuration/drm.md#decryption) selects
+- writes QuickTime chapters
+- keeps the whole downloaded segments of a `--sample` run, because the MP4Box cut removes the 3D signalling
+- does not repack the track or rewrite its colour metadata with FFmpeg
+- writes no `--include-sample` sample, because `mkvmerge` cuts only Matroska files
+- never uses the track in a `HYBRID` merge
+
+A Dolby Vision profile 20 track has no HDR10 base layer, so a player without Dolby Vision shows
+wrong colours.
 
 You configure muxing (the combination of video, audio, subtitle, chapter and attachment tracks into a single Matroska file with `mkvmerge`) under the `muxing` config key. unshackle muxes only movies and episodes. Read [Music output files](#music-output-files) for what a music download does instead.
 
@@ -461,8 +473,14 @@ muxing:
 | `merge_video` | bool | `false` | Group video tracks that share the same resolution, range, and codec into one file so only language varies inside it. |
 | `merge_audio` | bool | `true` | Merge audio tracks of the same kind so multiple languages sit in one file. |
 | `default_language` | map | *(unset)* | Preferred language per track type (`video` / `audio` / `subtitle`). A track in the preferred language is flagged as the default track. |
+| `default_subtitle_type` | str or list | *(unset)* | The subtitle types that can take the default flag, in order: `forced`, `normal`, `sdh` (CC counts as SDH). The first subtitle track of the first type that the title has gets the flag. |
 
-When no track has the preferred language, unshackle applies sensible defaults. The video default falls back to the title language, then the original-language track, then the first track. The audio default is the original-language track. The subtitle default is a forced track in the first audio's language.
+When no track has the preferred language, unshackle applies sensible defaults. The video default falls back to the title language, then the original-language track, then the first track. The audio default is the original-language track. The subtitle default is a forced track in the language of the default audio track.
+
+Set `default_subtitle_type` to give the subtitle default to a different type. `default_subtitle_type: normal` with `default_language.subtitle: pl` puts the flag on the full Polish track when the title also has a forced Polish track. Without `default_language.subtitle`, the first track of the type in file order gets the flag, and a forced track counts only in the language of the default audio track. When the title has no track of a listed type, the rules above apply.
+
+!!! tip "Use `normal` for players that read the forced flag"
+    A forced track always carries the Matroska forced flag. A player that reads it, such as mpv or Jellyfin in its Smart mode, shows the forced track when the audio is in your subtitle language and the default track when it is not. `default_subtitle_type: forced` puts the default flag on the forced track, and such a player then shows it in place of the full track.
 
 !!! tip "Hiding `Service kind: original`"
     MediaInfo renders `--original-flag` as a `Service kind: original` line on the original-language
@@ -477,17 +495,18 @@ When no track has the preferred language, unshackle applies sensible defaults. T
 
 A few muxing behaviors are automatic and not configurable:
 
-- `--no-date` is always passed for privacy (no timestamps embedded).
+- The output has no encoding date: mkvmerge gets `--no-date` and MP4Box gets `-for-test`.
 - Descriptive audio gets the visually-impaired flag. SDH subtitles get the hearing-impaired flag. Forced subtitles get the forced flag.
 - unshackle writes the chapters from the title's chapter list (see [Chapters](#chapters-naming) below).
 
-The `--no-mux` flag skips muxing entirely and writes the individual track files, each with a track-type suffix, into the same output/folder structure.
+The `--no-mux` flag skips muxing entirely and writes the individual track files, each with a track-type suffix, into the same output/folder structure. A track that shaka-packager decrypts has its date set to 1970-01-01; other tracks keep the date of the source file.
 
 ## Sample files
 
 [`--sample`](cli-reference.md#output-muxing-files) and `--include-sample` write a sample into a
 `Sample` folder inside the output folder of the title. The sample keeps the filename of the
 title, with a `SAMPLE` tag at the end. The tag uses the separator of the output template.
+`--include-sample` cuts the sample with `mkvmerge`, so a title that muxes to MP4 gets no sample.
 
 ```text title="A movie with --include-sample"
 Some.Movie.2026.1080p.EXAMPLE.WEB-DL.H.264-TAG/

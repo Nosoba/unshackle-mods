@@ -141,6 +141,9 @@ def offline_run(monkeypatch, tmp_path):
         command.service = "FAKE"
         command.completed_files = []
         command.skipped_subtitles = []
+        command.skipped_titles = []
+        command.stop_reason = None
+        command.download_error = None
         command.proxy_providers = []
         command.get_cookie_jar = lambda *args: None
         command.get_credentials = lambda *args: None
@@ -278,7 +281,8 @@ def test_kind_only_skips_clean_staged_subtitles_before_continue_or_exit(offline_
         season_override=7,
         wanted=["1x1"] if single_selected else [],
     )
-    assert result.exit_code == (1 if single_selected else None)
+    # every title skipped is a failed run upstream, whatever the selection size
+    assert result.exit_code == 1
     assert len(result.staged) == (1 if single_selected else 2)
     assert all(not path.exists() for path in result.staged)
     assert source.read_text(encoding="utf8") == content

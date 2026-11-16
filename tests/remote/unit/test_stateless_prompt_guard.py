@@ -7,7 +7,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -16,6 +16,7 @@ import unshackle.core.service as service_module
 from unshackle.core.api import download_worker, handlers
 from unshackle.core.api.errors import APIError, APIErrorCode, build_error_response
 from unshackle.core.api.input_bridge import AuthStatus, InputBridge, StatelessInputBridge
+from unshackle.core.search_result import SearchResult
 from unshackle.core.service import Service
 
 
@@ -46,7 +47,13 @@ class FakeService:
 
     def search(self):
         assert self.authenticated
-        yield SimpleNamespace(**RESULT)
+        yield SearchResult(
+            id_=RESULT["id"],
+            title=RESULT["title"],
+            description=RESULT["description"],
+            label=RESULT["label"],
+            url=RESULT["url"],
+        )
 
     def get_titles(self):
         assert self.authenticated
@@ -144,7 +151,7 @@ def test_no_prompt_paths_succeed_with_per_instance_guards(operation, services, m
 
 @pytest.mark.asyncio
 async def test_stateless_handlers_propagate_auth_failed_and_clean_up(operation, services, monkeypatch):
-    cleanup = Mock()
+    cleanup = AsyncMock()
     monkeypatch.setattr(handlers.RequestCache, "cleanup", cleanup)
     handler = handlers.list_titles_handler if operation == "list" else handlers.search_handler
     with pytest.raises(APIError) as raised:
@@ -152,7 +159,7 @@ async def test_stateless_handlers_propagate_auth_failed_and_clean_up(operation, 
 
     assert raised.value.error_code is APIErrorCode.AUTH_FAILED
     assert json.loads(build_error_response(raised.value).body)["error_code"] == "AUTH_FAILED"
-    cleanup.assert_called_once_with()
+    cleanup.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -221,6 +228,7 @@ def test_download_worker_still_relays_service_input(monkeypatch):
             os.write(write_fd, b'"123456"\n')
 
     previous_handler = console_module._prompt_handler
+    previous_notice = console_module._notice_handler
     try:
         download_worker.relay_prompts(answer_on_prompt)
         service = FakeService()
@@ -230,6 +238,7 @@ def test_download_worker_still_relays_service_input(monkeypatch):
         assert service.request_input(PROMPT) == "123456"
     finally:
         console_module.set_prompt_handler(previous_handler)
+        console_module.set_notice_handler(previous_notice)
         os.close(write_fd)
         os.close(read_fd)
     assert updates == [{"input_prompt": PROMPT}, {"input_prompt": None}]

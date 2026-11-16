@@ -8,11 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-<<<<<<< HEAD
-import sys
-from functools import partial
-=======
->>>>>>> upstream/dev
 import time
 from contextlib import ExitStack, closing
 from itertools import accumulate
@@ -227,7 +222,11 @@ class HLS:
 
         supplemental_codecs = self.supplemental_codecs_by_uri()
 
-        for playlist in self.manifest.playlists:
+        video_layouts = [
+            (raw.get("stream_info") or {}).get("req_video_layout")
+            for raw in (getattr(self.manifest, "data", None) or {}).get("playlists", [])
+        ]
+        for playlist, video_layout in zip(self.manifest.playlists, video_layouts):
             video_codec: Optional[Video.Codec] = None
             primary_track_type: type[Audio] | type[Video]
             try:
@@ -246,21 +245,15 @@ class HLS:
             )
             # DV-composite track: primary codec is plain HEVC but SUPPLEMENTAL-CODECS advertises
             # a DV codec. Range stays whatever VIDEO-RANGE signaled (HDR10/HLG/SDR); DVFixup will
-<<<<<<< HEAD
-            # restore DV signaling post-download. Services that know their encoder embeds HDR10+
-            # SEI must override `range` themselves.
-            dv_compatible_bitstream = primary_track_type is Video and not primary_has_dv and supp_dv_codec is not None
-            
-            track_duration = None
-            if hasattr(playlist, 'media') and hasattr(playlist.media, 'segments') and playlist.media.segments:
-                track_duration = sum(s.duration for s in playlist.media.segments)
-=======
             # restore DV signaling post-download. HDR10+ SEI in an HDR10 track is found later by the
             # core HDR10+ probe.
             dv_compatible_bitstream = primary_track_type is Video and Video.is_dv_composite(
                 video_codec, playlist.stream_info.codecs, supplemental_codecs.get(playlist.uri)
             )
->>>>>>> upstream/dev
+
+            track_duration = None
+            if hasattr(playlist, "media") and hasattr(playlist.media, "segments") and playlist.media.segments:
+                track_duration = sum(s.duration for s in playlist.media.segments)
 
             tracks.add(
                 primary_track_type(
@@ -288,6 +281,9 @@ class HLS:
                                 (playlist.stream_info.closed_captions or "").strip('"'), []
                             ),
                             dv_compatible_bitstream=dv_compatible_bitstream,
+                            stereo=Video.is_stereo(
+                                playlist.stream_info.codecs, supplemental_codecs.get(playlist.uri), video_layout
+                            ),
                         )
                         if primary_track_type is Video
                         else {}

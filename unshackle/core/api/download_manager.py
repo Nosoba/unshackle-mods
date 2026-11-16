@@ -139,6 +139,8 @@ class DownloadJob:
     # Subtitles skipped under skip_subtitle_errors (non-fatal). Each entry is a dl.SkippedSubtitle
     # dict (id / language / title) so a client can report which weren't available.
     skipped_subtitles: List[Dict[str, Any]] = field(default_factory=list)
+    # Titles skipped because a requested track or language is missing; each a dl.SkippedTitle (title / reason).
+    skipped_titles: List[Dict[str, Any]] = field(default_factory=list)
 
     track_tree_text: Optional[str] = None
 
@@ -174,6 +176,7 @@ class DownloadJob:
             "segments_total": self.segments_total,
             "speed": self.speed,
             "skipped_subtitles": self.skipped_subtitles,
+            "skipped_titles": self.skipped_titles,
             "input_prompt": self.input_prompt,
             "track_tree_text": self.track_tree_text,
             "notice": self.notice,
@@ -239,6 +242,7 @@ def record_job_history(job: DownloadJob) -> None:
         "created_time": job.created_time.isoformat(),
         "completed_time": job.completed_time.isoformat() if job.completed_time else None,
         "output_files": job.output_files,
+        "skipped_titles": job.skipped_titles,
         "parameters": redact_parameters(job.parameters),
         "error_message": _redact_text(job.error_message, job.parameters),
     }
@@ -444,29 +448,7 @@ def perform_download(
     ctx.params = {
         **dl_params,
         "cdm_name": params.get("cdm"),
-        "cdm_name": params.get("cdm"),
-        "all_drm": params.get("all_drm", False),
-        "repack": params.get("repack", False),
-        "tag": params.get("tag"),
-        "tmdb_id": params.get("tmdb_id"),
-        "imdb_id": params.get("imdb_id"),
-        "tvdb_id": params.get("tvdb_id"),
-        "tvdb_order": params.get("tvdb_order"),
-        "anilist_id": params.get("anilist_id"),
-        "enrich": params.get("enrich", False),
-        "daily": params.get("daily", False),
-        "output_dir": Path(params["output_dir"]) if params.get("output_dir") else None,
-        "no_cache": params.get("no_cache", False),
-        "reset_cache": params.get("reset_cache", False),
-        "quality": params.get("quality", []),
-        "vcodec": params.get("vcodec", []),
-        "acodec": params.get("acodec") or [],
-        "range_": params.get("range", [Video.Range.SDR]),
-        "best_available": params.get("best_available", False),
-        "lang": params.get("lang", ["best"]),
-        "v_lang": params.get("v_lang", []),
-        "a_lang": params.get("a_lang", []),
-        "forced_subs": params.get("forced_subs", False),
+        # dl skips the local service config and guards the proxy for a remote_services server
         "remote": bool(remote),
         "server": remote,
         "client_argv": f"{relay_label(params)} download job {job_id}",
@@ -544,14 +526,21 @@ def perform_download(
             dl_instance.result(
                 service=service_instance,
                 **{**ctx.params, "select_titles": False, "list_": False, "list_titles": False},
+                # Never accept a client path: dl_sub copies a server file into the output.
+                dl_sub=None,
                 progress_sink=progress_callback,
             )
 
     except SystemExit as exc:
         if exc.code != 0:
+            stdout_str = _redact_text(stdout_capture.getvalue(), params) or ""
+            stderr_str = _redact_text(stderr_capture.getvalue(), params) or ""
             log.error(f"Download exited with code {exc.code}")
-            log.error(f"Stdout: {stdout_str}")
-            log.error(f"Stderr: {stderr_str}")
+            log.error("Stdout: %s", redact_all(stdout_str))
+            log.error("Stderr: %s", redact_all(stderr_str))
+            if reason := getattr(dl_instance, "stop_reason", None):
+                reason_str = _redact_text(str(reason), params)
+                raise APIError(APIErrorCode.DOWNLOAD_ERROR, f"Download failed: {reason_str}")
             msg = f"Download failed with exit code {exc.code}"
             tail = (stderr_str or stdout_str or "").strip()[-800:]
             if tail:
@@ -559,9 +548,11 @@ def perform_download(
             raise APIError(APIErrorCode.DOWNLOAD_ERROR, msg)
 
     except Exception as exc:  # noqa: BLE001 - propagate to caller
-        log.error(f"Download execution failed: {exc}")
-        log.debug("Stdout: %s", stdout_capture.getvalue())
-        log.debug("Stderr: %s", stderr_capture.getvalue())
+        stdout_str = _redact_text(stdout_capture.getvalue(), params) or ""
+        stderr_str = _redact_text(stderr_capture.getvalue(), params) or ""
+        log.error("Download execution failed: %s", redact_all(_redact_text(str(exc), params)))
+        log.error("Stdout: %s", redact_all(stdout_str))
+        log.error("Stderr: %s", redact_all(stderr_str))
         raise
 
     # dl.result() catches a download-worker exception, reports it, but returns normally (exit 0).
@@ -994,11 +985,8 @@ class DownloadQueueManager:
         try:
             while True:
                 done, _ = await asyncio.wait({communicate_task}, timeout=0.5)
-                if communicate_task in done:
-                    stdout_bytes, stderr_bytes = communicate_task.result()
-                    break
 
-                # Check for progress updates (skip re-parse when the file hasn't changed since last tick)
+                # Read progress before the exit check so the worker's last write lands (skip an unchanged file)
                 try:
                     stat = os.stat(progress_path)
                     stat_key = (stat.st_mtime_ns, stat.st_size)
@@ -1042,6 +1030,8 @@ class DownloadQueueManager:
                                 job.skipped_subtitles = progress_data["skipped_subtitles"]
                             if progress_data.get("track_tree_text"):
                                 job.track_tree_text = progress_data["track_tree_text"]
+                            if progress_data.get("skipped_titles"):
+                                job.skipped_titles = progress_data["skipped_titles"]
                             if "progress" in progress_data:
                                 new_progress = float(progress_data["progress"])
                                 if new_progress != job.progress:
@@ -1055,6 +1045,10 @@ class DownloadQueueManager:
                         last_progress_stat = stat_key
                 except (OSError, json.JSONDecodeError, ValueError) as e:
                     log.debug(f"Could not read progress for job {job.job_id}: {e}")
+
+                if communicate_task in done:
+                    stdout_bytes, stderr_bytes = communicate_task.result()
+                    break
 
                 if job.cancel_event.is_set() or job.status == JobStatus.CANCELLED:
                     log.info(f"Cancellation detected for job {job.job_id}, terminating worker process")
@@ -1107,11 +1101,13 @@ class DownloadQueueManager:
                 if result_data:
                     job.error_details = result_data.get("error_details", message)
                     job.error_code = result_data.get("error_code")
-                
+
                 # Expose stderr to the caller if we lack a concrete reason
-                if safe_stderr and (not job.error_details or job.error_details == message or "SystemExit" in message):
+                if safe_stderr and (
+                    not job.error_details or job.error_details == message or "SystemExit" in (message or "")
+                ):
                     job.error_details = safe_stderr[-1000:].strip()
-                    
+
                 raise Exception(f"Worker exited with code {returncode}: {message}")
 
             if not result_data or result_data.get("status") != "success":

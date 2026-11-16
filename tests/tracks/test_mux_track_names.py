@@ -65,6 +65,13 @@ def test_descriptive_audio_flag_appends_to_the_generated_name() -> None:
     assert track.get_track_name() == "English (Descriptive)"
 
 
+def test_a_configured_original_label_replaces_the_translated_suffix(monkeypatch) -> None:
+    monkeypatch.setattr(config, "muxing", {"original_label": "[Original]"})
+    track = _audio("ja", True)
+    track.name = Tracks._generate_auto_name(track)
+    assert track.get_track_name() == "\u65e5\u672c\u8a9e [Original]"
+
+
 class _FakePopen:
     """Stand in for mkvmerge so mux() can be driven without the binary."""
 
@@ -79,6 +86,8 @@ class _FakePopen:
 def _mux_command(monkeypatch, tmp_path, *, original_flag=None) -> list[str]:
     monkeypatch.setattr(binaries, "MKVToolNix", "mkvmerge")
     monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    # mux() asks mkvmerge -J for each video file's track IDs, which the fake cannot answer
+    monkeypatch.setattr("unshackle.core.tracks.tracks.file_track_ids", lambda path: {"video": 0})
 
     muxing = {} if original_flag is None else {"original_flag": original_flag}
     monkeypatch.setattr(config, "muxing", muxing)

@@ -8,22 +8,18 @@ so the request collapsed to nothing and every such API download died with
 by "There's no orig Audio Track, cannot continue". The same download from the
 CLI worked, because the CLI never defaulted to "orig".
 
-The check is static because perform_download() needs a service, credentials and
-a network to call for real.
+The check casts defaults without running perform_download(), which needs a
+service, credentials and a network.
 """
 
 from __future__ import annotations
 
-import ast
-import inspect
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 from unshackle.commands.dl import dl
-from unshackle.core.api import download_manager
-from unshackle.core.api.handlers import DEFAULT_DOWNLOAD_PARAMS
+from unshackle.core.api.handlers import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
 
 pytestmark = pytest.mark.unit
 
@@ -46,23 +42,6 @@ def cli_default(name: str) -> list[Any]:
     raise AssertionError(f"dl has no --{name.replace('_', '-')} option; the API default has nothing to mirror")
 
 
-def call_site_default(name: str) -> Any:
-    """The fallback in download_manager's ``params.get(name, <default>)``."""
-    source = Path(inspect.getfile(download_manager)).read_text("utf8")
-    for node in ast.walk(ast.parse(source)):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "result"):
-            continue
-        for keyword in node.keywords:
-            if keyword.arg != name:
-                continue
-            value = keyword.value
-            assert isinstance(value, ast.Call) and len(value.args) == 2, (
-                f"{name} must be params.get(name, <default>), found {ast.dump(value)}"
-            )
-            return ast.literal_eval(value.args[1])
-    raise AssertionError(f"no dl.result({name}=...) call found in download_manager")
-
-
 @pytest.mark.parametrize("name", MIRRORED)
 def test_api_default_matches_the_cli(name: str) -> None:
     assert DEFAULT_DOWNLOAD_PARAMS[name] == cli_default(name), (
@@ -72,11 +51,9 @@ def test_api_default_matches_the_cli(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", MIRRORED)
-def test_call_site_agrees_with_the_declared_default(name: str) -> None:
-    """The default is written twice; a drift between them is silent."""
-    assert call_site_default(name) == DEFAULT_DOWNLOAD_PARAMS[name], (
-        f"download_manager's {name} fallback and DEFAULT_DOWNLOAD_PARAMS have drifted apart"
-    )
+def test_cast_preserves_the_declared_default(name: str) -> None:
+    """The cast feeds ctx.params, then the dl.result() keyword splat."""
+    assert cast_dl_params(dl.cli, {})[name] == DEFAULT_DOWNLOAD_PARAMS[name]
 
 
 def test_default_lang_needs_no_title_language() -> None:

@@ -27,7 +27,12 @@ CLI_ONLY = {
     "real_video_bitrate",
     "real_audio_bitrate",
     "speed_limit",
+    # dl_sub copies a server path into the output, so the API refuses to take it from a client.
+    "dl_sub",
 }
+
+# The API keeps a_lang empty so a client's lang cascades to audio; see test_api_language_defaults.py.
+API_DEFAULT_OVERRIDES = {"a_lang"}
 
 
 def test_every_dl_option_is_an_api_param_or_cli_only():
@@ -44,10 +49,11 @@ def test_api_defaults_cast_to_the_dl_defaults():
     expected = {
         p.name: p.type_cast_value(ctx, p.get_default(ctx))
         for p in dl.cli.params
-        if p.name not in CLI_ONLY | API_SHAPED_DL_PARAMS
+        if p.name not in CLI_ONLY | API_SHAPED_DL_PARAMS | API_DEFAULT_OVERRIDES
     }
     cast = cast_dl_params(dl.cli, {})
-    assert {k: v for k, v in cast.items() if k not in API_SHAPED_DL_PARAMS} == expected
+    assert {k: v for k, v in cast.items() if k not in API_SHAPED_DL_PARAMS | API_DEFAULT_OVERRIDES} == expected
+    assert cast["a_lang"] == DEFAULT_DOWNLOAD_PARAMS["a_lang"] == []
 
 
 def test_cli_only_options_never_reach_dl():

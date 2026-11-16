@@ -20,6 +20,7 @@ import pytest
 
 from unshackle.commands.dl import dl
 from unshackle.core.api import download_manager
+from unshackle.core.api.handlers import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
 
 pytestmark = pytest.mark.unit
 
@@ -40,13 +41,40 @@ def _result_call() -> ast.Call:
     return calls[0]
 
 
-def _supplied() -> dict[str, ast.expr]:
+def _supplied() -> set[str]:
     call = _result_call()
     assert not call.args, "dl.result() takes keywords only; a positional would silently shift"
-    # A **kwargs splat would hide what is passed from this test, and would also let a
-    # missing argument through to runtime, which is the bug being pinned here.
-    assert all(kw.arg for kw in call.keywords), "no **kwargs splat in the dl.result() call"
-    return {kw.arg: kw.value for kw in call.keywords}
+    splats = [kw.value for kw in call.keywords if kw.arg is None]
+    assert len(splats) == 1 and isinstance(splats[0], ast.Dict)
+    splat = splats[0]
+    assert splat.keys[0] is None and ast.unparse(splat.values[0]) == "ctx.params"
+    assert all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in splat.keys[1:])
+
+    tree = ast.parse(inspect.getsource(download_manager.perform_download))
+    contexts = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and any(ast.unparse(target) == "ctx.params" for target in node.targets)
+    ]
+    assert len(contexts) == 1 and isinstance(contexts[0], ast.Dict)
+    context = contexts[0]
+    assert context.keys[0] is None and ast.unparse(context.values[0]) == "dl_params"
+    assert all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in context.keys[1:])
+    casts = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and any(ast.unparse(target) == "dl_params" for target in node.targets)
+    ]
+    assert len(casts) == 1 and isinstance(casts[0], ast.Call)
+    assert ast.unparse(casts[0]) == "cast_dl_params(dl_command.cli, params)"
+    context_names = {key.value for key in context.keys[1:]}
+    assert context_names <= {p.name for p in dl.cli.params} | {"client_argv"}
+    return (
+        {kw.arg for kw in call.keywords if kw.arg is not None}
+        | {key.value for key in splat.keys[1:]}
+        | set(cast_dl_params(dl.cli, {}))
+        | context_names
+    )
 
 
 def _params() -> tuple[set[str], set[str]]:
@@ -78,10 +106,13 @@ def test_the_four_parameters_that_broke_the_api_are_covered() -> None:
 
 
 def test_no_unknown_keyword_is_passed() -> None:
-    """dl.result() ends in **__, which would swallow a misspelled keyword in silence."""
+    """The splat also carries init/ctx options; explicit result keywords must be known."""
     _, known = _params()
-    unknown = set(_supplied()) - known
-    assert not unknown, f"dl.result() does not accept {sorted(unknown)}; **__ would hide the mistake"
+    explicit = {kw.arg for kw in _result_call().keywords if kw.arg is not None}
+    assert not explicit - known
+    context_names = {p.name for p in dl.cli.params} | set(inspect.signature(dl.__init__).parameters) | {"client_argv"}
+    unknown = _supplied() - known - context_names
+    assert not unknown, f"dl does not accept {sorted(unknown)}; **__ would hide the mistake"
 
 
 def test_dl_sub_is_hardcoded_to_none() -> None:
@@ -91,7 +122,9 @@ def test_dl_sub_is_hardcoded_to_none() -> None:
     request params would give any API client a read primitive for the whole
     filesystem. It must be pinned, not plumbed.
     """
-    value = _supplied()["dl_sub"]
+    value = next(kw.value for kw in _result_call().keywords if kw.arg == "dl_sub")
     assert isinstance(value, ast.Constant) and value.value is None, (
         "dl_sub must be the literal None at the API call site, never taken from params"
     )
+    assert "dl_sub" not in DEFAULT_DOWNLOAD_PARAMS
+    assert "dl_sub" not in cast_dl_params(dl.cli, {"dl_sub": "/etc/passwd"})

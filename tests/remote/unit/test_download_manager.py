@@ -179,12 +179,7 @@ class _CapturedCtx(Exception):
 @pytest.mark.parametrize(
     ("params", "expected"),
     [
-<<<<<<< HEAD
-        # mods: dl's --lang defaults to "best", not upstream's "orig"
-        ({}, (["best"], [], [], [], False)),
-=======
-        ({}, (["orig"], [], [], ["all"], [], False, False)),
->>>>>>> upstream/dev
+        ({}, (["best"], [], [], ["all"], [], False, False)),
         (
             {
                 "lang": ["es-419"],
@@ -229,7 +224,19 @@ def test_perform_download_puts_the_lang_selection_in_the_service_ctx(
     assert selection == expected
 
 
-def test_perform_download_passes_latest_episodes_to_dl_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("params", "expected"),
+    [
+        ({"latest_episodes": 3}, (3, None, None, None)),
+        (
+            {"season_override": "2", "episode_override": 5, "set_year": "2024", "dl_sub": "/etc/passwd"},
+            (None, 2, 5, 2024),
+        ),
+    ],
+)
+def test_perform_download_passes_episode_options_to_dl_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, params: dict, expected: tuple
+) -> None:
     import click
 
     import unshackle.commands.dl as dl_module
@@ -255,9 +262,11 @@ def test_perform_download_passes_latest_episodes_to_dl_result(tmp_path: Path, mo
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: None)
 
     with pytest.raises(_CapturedCtx) as exc:
-        download_manager.perform_download("job-1", "EXAMPLE", "t1", {"latest_episodes": 3})
+        download_manager.perform_download("job-1", "EXAMPLE", "t1", params)
 
-    assert exc.value.args[0]["latest_episodes"] == 3
+    result = exc.value.args[0]
+    assert tuple(result[k] for k in ("latest_episodes", "season_override", "episode_override", "set_year")) == expected
+    assert result["dl_sub"] is None
 
 
 def test_perform_download_gives_dl_the_defaults_for_null_and_empty_values(
@@ -296,7 +305,7 @@ def test_perform_download_gives_dl_the_defaults_for_null_and_empty_values(
 
     assert seen["init"]["output_dir"] is None
     for view in (seen["parent"], seen["result"]):
-        assert view["quality"] == [] and view["vcodec"] == [] and view["acodec"] == [] and view["lang"] == ["orig"]
+        assert view["quality"] == [] and view["vcodec"] == [] and view["acodec"] == [] and view["lang"] == ["best"]
 
 
 def test_perform_download_casts_service_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -340,7 +349,7 @@ def test_worker_relays_a_prompt_and_reads_the_answer(monkeypatch: pytest.MonkeyP
     from types import SimpleNamespace
 
     from unshackle.core.api import download_worker
-    from unshackle.core.console import prompt_user, set_prompt_handler
+    from unshackle.core.console import prompt_user, set_notice_handler, set_prompt_handler
 
     read_fd, write_fd = os.pipe()
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: read_fd))
@@ -357,6 +366,7 @@ def test_worker_relays_a_prompt_and_reads_the_answer(monkeypatch: pytest.MonkeyP
         assert prompt_user("Enter PIN") == "12\n34"
     finally:
         set_prompt_handler(None)
+        set_notice_handler(None)
         os.close(write_fd)
     assert updates == [{"input_prompt": "Enter PIN"}, {"input_prompt": None}]
 
@@ -392,7 +402,7 @@ def test_a_prompt_discards_an_answer_sent_before_it(tmp_path: Path, monkeypatch:
 
     from unshackle.core.api import download_worker
     from unshackle.core.api.errors import APIErrorCode, categorize_exception
-    from unshackle.core.console import prompt_user, set_prompt_handler
+    from unshackle.core.console import prompt_user, set_notice_handler, set_prompt_handler
 
     answers = tmp_path / "stdin"
     answers.write_text('"stale"\n', encoding="utf-8")
@@ -407,6 +417,7 @@ def test_a_prompt_discards_an_answer_sent_before_it(tmp_path: Path, monkeypatch:
             prompt_user("Enter PIN")
     finally:
         set_prompt_handler(None)
+        set_notice_handler(None)
     assert categorize_exception(exc_info.value).error_code is APIErrorCode.AUTH_FAILED
 
 
@@ -419,7 +430,7 @@ def test_concurrent_prompts_go_out_one_at_a_time(monkeypatch: pytest.MonkeyPatch
     from types import SimpleNamespace
 
     from unshackle.core.api import download_worker
-    from unshackle.core.console import prompt_user, set_prompt_handler
+    from unshackle.core.console import prompt_user, set_notice_handler, set_prompt_handler
 
     read_fd, write_fd = os.pipe()
     monkeypatch.setattr(sys, "stdin", SimpleNamespace(fileno=lambda: read_fd))
@@ -442,6 +453,7 @@ def test_concurrent_prompts_go_out_one_at_a_time(monkeypatch: pytest.MonkeyPatch
             asker.join(timeout=5)
     finally:
         set_prompt_handler(None)
+        set_notice_handler(None)
         os.close(write_fd)
     assert sorted(results) == ["1", "2"]
     assert [u["input_prompt"] is None for u in updates] == [False, True, False, True]
@@ -631,3 +643,111 @@ def test_client_job_view_hides_debug_fields_without_debug_api() -> None:
     assert client_job_view(job, off) == {"job_id": "j"}
     assert client_job_view(job, None) == {"job_id": "j"}
     assert client_job_view(job, on) == job
+
+
+FAKE_SKIPPING_WORKER = """
+import sys
+from unshackle.core.api import download_worker
+
+
+def skip_then_stop(*args, progress_callback, **kwargs):
+    progress_callback({
+        "skipped_titles": [{"title": "Show S01E02", "reason": "missing ko"}],
+        "track_tree_text": "Tracks: audio ko",
+    })
+    raise RuntimeError("Download failed: Skipped all 2 titles")
+
+
+download_worker.perform_download = skip_then_stop
+sys.exit(download_worker.main(["worker"] + sys.argv[1:]))
+"""
+
+
+async def test_a_skip_written_just_before_the_worker_exits_reaches_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, manager: DownloadQueueManager
+) -> None:
+    import asyncio
+
+    from unshackle.core.api import download_manager
+
+    worker = tmp_path / "worker.py"
+    worker.write_text(FAKE_SKIPPING_WORKER, encoding="utf-8")
+    spawn = asyncio.create_subprocess_exec
+
+    async def spawn_fake_worker(executable: str, *args: str, **kwargs: Any) -> Any:
+        return await spawn(executable, str(worker), *args[2:], **kwargs)
+
+    monkeypatch.setattr(download_manager.asyncio, "create_subprocess_exec", spawn_fake_worker)
+    job = manager.create_job("EXAMPLE", "t")
+    with pytest.raises(Exception, match="Skipped all 2 titles"):
+        await asyncio.wait_for(manager.run_download_async(job), timeout=20)
+    assert job.skipped_titles == [{"title": "Show S01E02", "reason": "missing ko"}]
+    assert job.to_dict()["skipped_titles"] == job.skipped_titles
+    assert job.track_tree_text == job.to_dict()["track_tree_text"] == "Tracks: audio ko"
+
+
+@pytest.mark.parametrize("failure", ["reason", "stderr", "stdout", "exception"])
+def test_a_stopped_run_names_its_reason_in_the_job_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    import sys
+
+    import click
+
+    import unshackle.commands.dl as dl_module
+    from unshackle.core.api import download_manager, handlers
+    from unshackle.core.api.errors import APIError
+    from unshackle.core.services import Services
+
+    class FakeDl:
+        cli = dl_module.dl.cli
+
+        def __init__(self, ctx: click.Context, **kwargs: object) -> None:
+            self.stop_reason = None
+
+        def result(self, **kwargs: object) -> None:
+            print("stdout: test-private-token")
+            if failure != "stdout":
+                print("stderr: test-private-token", file=sys.stderr)
+            if failure == "reason":
+                self.stop_reason = "Show S01E01: Required audio language(s) not found: ko"
+            if failure == "exception":
+                raise RuntimeError("execution failed")
+            sys.exit(1)
+
+    class FakeService:
+        def __init__(self, ctx: click.Context) -> None:
+            pass
+
+    monkeypatch.setattr(dl_module, "dl", FakeDl)
+    monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
+    monkeypatch.setattr(Services, "load", staticmethod(lambda s: FakeService))
+    monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: None)
+
+    error_type = RuntimeError if failure == "exception" else APIError
+    with pytest.raises(error_type) as exc_info:
+        download_manager.perform_download("job-1", "EXAMPLE1", "t1", {"token": "test-private-token"})
+
+    message = str(exc_info.value)
+    if failure == "reason":
+        assert message == "Download failed: Show S01E01: Required audio language(s) not found: ko"
+    elif failure == "exception":
+        assert message == "execution failed"
+    else:
+        assert message.startswith(f"Download failed with exit code 1: {failure}:")
+    assert "Stdout: stdout:" in caplog.text
+    assert "Stderr:" in caplog.text
+    assert "test-private-token" not in message + caplog.text
+
+
+def test_job_history_keeps_the_skipped_titles(tmp_path: Path, manager: DownloadQueueManager) -> None:
+    import json
+
+    from unshackle.core.api.download_manager import record_job_history
+
+    job = manager.create_job("EXAMPLE", "t")
+    job.status = JobStatus.COMPLETED
+    job.skipped_titles = [{"title": "Show S01E02", "reason": "missing ko"}]
+    record_job_history(job)
+    entry = json.loads((tmp_path / "api_history.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["skipped_titles"] == job.skipped_titles

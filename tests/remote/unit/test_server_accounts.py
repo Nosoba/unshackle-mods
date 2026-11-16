@@ -163,7 +163,7 @@ def _create_with_real_ctx(monkeypatch, data):
 
 
 DL_DEFAULTS = {
-    "lang": ["orig"],
+    "lang": ["best"],
     "v_lang": [],
     "a_lang": [],
     "s_lang": ["all"],
@@ -199,14 +199,8 @@ def test_nested_dl_params_reach_the_parent_ctx(monkeypatch):
 
 def test_absent_dl_params_fall_back_to_the_dl_defaults(monkeypatch):
     svc = _create_with_real_ctx(monkeypatch, {})
-<<<<<<< HEAD
-    selection = {k: svc.parent_params[k] for k in ("lang", "v_lang", "a_lang", "acodec", "forced_subs")}
-    # mods: dl's --lang defaults to "best", not upstream's "orig"
-    assert selection == {"lang": ["best"], "v_lang": [], "a_lang": [], "acodec": [], "forced_subs": False}
-=======
     selection = {k: svc.parent_params[k] for k in (*DL_DEFAULTS,)}
     assert selection == DL_DEFAULTS
->>>>>>> upstream/dev
 
 
 def test_an_empty_lang_list_is_kept(monkeypatch):
@@ -231,14 +225,8 @@ def test_a_service_lang_option_never_gets_the_dl_lang(monkeypatch):
 )
 def test_malformed_dl_params_are_ignored(monkeypatch, dl_params):
     svc = _create_with_real_ctx(monkeypatch, {"dl_params": dl_params})
-<<<<<<< HEAD
-    selection = {k: svc.parent_params[k] for k in ("lang", "v_lang", "a_lang", "acodec", "forced_subs")}
-    # mods: dl's --lang defaults to "best", not upstream's "orig"
-    assert selection == {"lang": ["best"], "v_lang": [], "a_lang": [], "acodec": [], "forced_subs": False}
-=======
     selection = {k: svc.parent_params[k] for k in (*DL_DEFAULTS,)}
     assert selection == DL_DEFAULTS
->>>>>>> upstream/dev
 
 
 def test_profile_reaches_the_parent_ctx_params(monkeypatch):
@@ -247,3 +235,38 @@ def test_profile_reaches_the_parent_ctx_params(monkeypatch):
     monkeypatch.setattr(handlers.Services, "load", staticmethod(lambda s: _lang_option_module()))
     svc, _, _ = handlers.create_service_instance("OTHER", "t", {}, None, [], "work")
     assert svc.parent_params["profile"] == "work"
+
+
+def test_stateless_server_login_rejects_approval_before_polling(monkeypatch):
+    import logging
+    from types import SimpleNamespace
+
+    from unshackle.core import console
+
+    from unshackle.core.api.errors import APIErrorCode
+    from unshackle.core.api.input_bridge import AuthStatus, StatelessInputBridge
+    from unshackle.core.service import Service
+
+    monkeypatch.setattr(console, "_notice_handler", None)
+    bridge = StatelessInputBridge()
+    service = SimpleNamespace(log=logging.getLogger("test-approval"), _input_bridge=bridge)
+    checks = []
+    with pytest.raises(APIError) as exc_info:
+        Service.wait_for_approval(service, "Approve login", lambda: checks.append(True), timeout=0)
+    assert exc_info.value.error_code is APIErrorCode.AUTH_FAILED
+    assert exc_info.value.details == {"reason": "interactive_auth_required"}
+    assert bridge.status is AuthStatus.FAILED
+    assert not bridge.answered and not checks
+
+
+@pytest.mark.parametrize("cdm_call", [None, {"method": "get_license_challenge"}])
+def test_login_bridge_counts_only_user_answers(cdm_call):
+    from unshackle.core.api.input_bridge import AuthStatus, InputBridge
+
+    bridge = InputBridge()
+    assert not bridge.answered
+    assert bridge.submit_response("unused") is False
+    bridge.status = AuthStatus.PENDING_INPUT
+    bridge._cdm_call = cdm_call
+    assert bridge.submit_response("answer") is True
+    assert bridge.answered is (cdm_call is None)
