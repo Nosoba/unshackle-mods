@@ -643,6 +643,10 @@ def download_tracks_in_passes(
 
 
 class dl:
+    # Defaults for the -dls proxy state that result() fills in; callers bypassing it must not crash.
+    dl_sub_proxy: Optional[str] = None
+    dl_sub_proxy_query: Optional[str] = None
+
     @staticmethod
     def truncate_pssh_for_display(pssh_string: str, drm_type: str) -> str:
         """Truncate PSSH string for display when not in debug mode."""
