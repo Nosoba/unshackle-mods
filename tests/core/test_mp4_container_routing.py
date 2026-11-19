@@ -171,7 +171,7 @@ def test_mp4_subtitles_get_the_script_their_region_implies(tmp_path: Path, monke
 
     tracks.mux("Title", delete=False, output_path=tmp_path / "out.muxed.mkv")
     command = captured[0].args
-    assert f"{tmp_path / 's.vtt'}:lang=zh-Hant-TW:tkhd=enable,movie,preview" in command
+    assert f"{tmp_path / 's.vtt'}:lang=zh-Hant-TW:tkhd=enable,movie,preview:ID=-1" in command
     # the name is the mods autonym of the track language, not the English language_name()
     assert any(arg.endswith(f"={Tracks._generate_auto_name(vtt)}") for arg in command)
 
