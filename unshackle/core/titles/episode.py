@@ -93,7 +93,9 @@ class Episode(Title):
 
         if name is not None:
             name = name.strip()
-            if re.match(r"Episode ?#?\d+", name, re.IGNORECASE):
+            # only a name that is nothing but "Episode 4" is redundant; a name that merely
+            # starts with one ("EPISODE4 冬休み…") still carries the episode's title
+            if re.fullmatch(r"Episode ?#?\d+", name, re.IGNORECASE):
                 name = None
             elif name.lower() == title.lower():
                 name = None

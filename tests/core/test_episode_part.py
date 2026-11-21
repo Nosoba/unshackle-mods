@@ -186,3 +186,9 @@ def test_a_part_exclusion_leaves_the_other_parts_alone():
 
 def test_asking_for_a_part_of_an_unsplit_episode_selects_nothing():
     assert make_episode().matches_wanted(SeasonRange().parse_tokens("S01E01.2")) is False
+
+
+def test_a_name_that_merely_starts_with_episode_is_kept():
+    # TELASA titles its 2.5 season "EPISODE4 冬休みin栃木県（1）"; only a bare label is redundant
+    assert make_episode(name="EPISODE4 冬休みin栃木県（1）").name == "EPISODE4 冬休みin栃木県（1）"
+    assert make_episode(name="Episode #4").name is None
