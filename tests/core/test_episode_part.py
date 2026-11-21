@@ -125,20 +125,21 @@ def test_filename_is_unchanged_without_a_part(reset_template):
 
 def test_dotted_template_folds_the_part_after_the_episode(reset_template):
     name = make_episode(part=2).get_filename(StubMediaInfo())
-    assert name == "The.Show.S01E01.Part.2.DummyService-GROUP"
+    assert name == "The.Show.S01E01.2.DummyService-GROUP"
     assert name.endswith("-GROUP")  # group tag stays last
 
 
-def test_spaced_template_uses_spaces(reset_template):
+def test_spaced_template_keeps_the_dotted_part(reset_template):
+    # S01E01 2 would read as a stray number; the part stays dotted like the -w key
     reset_template.output_template = {"series": "{title} {season_episode} {quality?} {source}-{tag}"}
-    assert make_episode(part=2).get_filename(StubMediaInfo()) == "The Show S01E01 Part 2 DummyService-GROUP"
+    assert make_episode(part=2).get_filename(StubMediaInfo()) == "The Show S01E01.2 DummyService-GROUP"
 
 
 def test_template_context_leaves_the_season_token_alone(reset_template):
     ctx = make_episode(part=2).build_template_context(StubMediaInfo())
     assert ctx["season"] == "S01"
-    assert ctx["episode"] == "E01.Part.2"
-    assert ctx["season_episode"] == "S01E01.Part.2"
+    assert ctx["episode"] == "E01.2"
+    assert ctx["season_episode"] == "S01E01.2"
     assert ctx["part"] == 2
 
 

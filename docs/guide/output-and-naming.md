@@ -154,17 +154,17 @@ Every variable below is valid in both output and folder templates. unshackle tak
 A few services split one episode into several separately playable videos. Where a service reports that, unshackle folds the part index into `{episode}` and `{season_episode}`, so the stock `series` template names it with no change to your config.
 
 ```text
-Show.Name.S01E01.Part.2.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
+Show.Name.S01E01.2.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
 ```
 
-The part token sits immediately after the episode token, before the quality tags, and the group tag stays last. Its separator follows your template's own style, the same way daily content does, so a spaced template gives `S01E01 Part 2` instead.
+The part hangs off the episode number with a dot, the same form `-w S01E01.2` selects, so the filename says exactly which key it is. The group tag stays last. A half episode such as Hulu Japan's `第7.5話` is stored as episode 7 part 5 and named the same way.
 
 The part is left out of the folder name, so every part of an episode lands in the same season folder:
 
 ```text
 The.Show.S01.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG/
-  ├─ The.Show.S01E01.Part.1.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
-  ├─ The.Show.S01E01.Part.2.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
+  ├─ The.Show.S01E01.1.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
+  ├─ The.Show.S01E01.2.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
   └─ The.Show.S01E02.1080p.EXAMPLE.WEB-DL.DDP5.1.H.264-TAG.mkv
 ```
 

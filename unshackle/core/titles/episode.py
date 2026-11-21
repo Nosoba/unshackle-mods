@@ -146,11 +146,12 @@ class Episode(Title):
         return "sports" if self.sport and config.output_template.get("sports") else "series"
 
     def part_suffix(self) -> str:
-        """``.Part.2`` / `` Part 2`` in the active template's own separator style."""
-        if self.part is None:
-            return ""
-        sep = config.get_template_separator(self.template_kind())
-        return f"{sep}Part{sep}{self.part}"
+        """``.5`` / ``.2`` after the episode, matching the ``-w`` token for the part.
+
+        The separator stays a dot even in a spaced template: ``S01E07 5`` would read
+        as a stray number, while ``S01E07.5`` is the key the picker and ``-w`` use.
+        """
+        return self.part_label()
 
     def build_template_context(
         self, media_info: MediaInfo, show_service: bool = True, include_part: bool = True

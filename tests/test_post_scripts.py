@@ -283,7 +283,8 @@ def test_part_is_a_plain_number_on_success_and_failure(monkeypatch, separator):
     for context in (success, failure):
         assert context["part"] == "1"
         assert context["episode"] == "5"
-        assert context["season_episode"] == f"S01E05{separator}Part{separator}1"
+        # the part hangs off the episode as the dotted -w key, in every template style
+        assert context["season_episode"] == "S01E05.1"
     assert failure["quality"] == ""
     assert build_context(_episode(None), None, service="SVC")["part"] == ""
 

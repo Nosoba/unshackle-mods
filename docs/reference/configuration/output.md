@@ -48,7 +48,7 @@ folder-kind keys.
     [split episode](../../guide/output-and-naming.md#split-episodes) (`2`) and is empty on
     every other title. unshackle folds it into `{episode}` and `{season_episode}`, so the
     shipped `series` template names split episodes correctly with no edit. Putting
-    `{part?}` next to either of them renders the part twice (`S01E01.Part.2.2`). Use the
+    `{part?}` next to either of them renders the part twice (`S01E01.2.2`). Use the
     standalone variable only in a template that names neither `{episode}` nor
     `{season_episode}`, and note that it is always empty in a folder template, since
     folders do not carry the part.

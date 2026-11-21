@@ -418,7 +418,7 @@ Episode(..., season=1, number=1, part=2, name="The Reckoning")
     `"Episode 1 (Part 2): The Reckoning"` leaves you with no episode name at all. Remove
     the prefix before you pass it, or pass `None`.
 
-Once `part` is set, the filename gains a part token (`S01E01.Part.2`, see
+Once `part` is set, the filename gains a part suffix (`S01E01.2`, see
 [Output & naming](../guide/output-and-naming.md#split-episodes)), `-w S01E01.2` selects a
 single part while a bare `-w S01E01` selects them all, and the `--list-titles` tree labels
 the episode `01.2`. The REST API reports it as an extra `part` field on the serialized
