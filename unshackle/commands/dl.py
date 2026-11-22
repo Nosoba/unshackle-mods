@@ -142,6 +142,7 @@ from unshackle.core.utils import tags
 from unshackle.core.utils.bitrate import apply_real_bitrates
 from unshackle.core.utils.click_types import (
     AUDIO_CODEC_LIST,
+    EPISODE_NUMBER,
     LANGUAGE_RANGE,
     QUALITY_LIST,
     SAMPLE_RANGE,
@@ -1322,9 +1323,9 @@ class dl:
     )
     @click.option(
         "--episode-override",
-        type=int,
+        type=EPISODE_NUMBER,
         default=None,
-        help="Force override the episode number (e.g. use 5 for Episode 5).",
+        help="Force override the episode number (e.g. use 5 for Episode 5, or 7.5 for a part).",
     )
     @click.option(
         "-sy",
@@ -2216,7 +2217,7 @@ class dl:
         latest_episode: bool,
         latest_episodes: Optional[int],
         season_override: Optional[int],
-        episode_override: Optional[int],
+        episode_override: Optional[Union[int, tuple[int, int]]],
         set_year: Optional[int],
         lang: list[str],
         v_lang: Optional[list[str]],
@@ -2851,8 +2852,14 @@ class dl:
                     title.season = season_override
 
                 if episode_override is not None:
-                    self.log.info(f"Overriding Episode: {title.number} -> {episode_override}")
-                    title.number = episode_override
+                    number, part = (
+                        episode_override if isinstance(episode_override, tuple) else (episode_override, None)
+                    )
+                    wanted_label = f"{number}.{part}" if part is not None else str(number)
+                    self.log.info(f"Overriding Episode: {title.number}{title.part_label()} -> {wanted_label}")
+                    title.number = number
+                    if part is not None:
+                        title.part = part
 
             if set_year is not None and isinstance(title, (Episode, Movie)):
                 self.log.info(f"Overriding Year: {title.year} -> {set_year}")

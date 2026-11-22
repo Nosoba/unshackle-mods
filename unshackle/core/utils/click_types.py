@@ -535,6 +535,39 @@ class SampleRange(click.ParamType):
 
 
 SEASON_RANGE = SeasonRange()
+
+
+class EpisodeNumber(click.ParamType):
+    """An episode number, optionally with a part: '7' stays 7, '7.5' becomes (7, 5).
+
+    Episode numbers are ints, so a split episode is carried as a part of its base number and
+    renders as S01E07.5, the same key ``-w`` and the picker use.
+    """
+
+    name = "episode_number"
+
+    def convert(
+        self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
+    ) -> Union[int, tuple[int, int]]:
+        if isinstance(value, bool):
+            self.fail(f"'{value}' is not a valid episode number", param, ctx)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, tuple) and len(value) == 2:
+            return value
+
+        match = re.fullmatch(r"(\d+)(?:\.(\d+))?", str(value).strip())
+        if not match:
+            self.fail(f"'{value}' is not a valid episode number, expected N or N.P such as 7 or 7.5", param, ctx)
+        number, part = int(match.group(1)), match.group(2)
+        if part is None:
+            return number
+        if int(part) <= 0:
+            self.fail(f"'{value}' has part 0, parts start at 1", param, ctx)
+        return number, int(part)
+
+
+EPISODE_NUMBER = EpisodeNumber()
 LANGUAGE_RANGE = LanguageRange()
 QUALITY_LIST = QualityList()
 AUDIO_CODEC_LIST = AudioCodecList(Audio.Codec)

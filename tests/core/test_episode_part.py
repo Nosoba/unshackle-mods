@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import click
 import pytest
 
 from unshackle.core.config import config
 from unshackle.core.titles.episode import Episode, Series
-from unshackle.core.utils.click_types import SeasonRange
+from unshackle.core.utils.click_types import EPISODE_NUMBER, SeasonRange
 
 
 class DummyService:
@@ -187,6 +188,28 @@ def test_a_part_exclusion_leaves_the_other_parts_alone():
 
 def test_asking_for_a_part_of_an_unsplit_episode_selects_nothing():
     assert make_episode().matches_wanted(SeasonRange().parse_tokens("S01E01.2")) is False
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [("7", 7), (5, 5), ("7.5", (7, 5)), ("15.2", (15, 2)), ("150.10", (150, 10))],
+)
+def test_episode_override_accepts_a_part(given, expected):
+    """--episode-override 7.5 renumbers to a split episode, which renders as S01E07.5."""
+    assert EPISODE_NUMBER.convert(given) == expected
+
+
+def test_episode_override_part_lands_on_the_episode():
+    number, part = EPISODE_NUMBER.convert("7.5")
+    ep = make_episode(number=number, part=part)
+    assert str(ep) == "The Show S01E07.5 The Reckoning"
+    assert ep.matches_wanted(SeasonRange().parse_tokens("S01E07.5")) is True
+
+
+@pytest.mark.parametrize("bad", ["7.0", "x", "7.x", ".5", "7."])
+def test_episode_override_rejects_a_bad_number(bad):
+    with pytest.raises(click.BadParameter):
+        EPISODE_NUMBER.convert(bad)
 
 
 def test_a_name_that_merely_starts_with_episode_is_kept():
