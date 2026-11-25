@@ -16,7 +16,8 @@ from unshackle.core.api.download_manager import (
     redact_parameters,
     secret_values,
 )
-from unshackle.core.api.errors import APIError, APIErrorCode
+from unshackle.core.api.errors import APIError
+from unshackle.core.remote_protocol import APIErrorCode
 
 pytestmark = pytest.mark.unit
 
@@ -87,7 +88,7 @@ def test_to_dict_redacts_again_only_when_an_error_field_changes(monkeypatch):
 
     calls = []
     real = download_manager._redact_text
-    monkeypatch.setattr(download_manager, "_redact_text", lambda text, params: calls.append(text) or real(text, params))
+    monkeypatch.setattr(download_manager, "_redact_text", lambda text, *rest: calls.append(text) or real(text, *rest))
     job = DownloadJob(
         job_id="j1",
         status=JobStatus.FAILED,

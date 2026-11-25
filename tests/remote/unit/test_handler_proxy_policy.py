@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from unshackle.core.api import handlers
-from unshackle.core.api.errors import APIError, APIErrorCode
+from unshackle.core.api.errors import APIError
+from unshackle.core.remote_protocol import APIErrorCode
 from unshackle.core.utils import ip_info
 
 pytestmark = pytest.mark.unit
@@ -183,7 +184,6 @@ def test_setup_list_service_threads_request(monkeypatch):
     monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", fake_resolve)
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
-    monkeypatch.setattr(handlers, "build_parent_ctx", lambda *args, **kwargs: None)
     monkeypatch.setattr(handlers.Services, "load", lambda service: None)
     monkeypatch.setattr(handlers, "instantiate_service", lambda *args: FakeService())
     monkeypatch.setattr("unshackle.commands.dl.dl.get_cookie_jar", staticmethod(lambda service, profile: None))
@@ -202,7 +202,6 @@ def test_search_reports_failed_proxy_check_as_invalid_proxy(monkeypatch):
     monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", lambda *args: ("http://127.0.0.1:9", []))
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
-    monkeypatch.setattr(handlers, "build_parent_ctx", lambda *args, **kwargs: None)
     monkeypatch.setattr(handlers.Services, "load", lambda service: None)
     monkeypatch.setattr(handlers, "instantiate_service", failed_check)
     monkeypatch.setattr("unshackle.commands.dl.dl.get_cookie_jar", staticmethod(lambda service, profile: None))

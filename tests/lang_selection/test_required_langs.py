@@ -5,7 +5,7 @@ import inspect
 import pytest
 
 from unshackle.commands.dl import dl
-from unshackle.core.api.handlers import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
+from unshackle.core.dl_options import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
 from unshackle.core.utilities import missing_required_langs
 
 
@@ -137,19 +137,6 @@ def test_require_subs_no_longer_conflicts_with_s_lang():
         )
         is None
     )
-
-
-def test_all_three_require_flags_share_one_gate():
-    import inspect as _inspect
-
-    from unshackle.commands import dl as dl_module
-
-    source = _inspect.getsource(dl_module.dl.result)
-    # the sub gate must not short-circuit the s_lang branch any more
-    assert "downloading all available subtitles" not in source
-    for kind in ("audio", "video", "subtitle"):
-        assert f'"{kind}",' in source
-    assert "missing_required_langs(required, available, title.language, exact=exact_lang)" in source
 
 
 def test_exact_lang_turns_off_the_bare_tag_fallback():

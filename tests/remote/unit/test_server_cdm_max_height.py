@@ -10,16 +10,18 @@ import click
 import pyplayready.system.pssh as pr_pssh_mod
 import pytest
 import pywidevine.pssh as wv_pssh_mod
-from rich.table import Table
 
 import unshackle.core.drm as drm_mod
+from tests.core.key_resolver import key_table, resolver
 from tests.remote.key_source import CAPPED, PR_DEVICE, one_title, remote_keys, remote_session
+from tests.remote.sessions import session_entry
 from unshackle.commands.dl import dl
+from unshackle.core import remote_channel
 from unshackle.core.api import handlers
-from unshackle.core.api.errors import APIError, APIErrorCode
-from unshackle.core.api.session_store import SessionEntry
+from unshackle.core.api.errors import APIError
 from unshackle.core.config import cdm_entry_names_device
 from unshackle.core.drm import Widevine
+from unshackle.core.remote_protocol import APIErrorCode
 from unshackle.core.remote_service import RemoteClient, RemoteService
 from unshackle.core.tracks import Audio, Video
 
@@ -120,13 +122,13 @@ def test_bad_quality_is_invalid_input():
 @pytest.mark.parametrize(
     ("session", "track", "refused"),
     [
-        (SimpleNamespace(server_cdm=True, server_cdm_max_height=1080), video(2160), True),
-        (SimpleNamespace(server_cdm=True, server_cdm_max_height=1080), video(1080), False),
-        (SimpleNamespace(server_cdm=True, server_cdm_max_height=1080), video(None), False),
-        (SimpleNamespace(server_cdm=True, server_cdm_max_height=1080), Audio.__new__(Audio), False),
-        (SimpleNamespace(server_cdm=True, server_cdm_max_height=None), video(2160), False),
-        (SimpleNamespace(server_cdm=False, server_cdm_max_height=1080), video(720), True),
-        (SimpleNamespace(), video(2160), False),  # a session from before the cap existed
+        (session_entry(server_cdm_max_height=1080), video(2160), True),
+        (session_entry(server_cdm_max_height=1080), video(1080), False),
+        (session_entry(server_cdm_max_height=1080), video(None), False),
+        (session_entry(server_cdm_max_height=1080), Audio.__new__(Audio), False),
+        (session_entry(server_cdm_max_height=None), video(2160), False),
+        (session_entry(server_cdm=False, server_cdm_max_height=1080), video(720), True),
+        (session_entry(), video(2160), False),
     ],
 )
 def test_live_licence_refusal(session, track, refused):
@@ -158,13 +160,13 @@ def single(refusal):
 
 def test_a_vault_hit_is_served_above_the_cap(widevine_env, monkeypatch):
     monkeypatch.setattr(handlers, "check_vaults", lambda kids, name, **_: ({"11" * 16: "key"}, {"11" * 16: "sqlite"}))
-    refusal = handlers.live_licence_refusal(SimpleNamespace(server_cdm_max_height=1080), video(2160))
+    refusal = handlers.live_licence_refusal(session_entry(server_cdm_max_height=1080), video(2160))
     assert single(refusal) == {"11" * 16: "key"}
 
 
 def test_a_vault_miss_raises_the_refusal_before_the_device_loads(widevine_env, monkeypatch):
     monkeypatch.setattr(handlers, "check_vaults", lambda kids, name, **_: None)
-    refusal = handlers.live_licence_refusal(SimpleNamespace(server_cdm_max_height=1080), video(2160))
+    refusal = handlers.live_licence_refusal(session_entry(server_cdm_max_height=1080), video(2160))
     with pytest.raises(APIError) as ei:
         single(refusal)
     assert ei.value is refusal
@@ -265,7 +267,7 @@ def test_a_null_service_in_the_cap_map_falls_through_to_the_default(monkeypatch)
 
 def test_an_ultrawide_track_is_measured_as_the_smallest_quality_that_selects_it():
     """-q matches a height or a 16:9 width, so a track passes the cap when either one is inside it."""
-    session = SimpleNamespace(server_cdm=True, server_cdm_max_height=1080)
+    session = session_entry(server_cdm_max_height=1080)
     assert handlers.live_licence_refusal(session, video(1600, 3840)) is not None
     assert handlers.live_licence_refusal(session, video(None, 3840)) is not None
     assert handlers.live_licence_refusal(session, video(1080, 2560)) is None  # -q 1080 selects it
@@ -355,7 +357,7 @@ def playready_env(monkeypatch):
 
 
 def test_playready_raises_the_refusal_before_the_device_loads(playready_env):
-    refusal = handlers.live_licence_refusal(SimpleNamespace(server_cdm_max_height=1080), video(2160))
+    refusal = handlers.live_licence_refusal(session_entry(server_cdm_max_height=1080), video(2160))
     with pytest.raises(APIError) as ei:
         handlers.handle_single_server_cdm(
             SimpleNamespace(), SimpleNamespace(), video(2160), "cHNzaA==", "playready", None, {}, refusal
@@ -390,9 +392,7 @@ def media(kind, tid, drm, **attrs):
 @pytest.fixture
 def licence_env(monkeypatch):
     """A capped remote session and a stand-in server licence that honours the refusal like the real one."""
-    session = SessionEntry(session_id="sess", service_tag="EXAMPLE1", service_instance=SimpleNamespace())
-    session.server_cdm = True
-    session.server_cdm_max_height = 1080
+    session = session_entry(service_tag="EXAMPLE1", server_cdm_max_height=1080)
     calls: list = []
     vault = {}
 
@@ -480,7 +480,7 @@ def test_a_client_device_session_builds_the_service_on_a_stub_of_that_device(mon
 
     monkeypatch.setattr(handlers, "load_service_yaml", lambda tag: {})
     monkeypatch.setattr(handlers, "load_full_cdm", no_server_device)
-    monkeypatch.setattr(handlers, "build_parent_ctx", lambda profile, cdm, *a, **k: built.update(cdm=cdm))
+    monkeypatch.setattr(handlers, "served_context", lambda obj, *a: built.update(cdm=obj.cdm))
     monkeypatch.setattr(handlers.Services, "load", lambda tag: object)
     monkeypatch.setattr(handlers, "instantiate_service", lambda *a, **k: "service")
 
@@ -539,20 +539,17 @@ class _LocalWidevine(Widevine):
         raise self.Used(cdm)
 
 
+def server_stub_resolver(svc, licence, cdm_for=None):
+    """Content-key resolution for a --cdm-only remote run, whose loaded CDM is the server stub."""
+    return resolver(cdm="server stub", licence=licence, cdm_for=cdm_for, tag="EXAMPLE1", source=svc, cdm_only=True)
+
+
 def prepare(svc, licence, drm=None, track=None, cdm_for=None):
-    runner = dl.__new__(dl)
-    runner._remote_service = svc
-    runner.cdm = "server stub"
-    runner.service = "EXAMPLE1"
-    runner.debug_logger = None
-    runner.log = logging.getLogger("test-server-cdm-cap")
-    runner.cdm_for = cdm_for
-    table = Table()
-    table.add_column()
+    keys = server_stub_resolver(svc, licence, cdm_for)
     drm = drm or _LocalWidevine()
     track = track or SimpleNamespace(id="vid", drm=None, get_drm_for_cdm=lambda cdm: None)
     with pytest.raises(_LocalWidevine.Used) as ei:
-        runner.prepare_drm(drm, track, None, lambda **k: None, licence, table=table, cdm_only=True)
+        keys.licence_for(track, None, key_table())(drm)
     return ei.value.args[0]
 
 
@@ -584,31 +581,15 @@ class PlayReady:
         self.content_keys = {}
 
 
-def test_a_mid_download_handover_puts_the_keys_on_the_callers_drm(monkeypatch):
+def test_a_mid_download_handover_puts_the_keys_on_the_callers_drm():
     """The caller decrypts with the DRM object it passed in, so the local licence must fill that one."""
-    monkeypatch.setattr(dl, "LICENSE_KEY_CACHE", {})
     svc = remote_keys(local_cdm="local device")
-    runner = dl.__new__(dl)
-    runner._remote_service = svc
-    runner.cdm = "server stub"
-    runner.service = "EXAMPLE1"
-    runner.debug_logger = None
-    runner.log = logging.getLogger("test-server-cdm-cap")
-    runner.flush_vault_writes = lambda pending: None
-    table = Table()
-    table.add_column()
+    keys = server_stub_resolver(svc, lambda **k: svc.client_licensed.add("vid"))
     server_drm, local_drm = PlayReady(), _KeyedWidevine()
     track = SimpleNamespace(id="vid", drm=[server_drm, local_drm], get_drm_for_cdm=lambda cdm: local_drm)
 
-    runner.prepare_drm(
-        server_drm,
-        track,
-        None,
-        lambda **k: None,
-        lambda **k: svc.client_licensed.add("vid"),
-        table=table,
-        cdm_only=True,
-    )
+    keys.licence_for(track, None, key_table())(server_drm)
+    keys.wait_vault_writes()
 
     assert server_drm.content_keys == {UUID(int=0xCA9): "ab" * 16}
 
@@ -774,26 +755,28 @@ def test_a_client_with_no_device_does_not_decline():
     assert "server_cdm" not in data
 
 
-def created(answer):
+def created(answer, monkeypatch):
     """Run ``authenticate()`` to its end for a device the service's cdm entry loaded."""
     svc, _ = sent_create(None, cdm_entry=True, cdm_map={"EXAMPLE1": "my_device"})
     svc._server_cdm = None
     svc.client = SimpleNamespace(post=lambda path, data: {"session_id": "sess", **answer})
-    svc.close = svc.start_keepalive = lambda: None
+    svc.close = lambda: None
+    channel = SimpleNamespace(keep_alive=lambda: None, drain_logs=lambda: None, in_flight=None)
+    monkeypatch.setattr(remote_channel, "open_channel", lambda service: channel)
     svc.authenticate()
     return svc
 
 
-def test_the_client_says_when_a_cdm_entry_gave_the_licensing_to_its_device(caplog):
+def test_the_client_says_when_a_cdm_entry_gave_the_licensing_to_its_device(caplog, monkeypatch):
     with caplog.at_level(logging.INFO):
-        svc = created({"server_cdm": False})
+        svc = created({"server_cdm": False}, monkeypatch)
     assert svc._server_cdm is False
     assert "cdm config has an entry for EXAMPLE1" in caplog.text
 
 
-def test_the_client_does_not_claim_its_device_when_the_server_keeps_the_server_cdm(caplog):
+def test_the_client_does_not_claim_its_device_when_the_server_keeps_the_server_cdm(caplog, monkeypatch):
     with caplog.at_level(logging.INFO):
-        svc = created({"server_cdm": True, "server_cdm_max_height": 1080})
+        svc = created({"server_cdm": True, "server_cdm_max_height": 1080}, monkeypatch)
     assert svc._server_cdm is True
     assert "your own device is not used" in caplog.text
     assert "cdm config has an entry" not in caplog.text

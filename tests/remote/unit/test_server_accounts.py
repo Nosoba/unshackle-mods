@@ -266,7 +266,7 @@ def test_login_bridge_counts_only_user_answers(cdm_call):
     bridge = InputBridge()
     assert not bridge.answered
     assert bridge.submit_response("unused") is False
-    bridge.status = AuthStatus.PENDING_INPUT
-    bridge._cdm_call = cdm_call
+    bridge.login_status = AuthStatus.PENDING_INPUT
+    bridge._open("prompt", cdm_call)
     assert bridge.submit_response("answer") is True
     assert bridge.answered is (cdm_call is None)

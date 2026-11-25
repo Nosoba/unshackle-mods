@@ -701,7 +701,7 @@ class Track:
         held: list[DRM_T] = list(self.drm or [])
         if not init_data or any(type(d) not in (Widevine, PlayReady) for d in held):
             return
-        for system in (PlayReady, Widevine) if self.prefers_playready(cdm) else (Widevine, PlayReady):
+        for system in self.pssh_order(cdm):
             if any(type(d) is system for d in held):
                 continue
             try:
@@ -722,6 +722,26 @@ class Track:
         if self._drm_preference:
             return DRM_PREFERENCE_TYPES[self._drm_preference] is PlayReady
         return is_playready_cdm(cdm)
+
+    def pssh_order(self, cdm: Optional[object]) -> tuple[Union[type[Widevine], type[PlayReady]], ...]:
+        """Widevine and PlayReady, in the order to look for their PSSH."""
+        return (PlayReady, Widevine) if self.prefers_playready(cdm) else (Widevine, PlayReady)
+
+    def drm_from_pssh(
+        self,
+        cdm: Optional[object],
+        read: Callable[[Union[type[Widevine], type[PlayReady]]], DRM_T],
+        log: logging.Logger,
+    ) -> None:
+        """Set drm to the first DRM that `read` finds a PSSH for, in pssh_order."""
+        systems = self.pssh_order(cdm)
+        for system in systems:
+            try:
+                self.drm = [read(system)]
+                return
+            except system.Exceptions.PSSHNotFound:
+                continue
+        log.debug(f"No {systems[0].__name__} or {systems[1].__name__} PSSH was found for this track, is it DRM free?")
 
     def download(
         self,
@@ -845,41 +865,15 @@ class Track:
                     ):
                         self.add_init_drm(self.get_init_segment(session=session), cdm)
                     elif not self.drm and track_type in ("Video", "Audio"):
-                        if self.prefers_playready(cdm):
-                            try:
-                                self.drm = [PlayReady.from_track(self, session)]
-                            except PlayReady.Exceptions.PSSHNotFound:
-                                try:
-                                    self.drm = [Widevine.from_track(self, session)]
-                                except Widevine.Exceptions.PSSHNotFound:
-                                    log.debug("No PlayReady or Widevine PSSH was found for this track, is it DRM free?")
-                        else:
-                            try:
-                                self.drm = [Widevine.from_track(self, session)]
-                            except Widevine.Exceptions.PSSHNotFound:
-                                try:
-                                    self.drm = [PlayReady.from_track(self, session)]
-                                except PlayReady.Exceptions.PSSHNotFound:
-                                    log.debug("No Widevine or PlayReady PSSH was found for this track, is it DRM free?")
+                        self.drm_from_pssh(cdm, lambda system: system.from_track(self, session), log)
 
                     if self.drm:
                         drm = self.get_drm_for_cdm(cdm)
                         track_kid = None if isinstance(drm, BlowfishStripe) else self.get_key_id(session=session)
-                        if isinstance(drm, Widevine):
+                        if isinstance(drm, (Widevine, PlayReady, ClearKeyCENC)):
                             if not prepare_drm:
-                                raise ValueError("prepare_drm func must be supplied to use Widevine DRM")
-                            progress(downloaded="LICENSING")
-                            prepare_drm(drm, track_kid=track_kid)
-                            progress(downloaded="[yellow]LICENSED")
-                        elif isinstance(drm, PlayReady):
-                            if not prepare_drm:
-                                raise ValueError("prepare_drm func must be supplied to use PlayReady DRM")
-                            progress(downloaded="LICENSING")
-                            prepare_drm(drm, track_kid=track_kid)
-                            progress(downloaded="[yellow]LICENSED")
-                        elif isinstance(drm, ClearKeyCENC):
-                            if not prepare_drm:
-                                raise ValueError("prepare_drm func must be supplied to use ClearKey DRM")
+                                system = type(drm).__name__.removesuffix("CENC")
+                                raise ValueError(f"prepare_drm func must be supplied to use {system} DRM")
                             progress(downloaded="LICENSING")
                             prepare_drm(drm, track_kid=track_kid)
                             progress(downloaded="[yellow]LICENSED")
@@ -923,7 +917,8 @@ class Track:
                             with save_path.open("wb") as joined, media_path.open("rb") as media:
                                 joined.write(sample_range[0])
                                 shutil.copyfileobj(media, joined)
-                            media_path.unlink()
+                            with contextlib.suppress(OSError):
+                                media_path.unlink()
 
                         self.path = save_path
                         events.emit(events.Types.TRACK_DOWNLOADED, track=self)
@@ -1019,59 +1014,10 @@ class Track:
         return target
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialise the track for export/import (identity/URL/descriptor/language).
+        """The track in the export form; see ``wire.track_to_dict``."""
+        from unshackle.core.wire import track_to_dict
 
-        DRM is not serialised here. The export writer attaches the licensed DRM + keys.
-        Subclasses add their own codec/quality fields.
-        """
-        data: dict[str, Any] = {
-            "type": self.__class__.__name__,
-            "id": self.id,
-            "url": self.url,
-            "language": str(self.language),
-            "is_original_lang": self.is_original_lang,
-            "descriptor": self.descriptor.name,
-            "needs_repack": self.needs_repack,
-            "name": self.name,
-            "edition": self.edition,
-            "duration": self.duration,
-            "note": self.note,
-        }
-        return data
-
-    @staticmethod
-    def base_kwargs_from_dict(data: dict[str, Any]) -> dict[str, Any]:
-        """Assemble the shared Track constructor kwargs from a ``to_dict()`` payload.
-
-        DRM is not reconstructed here: ``to_dict`` does not serialise it, and the import
-        flow attaches the licensed DRM + content keys separately.
-        """
-        return {
-            "url": data["url"],
-            "language": data.get("language") or "und",
-            "is_original_lang": data.get("is_original_lang", False),
-            "descriptor": Track.Descriptor[data.get("descriptor", "URL")],
-            "needs_repack": data.get("needs_repack", False),
-            "name": data.get("name"),
-            "edition": data.get("edition") or None,
-            "note": data.get("note"),
-            "id_": data.get("id"),
-            "duration": data.get("duration"),
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Track":
-        """Reconstruct the correct Track subclass from a ``to_dict()`` payload."""
-        from unshackle.core.tracks.audio import Audio
-        from unshackle.core.tracks.subtitle import Subtitle
-        from unshackle.core.tracks.video import Video
-
-        track_type = data.get("type")
-        builders: dict[Optional[str], type[Track]] = {"Video": Video, "Audio": Audio, "Subtitle": Subtitle}
-        builder = builders.get(track_type)
-        if builder is None:
-            raise ValueError(f"Cannot reconstruct unsupported track type: {track_type!r}")
-        return builder.from_dict(data)
+        return track_to_dict(self)
 
     @property
     def mux_language(self) -> Language:

@@ -11,16 +11,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
 from unshackle.core.api.events import bus
-from unshackle.core.api.input_bridge import AUTH_INPUT_TIMEOUT, AuthStatus, InputBridge
+from unshackle.core.api.input_bridge import AUTH_INPUT_TIMEOUT, InputBridge
 from unshackle.core.api.sanitize import sanitize_log
+from unshackle.core.api.session_channel import SessionChannel, drain_message
 from unshackle.core.config import config
-from unshackle.core.tracks import Track
+from unshackle.core.remote_protocol import AuthStatus
+from unshackle.core.tracks import Track, Tracks
 
 log = logging.getLogger("api.session")
 
@@ -48,7 +50,7 @@ class SessionEntry:
     owner_key: Optional[str] = None  # X-Secret-Key that owns this session
     cache_tag: Optional[str] = None
     server_account: Optional[str] = None  # profile name when the server lent its own account
-    server_cdm: Optional[bool] = None  # False: the client's own device licenses this session
+    server_cdm: bool = False  # False: the client's own device licenses this session
     server_cdm_max_height: Optional[int] = None
     server_vault: bool = False  # a session the client's device licenses may still take keys from the server vault
     server_device: bool = False  # its service runs on the server's lent device, so keys come only from a vault
@@ -56,12 +58,29 @@ class SessionEntry:
     user_config: Optional[Dict[str, Any]] = None  # the serve.users entry the session was created with
     input_bridge: Optional[InputBridge] = None
     log_buffer: Optional[Any] = None  # SessionLogBuffer mirroring the service's self.log
-    auth_status: AuthStatus = AuthStatus.AUTHENTICATED
+    channel: SessionChannel = field(default_factory=SessionChannel, repr=False, compare=False)
     auth_error: Optional[str] = None
     client: Dict[str, Any] = field(default_factory=dict)  # version/argv/platform the client reported
     actions: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=500))
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_accessed: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        if self.input_bridge is not None:
+            self.input_bridge.channel = self.channel
+        if self.log_buffer is not None:
+            self.log_buffer.listener = self.channel.log
+
+    @property
+    def auth_status(self) -> AuthStatus:
+        """The login state, which the input bridge holds; a remote session with no bridge has no login to wait on."""
+        return self.input_bridge.login_status if self.input_bridge else AuthStatus.AUTHENTICATED
+
+    def add_tracks(self, title_id: str, tracks: Tracks) -> None:
+        """Register the video, audio and subtitle tracks of a title, so the later routes find each one by its id."""
+        title_tracks: Dict[str, Track] = {str(t.id): t for t in [*tracks.videos, *tracks.audio, *tracks.subtitles]}
+        self.tracks.update(title_tracks)
+        self.tracks_by_title[title_id] = title_tracks
 
     def touch(self) -> None:
         """Update last_accessed timestamp."""
@@ -69,12 +88,18 @@ class SessionEntry:
 
     @property
     def in_use(self) -> bool:
-        """True while a request holds the lock for service work; the store does not expire such a remote session.
+        """True while a request holds the lock for service work, or the client holds its remote session channel open.
 
-        A request can run for longer than the TTL, and expiry would remove the cache directory
-        that the worker thread still writes to.
+        The store does not expire such a remote session. A request can run for longer than the TTL, and expiry
+        would remove the cache directory that the worker thread still writes to.
         """
-        return self.lock.locked()
+        return self.lock.locked() or self.channel.attached
+
+    def end(self) -> None:
+        """Unblock the service threads that wait on the client, and close the remote session channel."""
+        if self.input_bridge:
+            self.input_bridge.cancel()
+        self.channel.end()
 
     def summary(self, include_actions: bool = True) -> Dict[str, Any]:
         """Dashboard view of the session: no service instance, no raw owner key."""
@@ -159,21 +184,35 @@ class SessionStore:
         service_tag: str,
         service_instance: Any,
         session_id: Optional[str] = None,
+        *,
         owner_key: Optional[str] = None,
         creator_ip: Optional[str] = None,
         server_account: Optional[str] = None,
+        cache_tag: Optional[str] = None,
+        user_config: Optional[Dict[str, Any]] = None,
+        server_cdm: bool = False,
+        server_cdm_max_height: Optional[int] = None,
+        server_vault: bool = False,
+        server_device: bool = False,
+        client_auth: bool = False,
+        client: Optional[Dict[str, Any]] = None,
+        input_bridge: Optional[InputBridge] = None,
+        log_buffer: Optional[Any] = None,
     ) -> SessionEntry:
-        """Make a new remote session with an authenticated service instance."""
+        """Make a new remote session, complete with every field the dashboard shows, and announce it."""
         evicted_tag: Optional[str] = None
         async with self._lock:
             max_sessions = self.max_sessions
             if max_sessions is not None and len(self._sessions) >= max_sessions:
                 sessions = self._sessions
-                oldest_id = min(sessions, key=lambda k: (sessions[k].in_use, sessions[k].last_accessed))
-                log.warning(f"Max sessions reached ({max_sessions}), evicting oldest: {oldest_id}")
+                held = Counter(s.owner_key for s in sessions.values())
+                oldest_id = min(
+                    sessions,
+                    key=lambda k: (sessions[k].in_use, -held[sessions[k].owner_key], sessions[k].last_accessed),
+                )
+                log.warning(f"Max sessions reached ({max_sessions}), evicting oldest of the busiest key: {oldest_id}")
                 evicted = self._sessions.pop(oldest_id)
-                if evicted.input_bridge:
-                    evicted.input_bridge.cancel()
+                evicted.end()
                 evicted_tag = evicted.cache_tag
                 _publish("delete", evicted, "evicted")
                 _schedule_pending_reload(evicted.service_tag)
@@ -186,6 +225,16 @@ class SessionStore:
                 owner_key=owner_key,
                 creator_ip=creator_ip,
                 server_account=server_account,
+                cache_tag=cache_tag,
+                user_config=user_config,
+                server_cdm=server_cdm,
+                server_cdm_max_height=server_cdm_max_height,
+                server_vault=server_vault,
+                server_device=server_device,
+                client_auth=client_auth,
+                client=client or {},
+                input_bridge=input_bridge,
+                log_buffer=log_buffer,
             )
             self._sessions[session_id] = entry
             _publish("create", entry)
@@ -201,11 +250,12 @@ class SessionStore:
                 return None
 
             expired = False
-            if not entry.in_use and entry.auth_status not in (AuthStatus.AUTHENTICATING, AuthStatus.PENDING_INPUT):
+            if not entry.in_use and entry.auth_status != AuthStatus.AUTHENTICATING:
                 elapsed = (datetime.now(timezone.utc) - entry.last_accessed).total_seconds()
                 if elapsed > self.ttl:
                     log.info(f"Session {sanitize_log(session_id)} expired (elapsed={elapsed:.0f}s, ttl={self.ttl}s)")
                     _publish("delete", self._sessions.pop(session_id), "expired")
+                    entry.end()
                     _schedule_pending_reload(entry.service_tag)
                     expired = True
             if not expired:
@@ -228,8 +278,7 @@ class SessionStore:
             entry = self._sessions.pop(session_id, None)
             if not entry:
                 return False
-            if entry.input_bridge:
-                entry.input_bridge.cancel()
+            entry.end()
             _publish("delete", entry, "closed")
             log.info(f"Deleted session {sanitize_log(session_id)}")
             _schedule_pending_reload(entry.service_tag)
@@ -245,7 +294,7 @@ class SessionStore:
                 if entry.in_use:
                     continue
                 elapsed = (now - entry.last_accessed).total_seconds()
-                if entry.auth_status in (AuthStatus.AUTHENTICATING, AuthStatus.PENDING_INPUT):
+                if entry.auth_status == AuthStatus.AUTHENTICATING:
                     if elapsed > AUTH_INPUT_TIMEOUT:
                         expired.append(sid)
                 elif elapsed > self.ttl:
@@ -254,8 +303,7 @@ class SessionStore:
             cache_tags: list[Optional[str]] = []
             for sid in expired:
                 entry = self._sessions.pop(sid)
-                if entry.input_bridge:
-                    entry.input_bridge.cancel()
+                entry.end()
                 cache_tags.append(entry.cache_tag)
                 _publish("delete", entry, "expired")
                 ended_tags.add(entry.service_tag)
@@ -289,11 +337,10 @@ class SessionStore:
             self._cleanup_task = None
 
     async def cancel_all_bridges(self) -> None:
-        """Cancel all active input bridges (called on server shutdown)."""
+        """Cancel all active input bridges and close every remote session channel (called on server shutdown)."""
         async with self._lock:
             for entry in self._sessions.values():
-                if entry.input_bridge:
-                    entry.input_bridge.cancel()
+                entry.end()
             count = len(self._sessions)
         if count:
             log.info(f"Cancelled bridges for {count} active session(s)")
@@ -352,11 +399,14 @@ class SessionStore:
         for entry in self._sessions.values():
             if entry.log_buffer is not None:
                 entry.log_buffer.append(logging.WARNING, DRAIN_WARNING)
+            entry.channel.send(drain_message(True))
 
     def stop_drain(self) -> None:
         if self.draining:
             self.draining = False
             log.warning("Drain cancelled: new sessions and jobs are accepted again")
+            for entry in self._sessions.values():
+                entry.channel.send(drain_message(False))
 
     @property
     def session_count(self) -> int:
@@ -369,7 +419,8 @@ session_store: Optional[SessionStore] = None
 
 def refuse_while_draining() -> None:
     """Raise SERVER_DRAINING for a new session or job once the operator has started a drain."""
-    from unshackle.core.api.errors import APIError, APIErrorCode
+    from unshackle.core.api.errors import APIError
+    from unshackle.core.remote_protocol import APIErrorCode
 
     if get_session_store().draining:
         raise APIError(

@@ -14,10 +14,14 @@ import pytest
 from pywidevine import DeviceTypes
 from pywidevine.pssh import PSSH
 
+from tests.remote.sessions import session_entry
 from unshackle.core.api import handlers
 from unshackle.core.api.errors import APIError
-from unshackle.core.api.input_bridge import AuthStatus, InputBridge
+from unshackle.core.api.input_bridge import InputBridge
 from unshackle.core.cdm.client_relay import ClientDeviceCdm, answer_cdm_call
+from unshackle.core.launch import served_context
+from unshackle.core.remote_protocol import APIErrorCode, AuthStatus
+from unshackle.core.utils.click_types import ContextData
 
 pytestmark = pytest.mark.unit
 
@@ -103,7 +107,7 @@ def test_the_client_refuses_a_challenge_for_the_other_drm_system() -> None:
 
 def test_a_cdm_call_after_authentication_leaves_the_status_alone() -> None:
     bridge = InputBridge()
-    bridge.status = AuthStatus.AUTHENTICATED
+    bridge.login_status = AuthStatus.AUTHENTICATED
     result: list[dict] = []
     worker = threading.Thread(target=lambda: result.append(bridge.request_cdm({"op": "challenge"}, timeout=5)))
     worker.start()
@@ -169,8 +173,8 @@ def test_a_relaying_client_gets_a_stand_in_with_its_device_facts(monkeypatch: py
     monkeypatch.setattr(handlers, "load_service_yaml", lambda tag: {"esn": "SERVER"})
     monkeypatch.setattr(
         handlers,
-        "build_parent_ctx",
-        lambda profile, cdm, *a, **k: built.update(cdm=cdm, config=a[3], params=k["extra_params"]),
+        "served_context",
+        lambda obj, params, keys: built.update(cdm=obj.cdm, config=obj.config, params={**params, **keys}),
     )
     monkeypatch.setattr(handlers.Services, "load", lambda tag: Declares)
     monkeypatch.setattr(handlers, "instantiate_service", lambda *a, **k: "service")
@@ -199,16 +203,23 @@ def test_a_relaying_client_gets_a_stand_in_with_its_device_facts(monkeypatch: py
     assert built["params"]["client_identity"] is True
 
 
-def test_an_answered_call_is_no_longer_pending_before_the_service_wakes() -> None:
+def test_an_answered_call_is_no_longer_pending_before_the_service_wakes(monkeypatch: pytest.MonkeyPatch) -> None:
     bridge = InputBridge()
     release = threading.Event()
-    real_wait = bridge._response_ready.wait
+    real_open = bridge._open
 
-    def slow_wait(timeout: float) -> bool:
-        release.wait(5)  # hold the service thread asleep after the answer arrives
-        return real_wait(timeout)
+    def open_slowly(prompt: str, cdm_call: Any = None) -> Any:
+        ask = real_open(prompt, cdm_call)
+        real_wait = ask.answered.wait
 
-    bridge._response_ready.wait = slow_wait  # type: ignore[method-assign]
+        def slow_wait(timeout: float) -> bool:
+            release.wait(5)  # hold the service thread asleep after the answer arrives
+            return real_wait(timeout)
+
+        ask.answered.wait = slow_wait  # type: ignore[method-assign]
+        return ask
+
+    monkeypatch.setattr(bridge, "_open", open_slowly)
     worker = threading.Thread(target=lambda: bridge.request_cdm({"op": "challenge"}, timeout=5))
     worker.start()
     for _ in range(100):
@@ -232,7 +243,7 @@ def test_a_lent_server_device_marks_the_stand_in() -> None:
 
 
 def test_a_lent_device_session_never_licenses_live() -> None:
-    refusal = handlers.live_licence_refusal(SimpleNamespace(server_device=True, server_cdm=False), object())
+    refusal = handlers.live_licence_refusal(session_entry(server_device=True, server_cdm=False), object())
     assert refusal is not None
     assert refusal.details == {"reason": "server_device"}
 
@@ -240,7 +251,7 @@ def test_a_lent_device_session_never_licenses_live() -> None:
 def test_a_vault_only_miss_raises_the_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(handlers, "check_vaults", lambda kids, service, **_: None)
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda *a, **k: None)
-    refusal = handlers.live_licence_refusal(SimpleNamespace(server_device=True), object())
+    refusal = handlers.live_licence_refusal(session_entry(server_device=True), object())
     with pytest.raises(APIError) as caught:
         handlers.handle_single_server_cdm(
             SimpleNamespace(),
@@ -323,7 +334,7 @@ def test_a_lent_device_gives_the_service_the_server_config_back(monkeypatch: pyt
         handlers, "load_service_yaml", lambda tag: {"esn": "SERVER", "esn_map": {7000: "s"}, "other": 1}
     )
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: server_device)
-    monkeypatch.setattr(handlers, "build_parent_ctx", lambda profile, cdm, *a, **k: built.update(cdm=cdm, config=a[3]))
+    monkeypatch.setattr(handlers, "served_context", lambda obj, *a: built.update(cdm=obj.cdm, config=obj.config))
     monkeypatch.setattr(handlers.Services, "load", lambda tag: Declares)
     monkeypatch.setattr(handlers, "instantiate_service", lambda *a, **k: "service")
 
@@ -346,11 +357,11 @@ def test_a_client_map_entry_replaces_the_server_entry_of_the_same_number() -> No
 
 
 def lent_device_session() -> Any:
-    return SimpleNamespace(
+    return session_entry(
+        server_cdm=False,
         server_device=True,
         client_auth=True,
         cache_tag="_sessions/abc/sid/EXAMPLE1",
-        input_bridge=None,
         service_instance=SimpleNamespace(
             session=SimpleNamespace(
                 headers={"Authorization": "Bearer server", "User-Agent": "ua"},
@@ -414,15 +425,15 @@ def test_a_lent_device_without_the_vault_grant_asks_the_server_for_no_key() -> N
         svc.proxy_license(b"challenge", track, "widevine")
 
 
-@pytest.mark.parametrize("extra", [None, {"quality": None}])
-def test_every_service_context_defaults_quality_to_a_list(extra: Any) -> None:
-    parent = handlers.build_parent_ctx(None, None, None, False, [], {}, extra_params=extra)
+@pytest.mark.parametrize("params", [{}, {"quality": None}])
+def test_every_service_context_defaults_quality_to_a_list(params: Any) -> None:
+    parent = served_context(ContextData(config={}, cdm=None, proxy_providers=[]), params, {})
     assert parent.params["quality"] == []
 
 
 def test_a_call_no_client_fetches_fails_fast_and_restores_the_status() -> None:
     bridge = InputBridge()
-    bridge.status = AuthStatus.AUTHENTICATED
+    bridge.login_status = AuthStatus.AUTHENTICATED
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="none is listening"):
         bridge.request_cdm({"op": "challenge"}, timeout=30, pickup=0.2)
@@ -453,3 +464,17 @@ def test_cancel_wakes_a_call_waiting_for_a_client() -> None:
     with pytest.raises(RuntimeError, match="cancelled"):
         bridge.request_cdm({"op": "challenge"}, timeout=30, pickup=20)
     assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize(
+    ("fields", "forbidden"),
+    [({"server_cdm": False}, True), ({"server_cdm": False, "server_vault": True}, False), ({}, False)],
+)
+def test_the_server_licence_route_follows_the_licensing_mode(
+    monkeypatch: pytest.MonkeyPatch, fields: dict, forbidden: bool
+) -> None:
+    """A session that the client's device licenses reaches the server licence route only for the server vault."""
+    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, service: True)
+    with pytest.raises(APIError) as caught:
+        handlers.license_response({"mode": "server_cdm", "track_id": "none"}, session_entry(**fields), "sess", None)
+    assert (caught.value.error_code is APIErrorCode.FORBIDDEN) is forbidden

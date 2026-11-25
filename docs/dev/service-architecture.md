@@ -116,7 +116,7 @@ up the objects your methods rely on:
 | `self.track_request` | A `TrackRequest` describing the requested codecs, ranges, and best-available flag (see below). |
 
 The constructor also resolves proxies: it reads `--proxy` and the `proxy_query` and
-`proxy_provider` context params that `dl` derives from it, consults the per-service
+`proxy_provider` context params that `dl` and `search` derive from it, consults the per-service
 `proxy_map`, and, if `GEOFENCE` is set and you did not give an explicit proxy, does a live
 IP check and auto-fetches a proxy to `GEOFENCE[0]` when it detects a geoblock. A
 `GEOBLOCK` hit with no `GEOFENCE` stops the run with a "not available in your region"
@@ -370,6 +370,13 @@ A typical `get_tracks` therefore looks like fetching the manifest text with
 - **DASH** enumerates tracks from only the *first* content period, but downloads segments
   from *all* content periods matching the representation. The parser reads `SegmentTemplate`,
   `SegmentList`, and `SegmentBase` addressing, and `$Number%0Nd$` padding.
+  When a period's fragment timeline starts again near 0, as in a stitched ad stream that
+  packages each part of the title on its own, the merge moves that period to follow the
+  periods it keeps before it. A timeline that continues is not changed, so the gaps of filtered ad
+  periods stay in it. Audio that runs past a period join is cut where the next period
+  starts. Plain WebVTT periods and HLS subtitles across `EXT-X-DISCONTINUITY` blocks
+  get the same treatment: fVTT through its tfdt, and WebVTT through its cue times, which move to
+  the block's playlist start when that puts more cues inside the block.
 - **HLS** re-fetches the media playlist at download time, recovers `SUPPLEMENTAL-CODECS`
   from raw text (python-m3u8 drops it) to detect Dolby Vision composite streams, and uses
   the media-sequence-number IV for AES-128 keys that have no explicit IV.

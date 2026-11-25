@@ -13,13 +13,7 @@ from aiohttp_swagger3 import SwaggerDocs, SwaggerInfo, SwaggerUiSettings
 
 from unshackle.core import __code_hash__, __version__
 from unshackle.core import services as services_module
-from unshackle.core.api.errors import (
-    APIError,
-    APIErrorCode,
-    build_error_response,
-    categorize_exception,
-    handle_api_exception,
-)
+from unshackle.core.api.errors import APIError, build_error_response, categorize_exception, handle_api_exception
 from unshackle.core.api.handlers import (
     CORS_HEADERS,
     DASHBOARD_EVENTS_ROUTE,
@@ -46,7 +40,6 @@ from unshackle.core.api.handlers import (
     download_history_handler,
     download_job_events_handler,
     download_job_input_handler,
-    enum_name,
     env_check_handler,
     get_allowed_services,
     get_download_job_handler,
@@ -66,6 +59,7 @@ from unshackle.core.api.handlers import (
     server_accounts_allowed,
     server_config_handler,
     session_bad_key_handler,
+    session_channel_handler,
     session_create_handler,
     session_delete_handler,
     session_info_handler,
@@ -82,13 +76,33 @@ from unshackle.core.api.handlers import (
     tunnel_handler,
 )
 from unshackle.core.api.sanitize import sanitize_log
+from unshackle.core.api.session_channel import close_channels
 from unshackle.core.drm import cbcs
+from unshackle.core.remote_protocol import (
+    BAD_KEY_ROUTE,
+    CHANNEL_ROUTE,
+    HEALTH_ROUTE,
+    LICENSE_ROUTE,
+    LOGS_ROUTE,
+    PROMPT_ROUTE,
+    SAMPLES_ROUTE,
+    SEARCH_ROUTE,
+    SEGMENT_FILTER_ROUTE,
+    SEGMENTS_ROUTE,
+    SERVICES_ROUTE,
+    SESSION_CREATE_ROUTE,
+    SESSION_ROUTE,
+    TITLES_ROUTE,
+    TRACKS_ROUTE,
+    APIErrorCode,
+)
 from unshackle.core.services import Services
 from unshackle.core.tunnel import CHECK_ROUTE as TUNNEL_CHECK_ROUTE
 from unshackle.core.tunnel import ROUTE as TUNNEL_ROUTE
 from unshackle.core.tunnel import close_tunnels
 from unshackle.core.update_checker import UpdateChecker
 from unshackle.core.utils.redact import redact_path
+from unshackle.core.wire import enum_name
 
 
 @web.middleware
@@ -145,12 +159,42 @@ def api_handler(handler: Handler) -> Handler:
     return wrapper
 
 
-async def json_body(request: web.Request) -> Any:
-    """The request's JSON body; raises INVALID_INPUT when it does not parse."""
+def categorized(handler: Handler) -> Handler:
+    """Answer an exception that is not an APIError as its category, with the route name as the operation."""
+    operation = handler.__name__
+    label = f"Error in {operation.replace('_', ' ')}"
+
+    @functools.wraps(handler)
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        try:
+            return await handler(request)
+        except APIError:
+            raise
+        except Exception as e:
+            log.exception(label)
+            return handle_api_exception(
+                e, context={"operation": operation}, debug_mode=request.app.get("debug_api", False)
+            )
+
+    return wrapper
+
+
+MAX_LOGIN_BODY_BYTES = 8 * 1024 * 1024
+
+
+async def json_body(request: web.Request, max_size: Optional[int] = None) -> Any:
+    """The request's JSON object; raises INVALID_INPUT when it does not parse or is not an object.
+
+    ``max_size`` replaces the body limit of the application for this read.
+    """
     try:
-        return await request.json()
+        data = await (request.clone(client_max_size=max_size) if max_size else request).json()
     except Exception as e:
         raise APIError(APIErrorCode.INVALID_INPUT, "Invalid JSON request body", details={"error": str(e)}) from e
+    if not isinstance(data, dict):
+        raise APIError(APIErrorCode.INVALID_INPUT, "The request body must be a JSON object")
+    request["json_body"] = data
+    return data
 
 
 HEARTBEAT_INTERVAL = 30.0
@@ -554,6 +598,7 @@ async def services(request: web.Request) -> web.Response:
 
 
 @api_handler
+@categorized
 async def search(request: web.Request) -> web.Response:
     """
     Find titles from a service.
@@ -650,14 +695,8 @@ async def search(request: web.Request) -> web.Response:
       '400':
         description: Invalid request
     """
-    data = await json_body(request)
-
-    try:
-        return await search_handler(data, request)
-    except Exception as e:
-        log.exception("Error in search")
-        debug_mode = request.app.get("debug_api", False)
-        return handle_api_exception(e, context={"operation": "search"}, debug_mode=debug_mode)
+    data = await json_body(request, MAX_LOGIN_BODY_BYTES)
+    return await search_handler(data, request)
 
 
 @api_handler
@@ -959,6 +998,16 @@ async def download(request: web.Request) -> web.Response:
               abitrate:
                 type: integer
                 description: Audio bitrate in kbps (default - None)
+              vbitrate_range:
+                type: string
+                description: >-
+                  Video bitrate range in kbps as "MIN-MAX" (e.g., "6000-7000"). Selects the highest bitrate in the
+                  range. Cannot be used with vbitrate (default - None)
+              abitrate_range:
+                type: string
+                description: >-
+                  Audio bitrate range in kbps as "MIN-MAX" (e.g., "128-256"). Selects the highest bitrate in the
+                  range. Cannot be used with abitrate (default - None)
               range:
                 type: array
                 items:
@@ -984,6 +1033,17 @@ async def download(request: web.Request) -> web.Response:
                 type: integer
                 minimum: 1
                 description: Download only the N most recent episodes; overrides latest_episode (default - null)
+              season_override:
+                type: integer
+                description: Force override the season number (default - null)
+              episode_override:
+                oneOf:
+                  - type: integer
+                  - type: string
+                description: Force override the episode number; a decimal part such as "7.5" lands on S01E07.5 (default - null)
+              set_year:
+                type: integer
+                description: Force override the year of the title (default - null)
               lang:
                 type: array
                 items:
@@ -1898,6 +1958,7 @@ async def env_check(request: web.Request) -> web.Response:
 
 
 @api_handler
+@categorized
 async def session_create(request: web.Request) -> web.Response:
     """
     Make a remote session.
@@ -2069,14 +2130,8 @@ async def session_create(request: web.Request) -> web.Response:
       '401':
         description: Authentication failed
     """
-    data = await json_body(request)
-    try:
-        return await session_create_handler(data, request)
-    except Exception as e:
-        log.exception("Error in session create")
-        return handle_api_exception(
-            e, context={"operation": "session_create"}, debug_mode=request.app.get("debug_api", False)
-        )
+    data = await json_body(request, MAX_LOGIN_BODY_BYTES)
+    return await session_create_handler(data, request)
 
 
 @api_handler
@@ -2136,6 +2191,7 @@ async def tunnel_check(request: web.Request) -> web.Response:
 
 @api_handler
 @heartbeat
+@categorized
 async def session_titles(request: web.Request) -> web.Response:
     """
     Get titles for an authenticated remote session.
@@ -2158,17 +2214,12 @@ async def session_titles(request: web.Request) -> web.Response:
         description: Remote session not found
     """
     session_id = request.match_info["session_id"]
-    try:
-        return await session_titles_handler(session_id, request)
-    except Exception as e:
-        log.exception("Error in session titles")
-        return handle_api_exception(
-            e, context={"operation": "session_titles"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_titles_handler(session_id, request)
 
 
 @api_handler
 @heartbeat
+@categorized
 async def session_tracks(request: web.Request) -> web.Response:
     """
     Get tracks and chapters for a specific title.
@@ -2204,16 +2255,11 @@ async def session_tracks(request: web.Request) -> web.Response:
     """
     session_id = request.match_info["session_id"]
     data = await json_body(request)
-    try:
-        return await session_tracks_handler(data, session_id, request)
-    except Exception as e:
-        log.exception("Error in session tracks")
-        return handle_api_exception(
-            e, context={"operation": "session_tracks"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_tracks_handler(data, session_id, request)
 
 
 @api_handler
+@categorized
 async def session_segments(request: web.Request) -> web.Response:
     """
     Get segment URLs for selected tracks.
@@ -2248,16 +2294,11 @@ async def session_segments(request: web.Request) -> web.Response:
     """
     session_id = request.match_info["session_id"]
     data = await json_body(request)
-    try:
-        return await session_segments_handler(data, session_id, request)
-    except Exception as e:
-        log.exception("Error in session segments")
-        return handle_api_exception(
-            e, context={"operation": "session_segments"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_segments_handler(data, session_id, request)
 
 
 @api_handler
+@categorized
 async def session_segment_filter(request: web.Request) -> web.Response:
     """
     Get the unwanted HLS segments for one track.
@@ -2293,13 +2334,7 @@ async def session_segment_filter(request: web.Request) -> web.Response:
     """
     session_id = request.match_info["session_id"]
     data = await json_body(request)
-    try:
-        return await session_segment_filter_handler(data, session_id, request)
-    except Exception as e:
-        log.exception("Error in session segment filter")
-        return handle_api_exception(
-            e, context={"operation": "session_segment_filter"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_segment_filter_handler(data, session_id, request)
 
 
 @api_handler
@@ -2352,6 +2387,7 @@ async def session_samples(request: web.Request) -> web.Response:
 
 @api_handler
 @heartbeat
+@categorized
 async def session_license(request: web.Request) -> web.Response:
     """
     Proxy DRM license through authenticated service.
@@ -2409,16 +2445,7 @@ async def session_license(request: web.Request) -> web.Response:
     """
     session_id = request.match_info["session_id"]
     data = await json_body(request)
-    try:
-        return await session_license_handler(data, session_id, request)
-    except Exception as e:
-        if isinstance(e, APIError) and e.error_code is APIErrorCode.SERVER_CDM_CAPPED:
-            log.info(f"Session licence refused: {e.message}")
-        else:
-            log.exception("Error in session license")
-        return handle_api_exception(
-            e, context={"operation": "session_license"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_license_handler(data, session_id, request)
 
 
 @api_handler
@@ -2514,6 +2541,44 @@ async def session_delete(request: web.Request) -> web.Response:
 
 
 @api_handler
+async def session_channel(request: web.Request) -> web.StreamResponse:
+    """
+    Open the remote session channel.
+    ---
+    summary: Open session channel
+    description: >-
+      A WebSocket that a --remote client holds open for its remote session. The server sends each message it
+      starts as a JSON text frame with a type field - prompt and cdm_call (each with an id), log, status, and drain
+      (with draining true or false).
+      The client answers a prompt or a CDM call with {"type": "answer", "id": <id>, "response": <text>}.
+      On attach the server first sends the log records after since, the drain state, the waiting prompts and
+      CDM calls, then the login state. The remote session does not expire while the channel is open. When the
+      server removes the remote session, it closes the channel with code 4404.
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: since
+        in: query
+        required: false
+        description: Send the log records after this sequence number first (default - 0)
+        schema:
+          type: integer
+    responses:
+      '101':
+        description: WebSocket open
+      '403':
+        description: The remote session belongs to another API key
+      '404':
+        description: Remote session not found
+    """
+    return await session_channel_handler(request.match_info["session_id"], request)
+
+
+@api_handler
+@categorized
 async def session_prompt_get(request: web.Request) -> web.Response:
     """
     Poll for pending interactive prompts during authentication.
@@ -2555,16 +2620,11 @@ async def session_prompt_get(request: web.Request) -> web.Response:
         description: Remote session not found
     """
     session_id = request.match_info["session_id"]
-    try:
-        return await session_prompt_get_handler(session_id, request)
-    except Exception as e:
-        log.exception("Error in session prompt get")
-        return handle_api_exception(
-            e, context={"operation": "session_prompt_get"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_prompt_get_handler(session_id, request)
 
 
 @api_handler
+@categorized
 async def session_logs(request: web.Request) -> web.Response:
     """
     Drain the remote session's service log records.
@@ -2615,16 +2675,11 @@ async def session_logs(request: web.Request) -> web.Response:
         since = int(request.query.get("since", 0))
     except ValueError:
         since = 0
-    try:
-        return await session_logs_handler(session_id, since, request)
-    except Exception as e:
-        log.exception("Error in session logs")
-        return handle_api_exception(
-            e, context={"operation": "session_logs"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_logs_handler(session_id, since, request)
 
 
 @api_handler
+@categorized
 async def session_prompt_submit(request: web.Request) -> web.Response:
     """
     Submit a response to a pending interactive prompt.
@@ -2667,13 +2722,7 @@ async def session_prompt_submit(request: web.Request) -> web.Response:
     """
     session_id = request.match_info["session_id"]
     data = await json_body(request)
-    try:
-        return await session_prompt_post_handler(data, session_id, request)
-    except Exception as e:
-        log.exception("Error in session prompt submit")
-        return handle_api_exception(
-            e, context={"operation": "session_prompt_submit"}, debug_mode=request.app.get("debug_api", False)
-        )
+    return await session_prompt_post_handler(data, session_id, request)
 
 
 @api_handler
@@ -3389,9 +3438,9 @@ async def remote_login_input(request: web.Request) -> web.Response:
 # --remote-only server mode; full mode registers every route. setup_routes registers the
 # routes and their docs from this table, so the live routes and the docs cannot drift.
 ROUTES: list[tuple[str, str, Handler, bool]] = [
-    ("GET", "/api/health", health, True),
-    ("GET", "/api/services", services, True),
-    ("POST", "/api/search", search, True),
+    ("GET", HEALTH_ROUTE, health, True),
+    ("GET", SERVICES_ROUTE, services, True),
+    ("POST", SEARCH_ROUTE, search, True),
     ("POST", "/api/list-titles", list_titles, False),
     ("POST", "/api/list-tracks", list_tracks, False),
     ("POST", "/api/download", download, False),
@@ -3413,21 +3462,22 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("GET", "/api/env/check", env_check, False),
     ("GET", "/api/remote/logins", remote_logins, False),
     ("POST", "/api/remote/logins/{login_id}/input", remote_login_input, False),
-    ("POST", "/api/session/create", session_create, True),
+    ("POST", SESSION_CREATE_ROUTE, session_create, True),
     ("GET", TUNNEL_ROUTE, tunnel, True),
     ("GET", TUNNEL_CHECK_ROUTE, tunnel_check, True),
-    ("GET", "/api/session/{session_id}/titles", session_titles, True),
-    ("POST", "/api/session/{session_id}/tracks", session_tracks, True),
-    ("POST", "/api/session/{session_id}/segments", session_segments, True),
-    ("POST", "/api/session/{session_id}/segment_filter", session_segment_filter, True),
-    ("POST", "/api/session/{session_id}/samples", session_samples, True),
-    ("POST", "/api/session/{session_id}/license", session_license, True),
-    ("POST", "/api/session/{session_id}/keys/bad", session_bad_key, True),
-    ("GET", "/api/session/{session_id}/logs", session_logs, True),
-    ("GET", "/api/session/{session_id}/prompt", session_prompt_get, True),
-    ("POST", "/api/session/{session_id}/prompt", session_prompt_submit, True),
-    ("GET", "/api/session/{session_id}", session_info, True),
-    ("DELETE", "/api/session/{session_id}", session_delete, True),
+    ("GET", TITLES_ROUTE, session_titles, True),
+    ("POST", TRACKS_ROUTE, session_tracks, True),
+    ("POST", SEGMENTS_ROUTE, session_segments, True),
+    ("POST", SEGMENT_FILTER_ROUTE, session_segment_filter, True),
+    ("POST", SAMPLES_ROUTE, session_samples, True),
+    ("POST", LICENSE_ROUTE, session_license, True),
+    ("POST", BAD_KEY_ROUTE, session_bad_key, True),
+    ("GET", LOGS_ROUTE, session_logs, True),
+    ("GET", PROMPT_ROUTE, session_prompt_get, True),
+    ("POST", PROMPT_ROUTE, session_prompt_submit, True),
+    ("GET", CHANNEL_ROUTE, session_channel, True),
+    ("GET", SESSION_ROUTE, session_info, True),
+    ("DELETE", SESSION_ROUTE, session_delete, True),
 ]
 
 DASHBOARD_ROUTES: list[tuple[str, str, Handler, bool]] = [
@@ -3463,13 +3513,14 @@ def setup_routes(
         "POST": router.add_post,
         "DELETE": router.add_delete,
     }
-    api_routes = [r for r in ROUTES if r[1] == "/api/health"] if cdm_only else ROUTES
+    api_routes = [r for r in ROUTES if r[1] == HEALTH_ROUTE] if cdm_only else ROUTES
     for method, path, handler, remote in api_routes + (DASHBOARD_ROUTES if dashboard else []):
         if remote_only and not remote:
             continue
         add[method](path, handler)
     app.on_response_prepare.append(generic_server_header)
     app.on_shutdown.append(close_tunnels)
+    app.on_shutdown.append(close_channels)
 
 
 async def generic_server_header(request: web.Request, response: web.StreamResponse) -> None:

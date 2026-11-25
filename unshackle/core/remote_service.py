@@ -11,7 +11,6 @@ import atexit
 import base64
 import contextlib
 import hashlib
-import json
 import logging
 import math
 import random
@@ -19,40 +18,77 @@ import re
 import shlex
 import sys
 import time
-from collections import deque
-from datetime import date as date_
-from enum import Enum
 from http.cookiejar import CookieJar
-from pathlib import Path
-from threading import Event, Lock, Thread, local
-from typing import Any, Callable, Dict, Iterable, Iterator, Optional, Protocol, TypeVar, Union
+from threading import Lock, local
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    Protocol,
+    TypeVar,
+    Union,
+    cast,
+)
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID
 
 import click
 import requests
 import urllib3
-from langcodes import Language
 from requests.adapters import HTTPAdapter, Retry
 from rich.padding import Padding
 from rich.rule import Rule
 from rich.spinner import Spinner
 
 from unshackle.core.config import config
-from unshackle.core.console import SyncLive, console, prompt_user, show_notice
+from unshackle.core.console import SyncLive, console
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
-from unshackle.core.drm import BlowfishStripe, cbcs, real_kids
+from unshackle.core.dl_options import remote_dl_params
+from unshackle.core.drm import cbcs, real_kids
+from unshackle.core.launch import launch_keys
 from unshackle.core.manifests.snapshot import match_track, restore
 from unshackle.core.proxies.resolve import is_loopback
+from unshackle.core.remote_protocol import (
+    BAD_KEY_ROUTE,
+    HEALTH_ROUTE,
+    LICENSE_ROUTE,
+    SAMPLES_ROUTE,
+    SEARCH_ROUTE,
+    SEGMENT_FILTER_ROUTE,
+    SERVICES_ROUTE,
+    SESSION_CREATE_ROUTE,
+    SESSION_ROUTE,
+    TITLES_ROUTE,
+    TRACKS_ROUTE,
+    APIErrorCode,
+    AuthStatus,
+    BadKeyReport,
+    ClientErrorKind,
+    ClientLogin,
+    LicenseReply,
+    LicenseRequest,
+    SegmentFilterReply,
+    SegmentFilterRequest,
+    SessionClosed,
+    SessionCreate,
+    SessionCreated,
+    TitlesReply,
+    TracksReply,
+    TracksRequest,
+)
 from unshackle.core.search_result import SearchResult
 from unshackle.core.session import MAX_BACKOFF
 from unshackle.core.titles import Title_T, Titles_T, remap_titles
 from unshackle.core.titles.episode import Episode, Series
-from unshackle.core.titles.movie import Movie, Movies
-from unshackle.core.titles.music import MUSIC_DATA_KEYS, SONG_FIELDS, Album, Song
-from unshackle.core.tracks import Audio, Chapter, Chapters, Subtitle, Tracks, Video
-from unshackle.core.tracks.attachment import Attachment
+from unshackle.core.titles.movie import Movies
+from unshackle.core.titles.music import Album, Song
+from unshackle.core.tracks import Chapter, Chapters, Tracks
 from unshackle.core.tracks.track import Track
 from unshackle.core.tunnel import PROXY_PORTS, TunnelClient, parse_retry_after
 from unshackle.core.utils import run_proxy
@@ -60,6 +96,10 @@ from unshackle.core.utils.collections import ci_get
 from unshackle.core.utils.redact import redact_path, redact_text, safe_display_url
 from unshackle.core.utils.service_params import service_options
 from unshackle.core.vault import Vault
+from unshackle.core.wire import apply_title_fields, build_title, build_tracks
+
+if TYPE_CHECKING:
+    from unshackle.core.remote_channel import Channel
 
 log = logging.getLogger("remote_service")
 
@@ -68,13 +108,19 @@ SENSITIVE_DATA_KEYS = ("credential", "credentials", "password", "token", "api_ke
 DEFAULT_AUTH_HEADERS = ["X-Secret-Key", "X-Api-Key"]
 
 # error kinds after which the remote session may be gone: the server restarted, or the tunnel it used closed
-SESSION_LOST = ("SESSION_NOT_FOUND", "CONNECT", "TIMEOUT", "TUNNEL_CLOSED")
+SESSION_LOST = (
+    APIErrorCode.SESSION_NOT_FOUND,
+    ClientErrorKind.CONNECT,
+    ClientErrorKind.TIMEOUT,
+    ClientErrorKind.TUNNEL_CLOSED,
+)
 # what a recovering call can meet on its way, so these log only once the recovery fails
-RECOVERABLE = (*SESSION_LOST, "SERVER_DRAINING")
+RECOVERABLE = (*SESSION_LOST, APIErrorCode.SERVER_DRAINING)
 RETRY_AFTER_MAX = 3600
 RETRY_AFTER_LOCK = Lock()
 RATE_LIMIT_TRIES = 3
 TUNNEL_SLOT_POLL = 15
+PROBE_TIMEOUT = 30.0
 REOPEN_WAIT = 1800.0  # seconds a lost session waits for its server to come back; covers a deploy's whole drain
 
 
@@ -101,6 +147,15 @@ def recovering() -> Iterator[None]:
 
 
 @contextlib.contextmanager
+def malformed_answer(what: str) -> Iterator[None]:
+    """Turn a server answer that does not decode into one RemoteError line instead of a traceback."""
+    try:
+        yield
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        raise RemoteError(f"The remote server sent malformed {what}: {e}", ClientErrorKind.UNKNOWN) from None
+
+
+@contextlib.contextmanager
 def quiet() -> Iterator[None]:
     """Log this thread's RemoteErrors at debug level, because the caller reports them."""
     before = _mute.quiet
@@ -111,7 +166,7 @@ def quiet() -> Iterator[None]:
         _mute.quiet = before
 
 
-def redact_secrets(text: str, data: Optional[Dict[str, Any]] = None) -> str:
+def redact_secrets(text: str, data: Optional[Mapping[str, Any]] = None) -> str:
     """Mask URL userinfo and any request-payload secrets before unshackle writes the text to the log."""
     secrets = [v for k in SENSITIVE_DATA_KEYS if isinstance(v := (data or {}).get(k), str) and v]
     return redact_text(text, secrets) or ""
@@ -138,16 +193,18 @@ class RemoteError(SystemExit):
     """A remote call that failed: logged, then exits a CLI run like ``SystemExit(1)``.
 
     A serve relaying for a REST client catches it instead and answers with ``message``; ``kind`` is the
-    remote server's error code, or CONNECT / TIMEOUT / AUTH when the remote session could not be reached or opened.
+    remote server's ``APIErrorCode``, or a ``ClientErrorKind`` when the client failed on its own side.
     (Not ``code``: SystemExit's ``code`` is the exit status.)
     """
 
     def __init__(self, message: str, kind: str) -> None:
+        from unshackle.core.api.sanitize import sanitize_log
+
         super().__init__(1)
-        self.message = message
+        self.message = sanitize_log(message)
         self.kind = kind
         muted = _mute.quiet or (_mute.recovering and kind in RECOVERABLE)
-        (log.debug if muted else log.error)(message)
+        (log.debug if muted else log.error)(self.message)
 
     def __str__(self) -> str:
         return self.message
@@ -173,8 +230,11 @@ class RemoteClient:
         self.api_key = api_key
         self.auth_headers = list(auth_headers) if auth_headers else list(DEFAULT_AUTH_HEADERS)
         self._auth_header_index = 0
+        self._auth_header_lock = Lock()
+        self._auth_header_found = False
         self._session: Optional[requests.Session] = None
         self.tunnel: Optional[TunnelClient] = None
+        self.no_channel = False  # this server or a gateway in front of it refused the remote session channel
         # wraps every request, so the service's CDM calls get answered while the server runs its code
         self.in_flight: Callable[[str], contextlib.AbstractContextManager[Any]] = lambda _: contextlib.nullcontext()
 
@@ -190,20 +250,24 @@ class RemoteClient:
         return self._session
 
     def next_auth_header(self) -> bool:
-        """Move the api key onto the next candidate header. False when no candidate header remains."""
-        if not self.api_key or self._auth_header_index + 1 >= len(self.auth_headers):
-            return False
+        """Move the API key onto the next candidate header. False when no candidate header remains.
+
+        Also False once a foreground call succeeded with the current header: a later 401 is about the API key itself.
+        """
         session = self.session
-        session.headers.pop(self.auth_headers[self._auth_header_index], None)
-        self._auth_header_index += 1
-        session.headers[self.auth_headers[self._auth_header_index]] = self.api_key
-        return True
+        with self._auth_header_lock:
+            if self._auth_header_found or not self.api_key or self._auth_header_index + 1 >= len(self.auth_headers):
+                return False
+            session.headers.pop(self.auth_headers[self._auth_header_index], None)
+            self._auth_header_index += 1
+            session.headers[self.auth_headers[self._auth_header_index]] = self.api_key
+            return True
 
     def request(
         self,
         method: str,
         endpoint: str,
-        data: Optional[Dict[str, Any]] = None,
+        data: Optional[Mapping[str, Any]] = None,
         optional: bool = False,
         expect: tuple[str, ...] = (),
         body: Optional[bytes] = None,
@@ -212,28 +276,74 @@ class RemoteClient:
 
         A raw ``body`` goes as ``application/octet-stream``, and a binary answer comes back under ``"body"``.
         """
-        url = f"{self.server_url}{endpoint}"
         payload: Dict[str, Any] = (
             {"json": data} if body is None else {"data": body, "headers": {"Content-Type": "application/octet-stream"}}
         )
+        try:
+            resp = self.send(method, endpoint, self.timeout, **payload)
+        except requests.ConnectionError as e:
+            if isinstance(e.args[0] if e.args else None, urllib3.exceptions.ReadTimeoutError):
+                raise self.timed_out(endpoint) from None
+            server_url = safe_display_url(self.server_url)
+            raise RemoteError(f"Could not connect to remote server at {server_url}", ClientErrorKind.CONNECT) from None
+        except requests.Timeout:
+            raise self.timed_out(endpoint) from None
+        if resp.status_code < 400 and "octet-stream" in resp.headers.get("Content-Type", ""):
+            return {"body": resp.content}
+        try:
+            detail = resp.json()
+        except ValueError:
+            if resp.status_code < 400:
+                raise RemoteError(
+                    f"The remote server answered {endpoint} with a body that is not JSON", ClientErrorKind.UNKNOWN
+                )
+            detail = {}
+        if not isinstance(detail, dict):
+            raise RemoteError(
+                f"The remote server answered {endpoint} with JSON that is not an object", ClientErrorKind.UNKNOWN
+            )
+        late_error = detail.get("status") == "error" and "error_code" in detail
+        if resp.status_code >= 400 or late_error:
+            page_title = re.search(r"<title>(.*?)</title>", resp.text, re.S) if not detail else None
+            fallback = f"HTTP {resp.status_code}: {page_title.group(1).strip()}" if page_title else resp.text
+            error_msg = redact_secrets(str(detail.get("message", fallback)), data)
+            # a gateway's own error page means the server behind it is down, as when it restarts
+            error_code = detail.get("error_code") or (
+                ClientErrorKind.CONNECT if resp.status_code >= 500 and not detail else ClientErrorKind.UNKNOWN
+            )
+            if error_code in expect:
+                return detail
+            if optional and error_code != APIErrorCode.SESSION_NOT_FOUND:
+                log.debug(f"Optional endpoint {endpoint} unavailable [{error_code}]: {error_msg}")
+                return {}
+            if self.tunnel and self.tunnel.lost:
+                raise RemoteError(
+                    "The tunnel to the server closed",
+                    ClientErrorKind.TUNNEL_CLOSED,
+                )
+            raise RemoteError(f"Server error [{error_code}]: {error_msg}", error_code)
+        return detail
+
+    def send(
+        self, method: str, endpoint: str, timeout: float, background: bool = False, **kwargs: Any
+    ) -> requests.Response:
+        """Send one request through the ``in_flight`` hook and return the response; ``requests`` raises its own errors.
+
+        A 401 moves the API key to the next candidate header, a gateway's error page goes once more, and a 429 with
+        Retry-After waits on the console. A ``background`` call skips the hook and the 429 wait.
+        """
+        url = f"{self.server_url}{endpoint}"
         gateway_retried = False
         rate_waits = 0
         while True:
-            try:
-                with self.in_flight(endpoint):
-                    resp = getattr(self.session, method)(url, timeout=self.timeout, **payload)
-            except requests.ConnectionError as e:
-                if isinstance(e.args[0] if e.args else None, urllib3.exceptions.ReadTimeoutError):
-                    raise self.timed_out(endpoint) from None
-                server_url = safe_display_url(self.server_url)
-                raise RemoteError(f"Could not connect to remote server at {server_url}", "CONNECT") from None
-            except requests.Timeout:
-                raise self.timed_out(endpoint) from None
+            with contextlib.nullcontext() if background else self.in_flight(endpoint):
+                resp = getattr(self.session, method)(url, timeout=timeout, **kwargs)
             # servers differ on which header carries the key, so retry the rest before giving up
             if resp.status_code == 401 and self.next_auth_header():
                 continue
             if (
-                resp.status_code == 429
+                not background
+                and resp.status_code == 429
                 and rate_waits < RATE_LIMIT_TRIES
                 and (retry_after := parse_retry_after(resp.headers.get("Retry-After")))
             ):
@@ -250,47 +360,30 @@ class RemoteClient:
                 log.debug(f"HTTP {resp.status_code} from the proxy in front of the server on {endpoint}, retrying once")
                 time.sleep(1)
                 continue
-            break
-        if resp.status_code < 400 and "octet-stream" in resp.headers.get("Content-Type", ""):
-            return {"body": resp.content}
+            if not background and resp.status_code < 400:
+                self._auth_header_found = True
+            return resp
+
+    def probe(self, endpoint: str, background: bool = True) -> Dict[str, Any]:
+        """GET a route with a short timeout: the JSON body, or an empty dict when the call fails. Never logs an error."""
         try:
-            detail = resp.json()
-        except ValueError:
-            if resp.status_code < 400:
-                raise
-            detail = {}
-        late_error = isinstance(detail, dict) and detail.get("status") == "error" and "error_code" in detail
-        if resp.status_code >= 400 or late_error:
-            page_title = re.search(r"<title>(.*?)</title>", resp.text, re.S) if not detail else None
-            fallback = f"HTTP {resp.status_code}: {page_title.group(1).strip()}" if page_title else resp.text
-            error_msg = redact_secrets(str(detail.get("message", fallback)), data)
-            # a gateway's own error page means the server behind it is down, as when it restarts
-            error_code = detail.get("error_code") or (
-                "CONNECT" if resp.status_code >= 500 and not detail else "UNKNOWN"
-            )
-            if error_code in expect:
-                return detail
-            if optional and error_code != "SESSION_NOT_FOUND":
-                log.debug(f"Optional endpoint {endpoint} unavailable [{error_code}]: {error_msg}")
-                return {}
-            if self.tunnel and self.tunnel.lost:
-                raise RemoteError(
-                    "The tunnel to the server closed",
-                    "TUNNEL_CLOSED",
-                )
-            raise RemoteError(f"Server error [{error_code}]: {error_msg}", error_code)
-        return detail
+            resp = self.send("get", endpoint, PROBE_TIMEOUT, background=background)
+            body = resp.json() if resp.ok else {}
+        except (requests.RequestException, ValueError) as e:
+            log.debug(f"Probe of {endpoint} failed: {e}")
+            return {}
+        return body if isinstance(body, dict) else {}
 
     def timed_out(self, endpoint: str) -> RemoteError:
         return RemoteError(
             f"Request to remote server timed out after {self.timeout}s: {endpoint}",
-            "TIMEOUT",
+            ClientErrorKind.TIMEOUT,
         )
 
-    def post(self, endpoint: str, data: Dict[str, Any], expect: tuple[str, ...] = ()) -> Dict[str, Any]:
+    def post(self, endpoint: str, data: Mapping[str, Any], expect: tuple[str, ...] = ()) -> Dict[str, Any]:
         return self.request("post", endpoint, data, expect=expect)
 
-    def post_optional(self, endpoint: str, data: Dict[str, Any]) -> Dict[str, Any]:
+    def post_optional(self, endpoint: str, data: Mapping[str, Any]) -> Dict[str, Any]:
         """POST to an endpoint that an older server may not have. Empty dict when the route is missing."""
         return self.request("post", endpoint, data, optional=True)
 
@@ -303,16 +396,6 @@ class RemoteClient:
 
     def delete(self, endpoint: str) -> Dict[str, Any]:
         return self.request("delete", endpoint)
-
-
-def enum_get(enum_cls: type[Enum], name: Optional[str], default: Any = None) -> Any:
-    """Safely get an enum value by name."""
-    if not name:
-        return default
-    try:
-        return enum_cls[name]
-    except KeyError:
-        return default
 
 
 def sample_batches(samples: list[bytes]) -> Iterator[list[bytes]]:
@@ -329,74 +412,6 @@ def sample_batches(samples: list[bytes]) -> Iterator[list[bytes]]:
         yield batch
 
 
-def base_track_kwargs(data: Dict[str, Any]) -> Dict[str, Any]:
-    """The shared Track constructor kwargs a serialized track carries.
-
-    An older server omits the newer keys, so each one falls back to the value a
-    locally-built track would have had.
-    """
-    return {
-        "url": data.get("url") or "https://placeholder",
-        "language": Language.get(data.get("language") or "und"),
-        "is_original_lang": bool(data.get("is_original_lang", data.get("is_original", False))),
-        "descriptor": enum_get(Track.Descriptor, data.get("descriptor"), Track.Descriptor.URL),
-        "needs_repack": bool(data.get("needs_repack", False)),
-        "name": data.get("name"),
-        "edition": data.get("edition") or None,
-        "note": data["note"] if isinstance(data.get("note"), str) else None,
-        "id_": data.get("id"),
-    }
-
-
-def deserialize_bitrate(data: Dict[str, Any]) -> int:
-    """Exact bits/s when the server sent it, otherwise the kb/s figure scaled back up."""
-    exact = data.get("bitrate_bps")
-    if exact:
-        return int(exact)
-    return data["bitrate"] * 1000 if data.get("bitrate") else 0
-
-
-def deserialize_video(data: Dict[str, Any]) -> Video:
-    return Video(
-        **base_track_kwargs(data),
-        codec=enum_get(Video.Codec, data.get("codec")),
-        range_=enum_get(Video.Range, data.get("range"), Video.Range.SDR),
-        bitrate=deserialize_bitrate(data),
-        width=data.get("width") or 0,
-        height=data.get("height") or 0,
-        fps=data.get("fps"),
-        scan_type=enum_get(Video.ScanType, data.get("scan_type")),
-        closed_captions=data.get("closed_captions") or None,
-        dv_compatible_bitstream=bool(data.get("dv_compatible_bitstream", False)),
-        hdr10plus=bool(data.get("hdr10plus", False)),
-        hdr10_base=bool(data.get("hdr10_base", False)),
-        stereo=bool(data.get("stereo", False)),
-    )
-
-
-def deserialize_audio(data: Dict[str, Any]) -> Audio:
-    joc = data.get("joc")
-    return Audio(
-        **base_track_kwargs(data),
-        codec=enum_get(Audio.Codec, data.get("codec")),
-        bitrate=deserialize_bitrate(data),
-        channels=data.get("channels"),
-        joc=joc,
-        extra={"atmos": True} if joc is None and data.get("atmos") else None,
-        descriptive=data.get("descriptive", False),
-    )
-
-
-def deserialize_subtitle(data: Dict[str, Any]) -> Subtitle:
-    return Subtitle(
-        **base_track_kwargs(data),
-        codec=enum_get(Subtitle.Codec, data.get("codec")),
-        cc=data.get("cc", False),
-        sdh=data.get("sdh", False),
-        forced=data.get("forced", False),
-    )
-
-
 def track_pssh(track: Any, drm_type: str) -> Optional[str]:
     """The base64 PSSH of the track's header for one DRM system; None when the track has none of it."""
     for drm_obj in track.drm or []:
@@ -406,91 +421,6 @@ def track_pssh(track: Any, drm_type: str) -> Optional[str]:
         if drm_type == "widevine" and drm_class == "Widevine":
             return drm_obj.pssh.dumps()
     return None
-
-
-def reconstruct_drm(drm_list: Optional[list]) -> list:
-    """Reconstruct DRM objects from serialized API data."""
-    if not drm_list:
-        return []
-    result: list[Any] = []
-    for drm_info in drm_list:
-        drm_type = drm_info.get("type", "")
-        pssh_str = drm_info.get("pssh")
-        if not pssh_str and drm_type != "blowfishstripe":
-            continue
-        try:
-            if drm_type == "blowfishstripe":
-                result.append(BlowfishStripe(drm_info["key"]))
-            elif drm_type == "widevine":
-                from pywidevine.pssh import PSSH as WidevinePSSH
-
-                from unshackle.core.drm import Widevine
-
-                wv_pssh = WidevinePSSH(pssh_str)
-                kids = drm_info.get("kids")
-                result.append(Widevine(pssh=wv_pssh, kid=kids[0] if kids and not wv_pssh.key_ids else None))
-            elif drm_type == "playready":
-                import base64 as b64
-
-                from pyplayready.system.pssh import PSSH as PlayReadyPSSH
-
-                from unshackle.core.drm import PlayReady
-
-                pr_pssh = PlayReadyPSSH(b64.b64decode(pssh_str))
-                result.append(PlayReady(pssh=pr_pssh, pssh_b64=pssh_str))
-        # a dropped entry can leave the track with no DRM, so never skip silently
-        except Exception as e:
-            log.warning(f"Skipping unparseable {drm_type} DRM entry from server: {e!r}")
-            continue
-    return result
-
-
-def build_attachment(data: Dict[str, Any]) -> Optional[Attachment]:
-    """Rebuild one attachment. A path-only attachment arrives as base64, which this writes to temp."""
-    kwargs = {
-        "name": data.get("name"),
-        "mime_type": data.get("mime_type"),
-        "description": data.get("description"),
-    }
-    if data.get("url"):
-        return Attachment(url=data["url"], **kwargs)
-
-    content = data.get("content")
-    if not content:
-        return None
-    try:
-        file_name = Path(str(data.get("file_name") or data.get("name") or "attachment")).name
-        target = config.directories.temp / "remote_attachments" / file_name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(base64.b64decode(content))
-        return Attachment(path=target, **kwargs)
-    except (OSError, ValueError) as e:
-        log.warning(f"Skipping attachment {data.get('name')!r} sent by the server: {e}")
-        return None
-
-
-def build_tracks(data: Dict[str, Any]) -> Tracks:
-    tracks = Tracks()
-    tracks.videos = [deserialize_video(v) for v in data.get("video", [])]
-    tracks.audio = [deserialize_audio(a) for a in data.get("audio", [])]
-    tracks.subtitles = [deserialize_subtitle(s) for s in data.get("subtitles", [])]
-
-    for track_data, track_obj in [
-        *zip(data.get("video", []), tracks.videos),
-        *zip(data.get("audio", []), tracks.audio),
-        *zip(data.get("subtitles", []), tracks.subtitles),
-    ]:
-        drm_objs = reconstruct_drm(track_data.get("drm"))
-        if drm_objs:
-            track_obj.drm = drm_objs
-        preference = track_data.get("drm_preference")
-        if preference:
-            try:
-                track_obj.drm_preference = preference
-            except ValueError:
-                log.warning(f"Ignoring unknown drm_preference {preference!r} from the server for track {track_obj.id}")
-    tracks.attachments = [a for a in map(build_attachment, data.get("attachments", [])) if a]
-    return tracks
 
 
 def apply_service_track_data(tracks: Tracks, data: Dict[str, Any]) -> None:
@@ -543,132 +473,6 @@ def segment_uri_filter(uris: Iterable[Any]) -> Callable[[Any], bool]:
         return bool(exact) and (uri in exact or uri.split("?")[0] in paths)
 
     return segment_filter
-
-
-EPISODE_PLACEHOLDER_NAME = re.compile(r"Episode ?#?\d+", re.IGNORECASE)
-
-
-def episode_name(name: Optional[str], series_title: Optional[str]) -> Optional[str]:
-    """Drop a placeholder episode name the way ``Episode.__init__`` does.
-
-    The server sends "Episode 04" for an unnamed episode, so the same filter has to run
-    again here, or the placeholder reaches the output file name.
-    """
-    if not name:
-        return None
-    name = name.strip()
-    if EPISODE_PLACEHOLDER_NAME.match(name):
-        return None
-    if series_title and name.lower() == series_title.lower():
-        return None
-    return name
-
-
-def parse_air_date(value: Any) -> Any:
-    """ISO date string back to a date, as ``Episode.__init__`` does; anything else passes through."""
-    if isinstance(value, str):
-        try:
-            return date_.fromisoformat(value[:10])
-        except ValueError:
-            return value
-    return value
-
-
-def apply_title_fields(title: Title_T, info: Dict[str, Any]) -> None:
-    """Copy the serialized metadata fields onto a local title.
-
-    A service can change its title inside ``get_tracks`` (a corrected original language,
-    a real episode name, an air date), so the client re-applies the server's view of the
-    title after every call that returns one. Season, number and part are set only by
-    ``build_title``, as dl can renumber them after the listing.
-    """
-    if info.get("language"):
-        title.language = Language.get(info["language"])
-    if info.get("description") is not None and isinstance(title, (Episode, Movie)):
-        title.description = info["description"]
-    if info.get("year") is not None:
-        title.year = info["year"]
-
-    if isinstance(title, Episode):
-        if info.get("series_title"):
-            title.title = info["series_title"]
-        if "name" in info:
-            title.name = episode_name(info["name"], title.title)
-        if info.get("absolute") is not None:
-            title.absolute = info["absolute"]
-        if info.get("air_date") is not None:
-            title.air_date = parse_air_date(info["air_date"])
-    elif info.get("name"):
-        title.name = info["name"]
-
-    for key in ("anime", "daily", "sport", *(SONG_FIELDS if isinstance(title, Song) else ())):
-        if info.get(key) is not None:
-            setattr(title, key, info[key])
-
-    extra = {k: info[k] for k in ("date", "cover_url") if info.get(k) is not None}
-    music_data = info.get("music_data")
-    if isinstance(music_data, dict):
-        extra.update({key: music_data[key] for key in MUSIC_DATA_KEYS if key in music_data})
-    if extra:
-        if isinstance(title.data, dict):
-            title.data.update(extra)
-        else:
-            title.data = extra
-
-
-def build_title(info: Dict[str, Any], service_tag: str, fallback_id: str) -> Title_T:
-    svc_class = type(service_tag, (), {})
-    lang = Language.get(info["language"]) if info.get("language") else None
-    title_type = info.get("type")
-    title: Title_T
-    if title_type == "episode":
-        title = Episode(
-            id_=info.get("id", fallback_id),
-            service=svc_class,
-            title=info.get("series_title", "Unknown"),
-            season=info.get("season", 0),
-            number=info.get("number", 0),
-            part=info.get("part"),
-            language=lang,
-        )
-    elif title_type == "movie":
-        title = Movie(
-            id_=info.get("id", fallback_id),
-            service=svc_class,
-            name=info.get("name") or "Unknown",
-            language=lang,
-        )
-    elif title_type == "song":
-        title = Song(
-            id_=info.get("id", fallback_id),
-            service=svc_class,
-            name=info.get("name") or "Unknown",
-            artist=info.get("artist") or "Unknown",
-            album=info.get("album") or "Unknown",
-            track=info.get("track") or 1,
-            disc=info.get("disc") or 1,
-            language=lang,
-            album_artist=info.get("album_artist"),
-            release_type=info.get("release_type") or "album",
-            total_tracks=info.get("total_tracks"),
-            total_discs=info.get("total_discs"),
-            genre=info.get("genre"),
-            explicit=info.get("explicit"),
-            isrc=info.get("isrc"),
-            upc=info.get("upc"),
-            copyright=info.get("copyright"),
-            label=info.get("label"),
-            lyrics=info.get("lyrics"),
-            artwork_url=info.get("artwork_url"),
-            synced_lyrics=info.get("synced_lyrics"),
-            lyrics_suffix=info.get("lyrics_suffix"),
-        )
-    else:
-        raise click.ClickException(
-            f"The remote server sent an unknown title type {title_type!r}; unshackle versions differ"
-        )
-    apply_title_fields(title, info)
-    return title
 
 
 def title_key(title: Title_T) -> tuple:
@@ -767,7 +571,7 @@ def remote_service_list(server_name: Optional[str]) -> Optional[list[dict]]:
         services: Optional[list[dict]] = None
         try:
             with quiet():
-                services = remote_client(server_name).get("/api/services").get("services") or []
+                services = remote_client(server_name).get(SERVICES_ROUTE).get("services") or []
         except (Exception, SystemExit) as e:
             log.warning(f"Could not list the services of remote server '{server_name}': {e}")
         _remote_lists[server_name] = (time.monotonic(), services)
@@ -887,12 +691,22 @@ def resolve_remote_proxy_arg(proxy_arg: str, providers: Optional[list] = None) -
         raise click.ClickException(str(e))
 
 
+def ws_headers(client: RemoteClient) -> dict[str, str]:
+    """The headers of a WebSocket to the server, the API key under the header that the server reads among them."""
+    return {k: str(v) for k, v in client.session.headers.items() if k.lower() != "connection"}
+
+
 def start_tunnel(client: RemoteClient, proxy: Optional[str] = None) -> TunnelClient:
     """Open a tunnel that sends the server's requests out through this machine's own connection, or through
-    ``proxy`` from this machine."""
+    ``proxy`` from this machine.
+
+    A health probe comes first, so the tunnel copies the auth header that the server reads.
+    """
     if proxy and (scheme := urlsplit(proxy).scheme.lower()) not in PROXY_PORTS:
         raise click.ClickException(f"--local-proxy cannot use a {scheme} proxy")
-    headers = {k: str(v) for k, v in client.session.headers.items() if k.lower() != "connection"}
+    if not client._auth_header_found:
+        client.probe(HEALTH_ROUTE)
+    headers = ws_headers(client)
     slot_deadline = time.monotonic() + RETRY_AFTER_MAX
     rate_waits = 0
     while True:
@@ -1061,6 +875,7 @@ class RemoteService:
     ANIME: bool = False
     DAILY: bool = False
     server_cdm_type: str = "widevine"
+    channel: Optional[Channel] = None
 
     def __init__(
         self,
@@ -1096,13 +911,9 @@ class RemoteService:
         self.server_vault = ServerVault(self)
         self._segment_filters: Dict[str, Callable[[Any], bool]] = {}
         self._sample_decrypt_tracks: set[str] = set()
-        self._log_seq = 0
-        self._recent_logs: deque[str] = deque(maxlen=3)
         self._input_bridge: Any = None  # a serve relaying for a REST client sets one, as it does for a Service
         # what a login waiting on the user (a pair code, an approval link) last showed; None otherwise
         self.auth_notice: Optional[str] = None
-        self._log_drain_lock = Lock()
-        self._keepalive_stop = Event()
         self._reopen_lock = Lock()
         self._current_title: Optional[Title_T] = None
         # client title and track id -> the id a reopened session gave the same title or track
@@ -1136,10 +947,6 @@ class RemoteService:
         # read before apply_service_config merges the server's values into the same section
         own = config.services.get(service_tag) or {}
         self._client_config = {k: own[k] for k in services_config.get("_client_config") or [] if k in own}
-        self._cdm_sessions: Dict[str, bytes] = {}
-        self._cdm_lock = Lock()
-        self._cdm_requests = 0
-        self._cdm_stop = Event()
         self.apply_service_config(svc_config)
 
     def apply_service_config(self, svc_config: dict) -> None:
@@ -1196,7 +1003,7 @@ class RemoteService:
             data["proxy"] = resolve_remote_proxy_arg(server_proxy_arg(params), providers)
             self.require_reachable_proxy(data["proxy"])
         try:
-            response = self.client.post("/api/search", data)
+            response = self.client.post(SEARCH_ROUTE, data)
         finally:
             if self.client.tunnel:  # a search is one request, so its tunnel ends with it
                 self.client.tunnel.stop()
@@ -1206,16 +1013,18 @@ class RemoteService:
                 result["id"], result["title"], result.get("description"), result.get("label"), result.get("url")
             )
 
-    def client_login(self, profile: Optional[str]) -> Dict[str, Any]:
+    def client_login(self, profile: Optional[str]) -> ClientLogin:
         """The credentials, cookies and cache to send, or nothing when the server manages the account."""
+        login = ClientLogin()
         if self._server_accounts is not None:
-            return {}
-        fields = {
-            "credentials": load_credentials_for_transport(self.service_tag, profile),
-            "cookies": load_cookies_for_transport(self.service_tag, profile),
-            "cache": self.load_cache_files(profile),
-        }
-        return {k: v for k, v in fields.items() if v}
+            return login
+        if credentials := load_credentials_for_transport(self.service_tag, profile):
+            login["credentials"] = credentials
+        if cookies := load_cookies_for_transport(self.service_tag, profile):
+            login["cookies"] = cookies
+        if cache := self.load_cache_files(profile):
+            login["cache"] = cache
+        return login
 
     def require_reachable_proxy(self, proxy: Optional[str]) -> None:
         """Refuse a proxy on this machine when the server is elsewhere: the server cannot reach it."""
@@ -1243,11 +1052,13 @@ class RemoteService:
         proxy = self.ctx.parent.params.get("proxy") if self.ctx.parent else None
         no_proxy = self.ctx.parent.params.get("no_proxy", False) if self.ctx.parent else False
 
-        create_data: Dict[str, Any] = {"service": self.service_tag, "title_id": self.title_id}
+        create_data: SessionCreate = {
+            "service": self.service_tag,
+            "title_id": self.title_id,
+            **self.client_login(profile),
+        }
 
-        if self._server_accounts is None:
-            create_data.update(self.client_login(profile))
-        else:
+        if self._server_accounts is not None:
             self.credential = None
             self.log.info(
                 "The server manages the account for this service" + (" and ignores --profile" if profile else "")
@@ -1284,7 +1095,7 @@ class RemoteService:
             resolved_proxy = resolve_remote_proxy_arg(server_proxy_arg(self.ctx.parent.params), providers)
             if resolved_proxy:
                 create_data["proxy"] = resolved_proxy
-                query = (self.ctx.parent.params.get("proxy_query") if self.ctx.parent else None) or proxy
+                query = launch_keys(self.ctx).get("proxy_query") or proxy
                 country = re.match(r"^(?:[a-z]+:)?([a-z]{2})\d*(?:@.*)?$", query, re.IGNORECASE)
                 if country:
                     create_data["proxy_region"] = country.group(1).lower()
@@ -1320,18 +1131,7 @@ class RemoteService:
                 create_data["generate_dv"] = True
             # Services pick the manifests to fetch from these. They go in their own
             # object: flat, a service option with the same name would take them (or override them).
-            # An empty list is sent as-is, because only an absent key falls back to the dl default.
-            params = self.ctx.parent.params
-            dl_params: dict[str, Any] = {
-                key: [str(x) for x in params[key]]
-                for key in ("lang", "v_lang", "a_lang", "s_lang")
-                if params.get(key) is not None
-            }
-            if params.get("acodec") is not None:
-                dl_params["acodec"] = [c.name for c in params["acodec"]]
-            for key in ("forced_subs", "exact_lang"):
-                if key in params:
-                    dl_params[key] = bool(params[key])
+            dl_params = remote_dl_params(self.ctx.parent.params)
             if dl_params:
                 create_data["dl_params"] = dl_params
 
@@ -1372,7 +1172,7 @@ class RemoteService:
 
         secrets = [v for v in (create_data.get("credentials") or {}).values() if isinstance(v, str) and len(v) >= 4]
         # a serve relaying for a REST client names itself; its own argv is just the serve command
-        client_argv = self.ctx.parent.params.get("client_argv") if self.ctx.parent else None
+        client_argv = launch_keys(self.ctx).get("client_argv")
         argv = (redact_path(redact_text(client_argv or shlex.join(sys.argv[1:]), secrets)) or "")[:3000]
         create_data["client"] = {
             "version": __version__,
@@ -1382,7 +1182,9 @@ class RemoteService:
         }
 
         try:
-            result = self.client.post("/api/session/create", create_data)
+            result = cast(SessionCreated, self.client.post(SESSION_CREATE_ROUTE, create_data))
+            if not isinstance(result.get("session_id"), str):
+                raise RemoteError("The remote server sent malformed session: no session_id", ClientErrorKind.UNKNOWN)
         except BaseException:
             if local and self.client.tunnel:  # no session, so close() never runs: free the tunnel now
                 self.client.tunnel.stop()
@@ -1407,13 +1209,15 @@ class RemoteService:
         # without the server vault grant the server refuses every key request, so none is sent
         self._local_vaults_only = self._server_device and not vault
 
-        status = result.get("status", "authenticated")
-        if status == "authenticating":
-            self.poll_auth_completion()
+        from unshackle.core.remote_channel import open_channel
+
+        self.channel = open_channel(self)
+        if result.get("status", AuthStatus.AUTHENTICATED) == AuthStatus.AUTHENTICATING:
+            self.channel.wait_auth()
         if create_data.get("cdm_relay"):
-            self.client.in_flight = self.answering_cdm_calls
+            self.client.in_flight = self.channel.in_flight
         self.drain_server_logs()
-        self.start_keepalive()
+        self.channel.keep_alive()
 
     @property
     def local_cdm(self) -> Any:
@@ -1462,27 +1266,6 @@ class RemoteService:
             message += "; pass a higher -q to license above it with your own device"
         self.log.info(message)
 
-    def start_keepalive(self) -> None:
-        """Send keep-alive requests so that a long download or mux operation does not outlive the server's idle TTL.
-
-        ``GET /api/session/{session_id}`` refreshes the idle timer and reports the TTL, so the thread sends
-        a request at an interval of one third of it. The thread stops when ``close()`` or a reopen runs. A client
-        that dies stops sending requests, so the server still expires an abandoned remote session.
-        """
-        info = self.client.get_optional(f"/api/session/{self._session_id}")
-        interval = max(float(info.get("expires_in") or 300) / 3, 5.0)
-        url = f"{self.client.server_url}/api/session/{self._session_id}"
-        stop = self._keepalive_stop = Event()
-
-        def ping() -> None:
-            while not stop.wait(interval):
-                try:
-                    self.client.session.get(url, timeout=30)
-                except requests.RequestException:
-                    pass
-
-        Thread(target=ping, name=f"{self.service_tag}-keepalive", daemon=True).start()
-
     def session_call(self, call: Callable[[Optional[str]], T]) -> T:
         """Run ``call`` with the session id, and once more on a new session when the server lost the old one."""
         session_id = self._session_id
@@ -1511,13 +1294,11 @@ class RemoteService:
                 return self._session_id is not None
             if session_id is None or not self.wait_for_server(accepting=False):
                 return False
-            url = f"{self.client.server_url}/api/session/{session_id}"
-            try:
-                alive = kind != "TUNNEL_CLOSED" and self.client.session.get(url, timeout=30).ok
-            except requests.RequestException:
-                alive = False
+            alive = kind != ClientErrorKind.TUNNEL_CLOSED and bool(
+                self.client.probe(SESSION_ROUTE.format(session_id=session_id), background=False)
+            )
             if alive:
-                return kind == "CONNECT"
+                return kind == ClientErrorKind.CONNECT
             self.log.warning("The remote session was lost, opening a new one")
             return self.reopen()
 
@@ -1527,12 +1308,9 @@ class RemoteService:
         delay = 1.0
         warned = False
         while True:
-            try:
-                health = self.client.session.get(f"{self.client.server_url}/api/health", timeout=30).json()
-                if health.get("status") == "ok" and not (accepting and health.get("draining")):
-                    return True
-            except (requests.RequestException, ValueError, AttributeError):
-                pass
+            health = self.client.probe(HEALTH_ROUTE)
+            if health.get("status") == "ok" and not (accepting and health.get("draining")):
+                return True
             if time.monotonic() >= deadline:
                 return False
             if not warned:
@@ -1548,19 +1326,20 @@ class RemoteService:
         A track the new remote session gives another id keeps its old one here, and calls translate it.
         """
         grants = (self._server_cdm, self._server_device, self._server_vault)
-        self._keepalive_stop.set()
+        self.close_channel()
         self._session_id = None
         if self.client.tunnel:  # the server forgot the tunnel too
             self.client.tunnel.stop()
             self.client.tunnel = None
-        self._log_seq = 0
         self._segment_filters.clear()
         if not self.wait_for_server(accepting=True):
             return False
         try:
             with recovering():
                 self.authenticate(credential=self.credential)
-                listing = self.client.get(f"/api/session/{self._session_id}/titles").get("titles", [])
+                listing = cast(TitlesReply, self.client.get(TITLES_ROUTE.format(session_id=self._session_id))).get(
+                    "titles", []
+                )
                 fresh_titles = [build_title(t, self.service_tag, self.title_id) for t in listing]
                 for old in self._titles or []:
                     same = [t for t in fresh_titles if title_key(t) == title_key(old)]
@@ -1583,7 +1362,9 @@ class RemoteService:
                 raise
             return False
         if (self._server_cdm, self._server_device, self._server_vault) != grants:
-            raise RemoteError("The new remote session licenses differently from the lost one", "GRANTS_CHANGED")
+            raise RemoteError(
+                "The new remote session licenses differently from the lost one", ClientErrorKind.GRANTS_CHANGED
+            )
         return True
 
     def reopen_after_drain(self) -> None:
@@ -1593,165 +1374,39 @@ class RemoteService:
             self.close()
             self._current_title = None
             if not self.reopen():
-                raise RemoteError(f"The remote server did not come back within {REOPEN_WAIT:.0f}s", "CONNECT")
+                raise RemoteError(
+                    f"The remote server did not come back within {REOPEN_WAIT:.0f}s", ClientErrorKind.CONNECT
+                )
 
     def server_draining(self) -> bool:
         """Whether the server announced a restart; asked once per title, as an episode can be shorter than the keepalive."""
-        try:
-            url = f"{self.client.server_url}/api/session/{self._session_id}"
-            return bool(self._session_id and self.client.session.get(url, timeout=30).json().get("draining"))
-        except (requests.RequestException, ValueError, AttributeError):
-            return False
+        return bool(self._session_id and self.channel and self.channel.draining())
 
     def server_track_id(self, track_id: Any) -> str:
         """The id the current remote session knows the track with this client id by."""
         return self._track_alias.get(str(track_id), str(track_id))
 
     def drain_server_logs(self) -> None:
-        """Fetch the service's server-side log records for this remote session and re-emit them locally.
+        """Show the service's server-side log records that the remote session channel has not brought already."""
+        if self.channel:
+            self.channel.drain_logs()
 
-        The server mirrors every ``self.log`` call the service makes into a
-        per-session buffer. Draining after each remote call shows the client
-        why a step failed. A relay failure must never break the operation
-        itself, so this method swallows every error.
-        """
-        if not self._session_id:
-            return
-        with self._log_drain_lock:
-            try:
-                with quiet():
-                    resp = self.client.get_optional(f"/api/session/{self._session_id}/logs?since={self._log_seq}")
-            except (Exception, SystemExit):
-                return
-            if not resp:
-                return
-            level_names = logging.getLevelNamesMapping()
-            for record in resp.get("logs", []):
-                level = level_names.get(str(record.get("level", "INFO")), logging.INFO)
-                self.log.log(level, str(record.get("message", "")))
-                self._recent_logs.append(str(record.get("message", "")).strip())
-            self._log_seq = int(resp.get("last_seq", self._log_seq))
-
-    def poll_auth_completion(self, poll_interval: float = 2.0, timeout: float = 600.0) -> None:
-        """Poll the server until authentication completes, handling interactive prompts.
-
-        When the server needs user input (OTP, device code, PIN), it returns
-        ``pending_input`` with a prompt. We display it locally, collect the
-        response, and POST it back. The server resumes its auth flow.
-        """
-        deadline = time.monotonic() + timeout
-        try:
-            self.poll_auth(deadline, poll_interval)
-        finally:
-            self.close_cdm_sessions()
-            if self.auth_notice is not None:
-                self.auth_notice = None
-                show_notice(None)
-
-    def poll_auth(self, deadline: float, poll_interval: float) -> None:
-        while time.monotonic() < deadline:
-            resp = self.client.get(f"/api/session/{self._session_id}/prompt")
-            status = resp.get("status")
-            seen = self._log_seq
-            self.drain_server_logs()
-
-            if status == "authenticated":
-                return
-
-            if status == "authenticating" and self._log_seq == seen and self._recent_logs:
-                notice = "\n".join(self._recent_logs)
-                if notice != self.auth_notice:
-                    self.auth_notice = notice
-                    show_notice(notice)
-
-            if status == "failed":
-                raise RemoteError(f"Remote auth failed: {resp.get('error', 'Authentication failed on server')}", "AUTH")
-
-            if status == "pending_input" and isinstance(resp.get("cdm_call"), dict):
-                self.answer_cdm_call(resp["cdm_call"], self._cdm_sessions)
-                continue
-
-            if status == "pending_input":
-                prompt = resp.get("prompt", "Enter input: ")
-                bridge = self._input_bridge
-                try:
-                    user_response = bridge.request_input(prompt) if bridge else prompt_user(prompt)
-                except EOFError:
-                    raise RemoteError("Remote auth needs interactive input but stdin is closed", "AUTH") from None
-                self.client.post(
-                    f"/api/session/{self._session_id}/prompt",
-                    {"response": user_response},
-                )
-                continue
-
-            time.sleep(poll_interval)
-
-        raise RemoteError("Remote authentication timed out", "AUTH")
-
-    def answer_cdm_call(self, call: Dict[str, Any], sessions: Dict[str, bytes]) -> None:
-        """Run one of the server's CDM calls on this machine's device and post the answer."""
-        from unshackle.core.cdm.client_relay import answer_cdm_call
-
-        answer = answer_cdm_call(self.local_cdm, call, sessions)
-        self.log.debug(f"Answered a server CDM call: {call.get('op')} ({'refused' if 'error' in answer else 'ok'})")
-        self.client.post(f"/api/session/{self._session_id}/prompt", {"response": json.dumps(answer)})
-
-    @contextlib.contextmanager
-    def answering_cdm_calls(self, endpoint: str) -> Iterator[None]:
-        """Answer the server's CDM calls while a remote session request runs service code.
-
-        One poller serves every concurrent request, and the local CDM sessions close when the last one ends.
-        """
-        if not endpoint.startswith(f"/api/session/{self._session_id}/") or endpoint.partition("?")[0].endswith(
-            ("/prompt", "/logs", "/samples")
-        ):
-            yield
-            return
-        with self._cdm_lock:
-            self._cdm_requests += 1
-            if self._cdm_requests == 1:
-                self._cdm_stop = Event()
-                Thread(
-                    target=self.poll_cdm_calls, args=(self._cdm_stop,), name=f"{self.service_tag}-cdm", daemon=True
-                ).start()
-        try:
-            yield
-        finally:
-            with self._cdm_lock:
-                self._cdm_requests -= 1
-                if self._cdm_requests == 0:
-                    self._cdm_stop.set()
-
-    def poll_cdm_calls(self, stop: Event, interval: float = 0.5) -> None:
-        url = f"{self.client.server_url}/api/session/{self._session_id}/prompt"
-        sessions: Dict[str, bytes] = {}
-        while not stop.wait(interval):
-            try:
-                call = self.client.session.get(url, timeout=30).json().get("cdm_call")
-                if isinstance(call, dict):
-                    with quiet():
-                        self.answer_cdm_call(call, sessions)
-            except (requests.RequestException, ValueError, SystemExit) as e:
-                self.log.debug(f"CDM call poll failed: {e}")
-        self.close_cdm_sessions(sessions)
-
-    def close_cdm_sessions(self, sessions: Optional[Dict[str, bytes]] = None) -> None:
-        """Close the local CDM sessions that the server's calls opened; best effort."""
-        sessions = self._cdm_sessions if sessions is None else sessions
-        cdm = self.local_cdm
-        for session_id in sessions.values():
-            with contextlib.suppress(Exception):
-                cdm.close(session_id)
-        sessions.clear()
+    def close_channel(self) -> None:
+        channel, self.channel = self.channel, None
+        if channel:
+            channel.close()
 
     def get_titles(self) -> Titles_T:
         if self._titles is not None:
             return self._titles
         try:
-            result = self.session_call(lambda sid: self.client.get(f"/api/session/{sid}/titles"))
+            result = cast(
+                TitlesReply, self.session_call(lambda sid: self.client.get(TITLES_ROUTE.format(session_id=sid)))
+            )
         finally:
             self.drain_server_logs()
-        titles_list = [build_title(t, self.service_tag, self.title_id) for t in result.get("titles", [])]
+        with malformed_answer("titles"):
+            titles_list = [build_title(t, self.service_tag, self.title_id) for t in result.get("titles") or []]
         first = titles_list[0] if titles_list else None
         if isinstance(first, Episode):
             self._titles = Series(titles_list)
@@ -1780,33 +1435,36 @@ class RemoteService:
         try:
             result = self.session_call(
                 lambda sid: self.client.post(
-                    f"/api/session/{sid}/tracks", {"title_id": self._title_alias.get(title_id, title_id)}
+                    TRACKS_ROUTE.format(session_id=sid),
+                    TracksRequest(title_id=self._title_alias.get(title_id, title_id)),
                 )
             )
         finally:
             self.drain_server_logs()
-        tracks = build_tracks(result)
+        with malformed_answer("tracks"):
+            tracks = build_tracks(result)
 
-        remote_title = result.get("title") or {}
-        if remote_title:
-            apply_title_fields(title, remote_title)
+            remote_title = result.get("title") or {}
+            if remote_title:
+                apply_title_fields(title, remote_title)
 
-        for k, v in result.get("session_headers", {}).items():
-            if k.lower() not in ("host", "content-length", "content-type"):
-                self._session.headers[k] = v
-        apply_session_cookies(self._session, result)
+            session_fields = cast(TracksReply, result)
+            for k, v in session_fields.get("session_headers", {}).items():
+                if k.lower() not in ("host", "content-length", "content-type"):
+                    self._session.headers[k] = v
+            apply_session_cookies(self._session, result)
 
-        restore(tracks, result)
-        apply_service_track_data(tracks, result)
+            restore(tracks, result)
+            apply_service_track_data(tracks, result)
 
-        server_cdm = bool(result.get("server_cdm", False)) or getattr(self, "_server_device", False)
+        server_cdm = bool(session_fields.get("server_cdm", False)) or getattr(self, "_server_device", False)
         if self._server_cdm is None:
             self._server_cdm = server_cdm
         elif self._server_cdm and not server_cdm:
             self._server_cdm = False
             self.report_local_fallback()
-        self.server_cdm_type = result.get("server_cdm_type", "widevine")
-        self._sample_decrypt_tracks.update(result.get("sample_decrypt_tracks") or [])
+        self.server_cdm_type = session_fields.get("server_cdm_type", "widevine")
+        self._sample_decrypt_tracks.update(session_fields.get("sample_decrypt_tracks") or [])
 
         for track in [*tracks.videos, *tracks.audio, *tracks.subtitles]:
             if track.descriptor == Track.Descriptor.HLS:
@@ -1826,7 +1484,7 @@ class RemoteService:
         def samples(body: bytes) -> Dict[str, Any]:
             def call(sid: Optional[str]) -> Dict[str, Any]:
                 query = urlencode({"track_id": self.server_track_id(track.id), "entry": entry})
-                return self.client.request("post", f"/api/session/{sid}/samples?{query}", body=body)
+                return self.client.request("post", SAMPLES_ROUTE.format(session_id=sid) + f"?{query}", body=body)
 
             return self.session_call(call)
 
@@ -1854,8 +1512,13 @@ class RemoteService:
             unwanted = self._segment_filters.get(track_id)
             if unwanted is None:
                 server_id = self.server_track_id(track_id)
-                result = self.session_call(
-                    lambda sid: self.client.post_optional(f"/api/session/{sid}/segment_filter", {"track_id": server_id})
+                result = cast(
+                    SegmentFilterReply,
+                    self.session_call(
+                        lambda sid: self.client.post_optional(
+                            SEGMENT_FILTER_ROUTE.format(session_id=sid), SegmentFilterRequest(track_id=server_id)
+                        )
+                    ),
                 )
                 unwanted = segment_uri_filter(result.get("unwanted") or [])
                 self._segment_filters[track_id] = unwanted
@@ -1894,15 +1557,18 @@ class RemoteService:
         capped: Dict[str, Any] = {}
         try:
             with console.status("Retrieving Remote License...", spinner="dots"):
-                resp = self.session_call(
-                    lambda sid: self.client.post(
-                        f"/api/session/{sid}/license",
-                        {
-                            "track_ids": [self.server_track_id(t.id) for t in keyed],
-                            "mode": "server_cdm",
-                            "drm_type": drm_type,
-                        },
-                    )
+                resp = cast(
+                    LicenseReply,
+                    self.session_call(
+                        lambda sid: self.client.post(
+                            LICENSE_ROUTE.format(session_id=sid),
+                            LicenseRequest(
+                                track_ids=[self.server_track_id(t.id) for t in keyed],
+                                mode="server_cdm",
+                                drm_type=drm_type,
+                            ),
+                        )
+                    ),
                 )
             track_ids = [self.server_track_id(t.id) for t in keyed]
             self.drain_server_logs()
@@ -2026,7 +1692,9 @@ class RemoteService:
         try:
             with quiet():
                 self.session_call(
-                    lambda sid: self.client.post_optional(f"/api/session/{sid}/keys/bad", {"kid": kid.hex, "key": key})
+                    lambda sid: self.client.post_optional(
+                        BAD_KEY_ROUTE.format(session_id=sid), BadKeyReport(kid=kid.hex, key=key)
+                    )
                 )
         except (Exception, RemoteError) as e:
             self.log.debug(f"Could not report the bad content key to the server: {e}")
@@ -2107,18 +1775,21 @@ class RemoteService:
         track: AnyTrack,
     ) -> Optional[Union[bytes, str]]:
         # a missing certificate is legal (services may not use one), so a failed fetch continues without one
-        resp = self.session_call(
-            lambda sid: self.client.post_optional(
-                f"/api/session/{sid}/license",
-                {
-                    "track_id": self.server_track_id(track.id),
-                    "challenge": base64.b64encode(challenge).decode("ascii"),
-                    "drm_type": "widevine",
-                    "is_certificate": True,
-                },
-            )
+        resp = cast(
+            LicenseReply,
+            self.session_call(
+                lambda sid: self.client.post_optional(
+                    LICENSE_ROUTE.format(session_id=sid),
+                    LicenseRequest(
+                        track_id=self.server_track_id(track.id),
+                        challenge=base64.b64encode(challenge).decode("ascii"),
+                        drm_type="widevine",
+                        is_certificate=True,
+                    ),
+                )
+            ),
         )
-        return base64.b64decode(resp["license"]) if resp.get("license") else None
+        return base64.b64decode(certificate) if (certificate := resp.get("license")) else None
 
     def proxy_license(
         self, challenge: Union[bytes, str], track: AnyTrack, drm_type: str, kid: Optional[UUID] = None
@@ -2145,18 +1816,18 @@ class RemoteService:
             refusal: Optional[Dict[str, Any]] = None
             if pssh_b64:
                 try:
-                    request = {"drm_type": drm_type, "mode": "server_cdm", "pssh": pssh_b64}
+                    request = LicenseRequest(drm_type=drm_type, mode="server_cdm", pssh=pssh_b64)
                     if kid:
                         request["kid"] = kid.hex
                     with quiet():
                         resp = self.session_call(
                             lambda sid: self.client.post(
-                                f"/api/session/{sid}/license",
-                                {**request, "track_id": self.server_track_id(track.id)},
-                                expect=("SERVER_CDM_CAPPED",),
+                                LICENSE_ROUTE.format(session_id=sid),
+                                LicenseRequest(**request, track_id=self.server_track_id(track.id)),
+                                expect=(APIErrorCode.SERVER_CDM_CAPPED,),
                             )
                         )
-                    if resp.get("error_code") == "SERVER_CDM_CAPPED":
+                    if resp.get("error_code") == APIErrorCode.SERVER_CDM_CAPPED:
                         refusal = resp.get("details") or {}
                     self.server_cdm_type = resp.get("drm_type", server_type)
                     keys = resp.get("keys", {})
@@ -2178,10 +1849,7 @@ class RemoteService:
 
         pssh_b64 = track_pssh(track, drm_type)
 
-        payload = {
-            "challenge": base64.b64encode(challenge).decode("ascii"),
-            "drm_type": drm_type,
-        }
+        payload = LicenseRequest(challenge=base64.b64encode(challenge).decode("ascii"), drm_type=drm_type)
         if pssh_b64:
             payload["pssh"] = pssh_b64
 
@@ -2189,7 +1857,8 @@ class RemoteService:
             with quiet():
                 resp = self.session_call(
                     lambda sid: self.client.post(
-                        f"/api/session/{sid}/license", {**payload, "track_id": self.server_track_id(track.id)}
+                        LICENSE_ROUTE.format(session_id=sid),
+                        LicenseRequest(**payload, track_id=self.server_track_id(track.id)),
                     )
                 )
         except RemoteError as e:
@@ -2216,12 +1885,12 @@ class RemoteService:
     def close(self) -> None:
         # a long-lived serve opens many of these; the atexit hook would keep every one alive
         atexit.unregister(self.close)
-        self._keepalive_stop.set()
+        self.close_channel()
         session_id, self._session_id = self._session_id, None
         if session_id:
             try:
                 with quiet():
-                    result = self.client.delete(f"/api/session/{session_id}")
+                    result = cast(SessionClosed, self.client.delete(SESSION_ROUTE.format(session_id=session_id)))
                 profile = self.ctx.parent.params.get("profile") if self.ctx.parent else None
                 self.save_returned_cache(result.get("cache", {}), profile)
             except SystemExit:
@@ -2295,7 +1964,7 @@ class RemoteService:
         """
         import zlib
 
-        from unshackle.core.api.sanitize import safe_cache_key
+        from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key
 
         cache_dir = config.directories.cache / self.service_tag
         if not cache_dir.is_dir():
@@ -2311,6 +1980,11 @@ class RemoteService:
                 self.log.debug(f"Withholding cache file from the remote server: {key}")
                 continue
             files[key] = base64.b64encode(zlib.compress(f.read_bytes())).decode("ascii")
+        if len(files) > MAX_SESSION_CACHE_KEYS:
+            self.log.warning(
+                f"The {self.service_tag} cache has {len(files)} files to send and a remote server takes "
+                f"{MAX_SESSION_CACHE_KEYS}: remove old files from {cache_dir}"
+            )
         return files
 
 

@@ -6,10 +6,13 @@ from enum import Enum
 
 import pytest
 
-from unshackle.core.api.handlers import serialize_audio_track, serialize_subtitle_track, serialize_video_track
+from tests.remote.sessions import session_entry
 from unshackle.core.manifests.snapshot import match_track
-from unshackle.core.remote_service import (
-    RemoteService,
+from unshackle.core.remote_service import RemoteService
+from unshackle.core.titles.episode import Episode
+from unshackle.core.titles.movie import Movie
+from unshackle.core.tracks import Audio, Subtitle, Video
+from unshackle.core.wire import (
     build_title,
     build_tracks,
     deserialize_audio,
@@ -17,10 +20,12 @@ from unshackle.core.remote_service import (
     deserialize_video,
     enum_get,
     reconstruct_drm,
+    serialize_audio_track,
+    serialize_subtitle_track,
+    serialize_video_track,
+    track_from_dict,
+    track_to_dict,
 )
-from unshackle.core.titles.episode import Episode
-from unshackle.core.titles.movie import Movie
-from unshackle.core.tracks import Audio, Subtitle, Video
 
 pytestmark = pytest.mark.unit
 
@@ -64,14 +69,12 @@ def test_a_stereo_track_stays_3d_over_remote() -> None:
 
 
 def test_a_track_note_shows_over_remote_and_export_and_is_not_an_edition() -> None:
-    from unshackle.core.tracks.track import Track
-
     v = Video(url="https://x/v.mp4", language="ja", codec=Video.Codec.AVC, note="h264mpl40-dash")
     a = Audio(url="https://x/a.mp4", language="ja", codec=Audio.Codec.AAC, note="heaac-2-dash")
     s = Subtitle(url="https://x/s.vtt", language="en", codec=Subtitle.Codec.WebVTT, note="webvtt-lssdh")
     copies = [deserialize_video(serialize_video_track(v)), deserialize_audio(serialize_audio_track(a))]
     copies += [deserialize_subtitle(serialize_subtitle_track(s))]
-    copies += [Track.from_dict(t.to_dict()) for t in (v, a, s)]
+    copies += [track_from_dict(track_to_dict(t)) for t in (v, a, s)]
     for copy in copies:
         assert copy.note and str(copy).endswith(f"| {copy.note}")
         assert copy.edition == []
@@ -356,6 +359,31 @@ def test_load_cache_files_wiring(tmp_path, monkeypatch) -> None:
     assert set(sent) == {"tokens_default", "session_guid"}
 
 
+@pytest.mark.parametrize("extra, warned", [(0, False), (1, True)])
+def test_load_cache_files_warns_above_the_server_limit(tmp_path, monkeypatch, caplog, extra, warned) -> None:
+    import logging
+    from types import SimpleNamespace
+
+    from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS
+    from unshackle.core.config import config
+    from unshackle.core.remote_service import RemoteService
+
+    cache_dir = tmp_path / "TESTSVC"
+    cache_dir.mkdir()
+    count = MAX_SESSION_CACHE_KEYS + extra
+    for i in range(count):
+        (cache_dir / f"state{i}.json").write_text("{}")
+    monkeypatch.setattr(config.directories, "cache", tmp_path)
+    monkeypatch.setattr(config, "credentials", {})
+    stub = SimpleNamespace(service_tag="TESTSVC", log=logging.getLogger("test"))
+
+    with caplog.at_level(logging.WARNING, logger="test"):
+        sent = RemoteService.load_cache_files(stub, None)
+
+    assert len(sent) == count
+    assert (f"has {count} files to send" in caplog.text) is warned
+
+
 def test_load_cache_files_forwards_nested_keys(tmp_path, monkeypatch) -> None:
     """A service that keeps its cache in subfolders (session_web/<sha1>.json) must have
     those files forwarded under the Cacher key, and the credential filter must still apply
@@ -490,7 +518,6 @@ async def test_session_delete_returns_nested_cache_keys(tmp_path, monkeypatch) -
     import base64
     import json
     import zlib
-    from types import SimpleNamespace
 
     from unshackle.core.api import handlers, session_store
 
@@ -502,7 +529,7 @@ async def test_session_delete_returns_nested_cache_keys(tmp_path, monkeypatch) -
         path.write_text(rel)
     monkeypatch.setattr(handlers.config.directories, "cache", tmp_path)
 
-    session = SimpleNamespace(cache_tag=cache_tag, client_auth=True, input_bridge=None)
+    session = session_entry(service_tag="TESTSVC", cache_tag=cache_tag, client_auth=True)
 
     async def fake_validated(session_id, request):
         return session
@@ -518,6 +545,7 @@ async def test_session_delete_returns_nested_cache_keys(tmp_path, monkeypatch) -
     body = json.loads(response.body)
     assert set(body["cache"]) == {"tokens", "session_web/abc", "MSL/web/keys", "MSL/keys.v2"}
     assert zlib.decompress(base64.b64decode(body["cache"]["session_web/abc"])) == b"session_web/abc"
+    assert session.channel.ended
 
 
 def test_resolve_manifest_data_matches_across_per_range_manifests() -> None:

@@ -7,9 +7,8 @@ from typing import Any
 
 import pytest
 
-from unshackle.core.api.handlers import serialize_audio_track
 from unshackle.core.tracks import Audio
-from unshackle.core.tracks.track import Track
+from unshackle.core.wire import serialize_audio_track, track_from_dict
 
 
 def make_audio(**overrides: Any) -> Audio:
@@ -56,7 +55,7 @@ def test_duration_rejects_invalid_values(duration: object) -> None:
 def test_duration_roundtrips_through_export_data() -> None:
     original = make_audio(duration=60)
 
-    rebuilt = Track.from_dict(original.to_dict())
+    rebuilt = track_from_dict(original.to_dict())
 
     assert rebuilt.duration == 60.0
     assert rebuilt.formatted_duration == "00:01:00"

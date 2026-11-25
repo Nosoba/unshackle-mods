@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 
+from tests.remote.sessions import session_entry
 from unshackle.core.api.errors import APIError
 from unshackle.core.api.handlers import client_session_auth, resolve_handler_proxy, scrub_track_data
 from unshackle.core.remote_service import apply_session_cookies
@@ -11,7 +12,7 @@ from unshackle.core.remote_service import apply_session_cookies
 def _session(client_auth):
     cookie = SimpleNamespace(name="sid", value="secret", domain=".example.com", path="/")
     svc = SimpleNamespace(headers={"Authorization": "Bearer x", "User-Agent": "ua"}, cookies=[cookie])
-    return SimpleNamespace(service_instance=SimpleNamespace(session=svc), client_auth=client_auth)
+    return session_entry(service_instance=SimpleNamespace(session=svc), client_auth=client_auth)
 
 
 def test_client_login_keeps_auth():
@@ -65,7 +66,7 @@ def test_rnet_session_sends_client_and_set_cookies():
     svc.cookies.set("sid", "stale", domain=".example.com")
     svc.cookies.set("cdn", "c", domain="cdn.other.net")
     svc.export_origin_cookies = lambda: {"https://www.example.com": "sid=live; cf=1"}
-    _, cookies = client_session_auth(SimpleNamespace(service_instance=SimpleNamespace(session=svc), client_auth=True))
+    _, cookies = client_session_auth(session_entry(service_instance=SimpleNamespace(session=svc), client_auth=True))
     assert {(c["name"], c["value"], c["domain"]) for c in cookies} == {
         ("sid", "live", "www.example.com"),
         ("cf", "1", "www.example.com"),
@@ -128,7 +129,7 @@ def test_remote_get_tracks_scopes_server_cookies():
         _session_id="s",
         service_tag="EXAMPLE",
         log=logging.getLogger("test"),
-        client=SimpleNamespace(post=lambda path, body: {"session_cookie_jar": jar}),
+        client=SimpleNamespace(post=lambda path, body: {"session_cookie_jar": jar}, probe=lambda endpoint: {}),
         drain_server_logs=lambda: None,
     )
     service.get_tracks(SimpleNamespace(id="t1"))
@@ -228,7 +229,7 @@ def test_dashboard_logs_redact_path():
 
 def test_server_login_strips_nested_and_unlisted_secrets():
     headers, _ = client_session_auth(
-        SimpleNamespace(
+        session_entry(
             service_instance=SimpleNamespace(
                 session=SimpleNamespace(headers={"X-Api-Key": "k", "Accept": "*"}, cookies=[])
             ),
@@ -276,7 +277,8 @@ def test_absent_key_keeps_server_devices(monkeypatch):
 def test_safe_inflate_rejects_non_str_via_isinstance():
     # A non-string cache value must be caught before base64.b64decode raises a 500.
     # Mirror the guard used in session_create_handler.
-    from unshackle.core.api.errors import APIError, APIErrorCode
+    from unshackle.core.api.errors import APIError
+    from unshackle.core.remote_protocol import APIErrorCode
 
     def guard(content):
         if not isinstance(content, str):
@@ -296,9 +298,9 @@ def _run_session(monkeypatch, tmp_path, data, answer, server_account=False, fail
     import zlib
 
     from unshackle.core.api import handlers
-    from unshackle.core.api.input_bridge import AuthStatus
     from unshackle.core.api.session_store import get_session_store
     from unshackle.core.config import config
+    from unshackle.core.remote_protocol import AuthStatus
 
     class PromptingService:
         _input_bridge = None
@@ -352,11 +354,18 @@ def test_client_auth_follows_login_provenance(monkeypatch, tmp_path, data, answe
     assert session.client_auth is expected
 
 
+def test_a_failed_login_reports_its_error(monkeypatch, tmp_path):
+    from unshackle.core.remote_protocol import AuthStatus
+
+    session = _run_session(monkeypatch, tmp_path, {}, "CODE", fail=True)
+    assert (session.auth_status, session.auth_error) == (AuthStatus.FAILED, "bad code")
+
+
 def test_prompt_post_rejects_response_the_bridge_refused(monkeypatch):
     import asyncio
 
     from unshackle.core.api import handlers
-    from unshackle.core.api.input_bridge import AuthStatus
+    from unshackle.core.remote_protocol import AuthStatus
 
     bridge = SimpleNamespace(status=AuthStatus.PENDING_INPUT, submit_response=lambda text: False)
 

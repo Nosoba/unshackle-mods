@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
-from threading import Event, Lock
+from threading import Lock
 
 import pytest
 import requests
 import responses
 from langcodes import Language
 
-from unshackle.core.remote_service import RemoteClient, RemoteError, RemoteService, build_title, quiet
+from unshackle.core.remote_service import RemoteClient, RemoteError, RemoteService, quiet
 from unshackle.core.tracks import Audio
 from unshackle.core.tracks.track import Track
+from unshackle.core.wire import build_title
 
 pytestmark = pytest.mark.unit
 
@@ -41,14 +42,12 @@ def make_service() -> RemoteService:
     service.service_tag = service.title_id = "TEST"
     service._session_id = "s1"
     service._reopen_lock = Lock()
-    service._keepalive_stop = Event()
     service._segment_filters = {}
     service._tracks_by_title = {}
     service._titles = None
     service._title_alias = {}
     service._track_alias = {}
     service._current_title = None
-    service._log_seq = 0
     service._server_cdm = service._server_device = service._server_vault = False
     return service
 

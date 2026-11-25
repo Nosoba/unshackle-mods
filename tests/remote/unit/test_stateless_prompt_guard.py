@@ -91,7 +91,6 @@ def services(monkeypatch):
     monkeypatch.setattr(handlers, "resolve_server_account", lambda *args: None)
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
     monkeypatch.setattr(handlers, "server_login_material", lambda *args: ("cookies", "credential"))
-    monkeypatch.setattr(handlers, "build_parent_ctx", lambda *args, **kwargs: None)
     monkeypatch.setattr(handlers.Services, "load", staticmethod(lambda *args: None))
     monkeypatch.setattr(handlers, "instantiate_service", instantiate)
     monkeypatch.setattr(handlers.RequestCache, "attach", lambda *args: None)
@@ -107,7 +106,6 @@ def run_stateless(operation):
 def test_guard_rejects_without_waiting_or_exposing_prompt(monkeypatch, no_terminal):
     bridge = StatelessInputBridge()
     monkeypatch.setattr(InputBridge, "request_input", no_terminal)
-    monkeypatch.setattr(bridge._response_ready, "wait", no_terminal)
 
     with pytest.raises(APIError, match="Start a download job or remote session") as raised:
         bridge.request_input("Private account information", timeout=600)
@@ -207,7 +205,7 @@ def test_remote_preflight_does_not_issue_or_answer_a_prompt():
     assert bridge.status is AuthStatus.AUTHENTICATING
     assert bridge.get_pending_prompt() is None
     assert not bridge.answered
-    bridge.status = AuthStatus.AUTHENTICATED
+    bridge.login_status = AuthStatus.AUTHENTICATED
     with pytest.raises(RuntimeError, match="after authentication"):
         service.ensure_input_supported()
     bridge.cancel()

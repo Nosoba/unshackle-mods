@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union
 from uuid import UUID
 
+import click
 import m3u8
 from construct import Container
 from pymp4.parser import Box
@@ -200,16 +201,10 @@ class Widevine:
         return []
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialise this DRM instance for export/import (PSSH + KIDs).
+        """This DRM in the export form; see ``wire.drm_to_dict``."""
+        from unshackle.core.wire import drm_to_dict
 
-        unshackle stores the content keys once at the export's track level, and does not
-        duplicate them here.
-        """
-        return {
-            "system": "Widevine",
-            "pssh_b64": self.pssh.dumps(),
-            "kids": [kid.hex for kid in self.kids],
-        }
+        return drm_to_dict(self)
 
     def get_content_keys(self, cdm: WidevineCdm, certificate: Callable, licence: Callable) -> None:
         """
@@ -253,7 +248,12 @@ class Widevine:
                         kid_count=len(self.kids),
                     )
                     license_res = call_licence(licence, challenge, pssh=self.pssh, session_id=session_id)
-                    cdm.parse_license(session_id, license_res)
+                    try:
+                        cdm.parse_license(session_id, license_res)
+                    except Exception as e:
+                        raise Widevine.Exceptions.EmptyLicense(
+                            f"No usable Widevine licence for KID {kid.hex}: {e}"
+                        ) from e
                     log_event(
                         "drm_license_response",
                         level="DEBUG",
@@ -317,10 +317,10 @@ class Widevine:
         class KIDNotFound(Exception):
             """KID (Encryption Key ID) was not found."""
 
-        class CEKNotFound(Exception):
+        class CEKNotFound(click.ClickException):
             """CEK (Content Encryption Key) for KID was not found in License."""
 
-        class EmptyLicense(Exception):
+        class EmptyLicense(click.ClickException):
             """License returned no Content Encryption Keys."""
 
 

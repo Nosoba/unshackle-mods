@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, cast
 
 from unshackle.core.api.events import bus, publish_service_event
 from unshackle.core.api.sanitize import sanitize_log
+from unshackle.core.credential import Credential
 from unshackle.core.utils.redact import REDACTED, URL_USERINFO_RE, redact_all, redact_path, redact_text
 from unshackle.core.utils.service_params import cast_service_options, service_options
 
@@ -49,15 +50,38 @@ def redact_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
     return redacted
 
 
-def secret_values(parameters: Dict[str, Any]) -> List[str]:
-    """Raw secret strings carried in job parameters, longest first, for scrubbing free text."""
+def credential_secrets(value: Any) -> List[str]:
+    """The secret parts of one credential in any form ``Credential.from_config`` loads."""
+    try:
+        credential = Credential.from_config(value)
+    except (AttributeError, TypeError, ValueError):
+        return []
+    parts = [
+        value if isinstance(value, str) else "",
+        credential.dumps(),
+        str(credential.password),
+        str(credential.extra or ""),
+    ]
+    return [part for part in parts if len(part) >= 4]  # short parts would blanket-replace and garble the text
+
+
+def secret_values(parameters: Dict[str, Any], service: Optional[str] = None) -> List[str]:
+    """Raw secret strings carried in job parameters and the credentials configured for ``service``, longest first."""
     if not isinstance(parameters, dict):
         return []
     secrets: List[str] = []
+    if service:
+        from unshackle.core.config import config
+
+        configured = (config.credentials or {}).get(service)
+        for value in configured.values() if isinstance(configured, dict) else [configured]:
+            secrets.extend(credential_secrets(value))
     for key in ("credential", "password", "token", "api_key"):
         value = parameters.get(key)
         if isinstance(value, str) and value:
             secrets.append(value)
+            if key == "credential":
+                secrets.extend(credential_secrets(value))
             if key == "credential" and ":" in value:
                 password = value.split(":", 1)[1]
                 if len(password) >= 4:  # short passwords would blanket-replace and garble the text
@@ -77,10 +101,10 @@ def owner_id(api_key: Optional[str]) -> Optional[str]:
     return hashlib.sha256(api_key.encode()).hexdigest()[:16]
 
 
-def _redact_text(text: Optional[str], parameters: Dict[str, Any]) -> Optional[str]:
+def _redact_text(text: Optional[str], parameters: Dict[str, Any], service: Optional[str] = None) -> Optional[str]:
     """Mask proxy userinfo and any known parameter secrets that leaked into a free-text field
     (error message / details / traceback / job worker stderr) before the API returns the field."""
-    return redact_text(text, secret_values(parameters))
+    return redact_text(text, secret_values(parameters, service))
 
 
 class JobStatus(Enum):
@@ -190,7 +214,10 @@ class DownloadJob:
                 names = ("error_message", "error_details", "error_traceback", "worker_stderr")
                 self.redacted = (
                     raw,
-                    {name: redact_path(_redact_text(text, self.parameters)) for name, text in zip(names, raw)},
+                    {
+                        name: redact_path(_redact_text(text, self.parameters, self.service))
+                        for name, text in zip(names, raw)
+                    },
                 )
             result.update(
                 {
@@ -244,7 +271,7 @@ def record_job_history(job: DownloadJob) -> None:
         "output_files": job.output_files,
         "skipped_titles": job.skipped_titles,
         "parameters": redact_parameters(job.parameters),
-        "error_message": _redact_text(job.error_message, job.parameters),
+        "error_message": _redact_text(job.error_message, job.parameters, job.service),
     }
     try:
         path = history_path()
@@ -372,11 +399,10 @@ def perform_download(
     import click
 
     from unshackle.commands.dl import dl
-    from unshackle.core.api.errors import APIError, APIErrorCode
-    from unshackle.core.config import config, load_yaml
+    from unshackle.core.api.errors import APIError
+    from unshackle.core.config import config
+    from unshackle.core.remote_protocol import APIErrorCode
     from unshackle.core.services import Services
-    from unshackle.core.utils.click_types import ContextData
-    from unshackle.core.utils.collections import merge_dict
 
     log.info(f"Starting sync download for job {job_id}")
 
@@ -426,21 +452,15 @@ def perform_download(
             params["wanted"] = season_range.parse_tokens(*wanted_raw)
 
     remote = params.get("remote")
-    service_config_path = None if remote else Services.get_path(service) / config.filenames.config
-    if service_config_path and service_config_path.exists():
-        service_config = load_yaml(service_config_path)
-    else:
-        service_config = {}
-    merge_dict(config.services.get(service) or {}, service_config)
 
     from unshackle.commands.dl import dl as dl_command
 
     ctx = click.Context(dl_command.cli)
     ctx.invoked_subcommand = service
-    from unshackle.core.api.handlers import cast_dl_params, load_full_cdm, relay_label
+    from unshackle.core.api.handlers import relay_label
+    from unshackle.core.dl_options import DL_OPTION_API_NAMES, cast_dl_params
+    from unshackle.core.launch import launch
 
-    cdm = load_full_cdm(service, params.get("profile"), params.get("cdm_type"))
-    ctx.obj = ContextData(config=service_config, cdm=cdm, proxy_providers=[], profile=params.get("profile"))
     try:
         dl_params = cast_dl_params(dl_command.cli, params)
     except click.BadParameter as exc:
@@ -451,14 +471,14 @@ def perform_download(
         # dl skips the local service config and guards the proxy for a remote_services server
         "remote": bool(remote),
         "server": remote,
-        "client_argv": f"{relay_label(params)} download job {job_id}",
     }
+    launch(ctx, {"client_argv": f"{relay_label(params)} download job {job_id}"})
     # Hand-built context: record parameter sources so service dl overrides
     # apply to defaults but never clobber client-sent values.
     from click.core import ParameterSource
 
     for param_name in ctx.params:
-        source_key = "range" if param_name == "range_" else param_name
+        source_key = DL_OPTION_API_NAMES.get(param_name, param_name)
         ctx.set_parameter_source(
             param_name, ParameterSource.COMMANDLINE if source_key in client_keys else ParameterSource.DEFAULT
         )
@@ -884,7 +904,9 @@ class DownloadQueueManager:
                 except Exception as e:
                     job.status = JobStatus.FAILED
                     job.error_message = str(e)
-                    log.error(f"Job {job.job_id} failed: {e}")
+                    log.error(
+                        f"Job {job.job_id} failed: {_redact_text(job.error_message, job.parameters, job.service)}"
+                    )
                 finally:
                     job.completed_time = datetime.now()
                     record_job_history(job)
@@ -922,7 +944,7 @@ class DownloadQueueManager:
             job.error_code = job.error_code or api_error.error_code.value
             job.error_traceback = job.error_traceback or traceback.format_exc()
 
-            log.error(f"Download failed for job {job.job_id}: {e}")
+            log.error(f"Download failed for job {job.job_id}: {_redact_text(str(e), job.parameters, job.service)}")
             raise
 
     def worker_speed_limit(self) -> Optional[float]:
@@ -1068,8 +1090,8 @@ class DownloadQueueManager:
 
             # A service can echo a credential or a proxy URL into its output, so scrub it before
             # it reaches the log as well, not only the API response.
-            safe_stdout = _redact_text(stdout.strip(), job.parameters)
-            safe_stderr = _redact_text(stderr.strip(), job.parameters)
+            safe_stdout = _redact_text(stdout.strip(), job.parameters, job.service)
+            safe_stderr = _redact_text(stderr.strip(), job.parameters, job.service)
             if stdout.strip():
                 log.debug(f"Worker stdout for job {job.job_id}: {safe_stdout}")
             if stderr.strip():

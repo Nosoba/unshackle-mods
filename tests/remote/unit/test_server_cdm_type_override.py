@@ -20,8 +20,10 @@ import pywidevine.pssh as wv_pssh_mod
 import unshackle.core.cdm as cdm_mod
 import unshackle.core.cdm.detect as detect_mod
 import unshackle.core.drm as drm_mod
+from tests.remote.sessions import session_entry
 from unshackle.core.api import handlers
 from unshackle.core.api.errors import APIError
+from unshackle.core.cdm.choice import choose_cdm
 
 pytestmark = pytest.mark.unit
 
@@ -74,14 +76,7 @@ def _session(track):
         get_widevine_license=lambda **k: b"",
         get_playready_license=lambda **k: b"",
     )
-    return SimpleNamespace(
-        lock=asyncio.Lock(),
-        service_tag="EXAMPLE",
-        service_instance=service,
-        served_keys={},
-        tracks=SimpleNamespace(get={"vid": track}.get),
-        log_buffer=None,
-    )
+    return session_entry(service_instance=service, tracks={"vid": track})
 
 
 @pytest.fixture
@@ -118,8 +113,7 @@ async def _license(monkeypatch, track, body):
 
 
 async def test_server_type_wins_over_client_request(env, monkeypatch):
-    monkeypatch.setattr(handlers, "detect_cdm_type_for_service", lambda tag, cfg: "widevine")
-    monkeypatch.setattr(handlers, "resolve_device_name", lambda *a, **k: "wv_dev")
+    monkeypatch.setattr(handlers.config, "cdm", {"EXAMPLE": "wv_dev"}, raising=False)
     monkeypatch.setattr(handlers, "require_track_pssh", lambda track, pssh, drm_type: None)
 
     track = SimpleNamespace(id="vid", drm=[_pr_drm(), _wv_drm()])
@@ -132,8 +126,7 @@ async def test_server_type_wins_over_client_request(env, monkeypatch):
 
 async def test_playready_only_track_licenses_with_widevine_server(env, monkeypatch):
     """The batch route licenses a PlayReady-only header with the Widevine device; so must this one."""
-    monkeypatch.setattr(handlers, "detect_cdm_type_for_service", lambda tag, cfg: "widevine")
-    monkeypatch.setattr(handlers, "resolve_device_name", lambda *a, **k: "wv_dev")
+    monkeypatch.setattr(handlers.config, "cdm", {"EXAMPLE": "wv_dev"}, raising=False)
 
     track = SimpleNamespace(id="vid", drm=[_pr_drm()])
     body = await _license(monkeypatch, track, {"drm_type": "playready"})
@@ -248,7 +241,6 @@ def test_the_server_device_follows_the_client_only_when_both_systems_are_mapped(
     monkeypatch.setattr(
         handlers, "load_full_cdm", lambda service, profile, cdm_type, app_config=None: asked.append(cdm_type)
     )
-    monkeypatch.setattr(handlers, "build_parent_ctx", lambda *a, **k: None)
     monkeypatch.setattr(handlers.Services, "load", lambda tag: object)
     monkeypatch.setattr(handlers, "instantiate_service", lambda *a, **k: "service")
 
@@ -302,9 +294,9 @@ def test_the_tracks_response_names_the_system_of_the_loaded_device(monkeypatch, 
         ({"EXAMPLE1": "wv_device"}, False),
     ],
 )
-def test_lists_both_systems_needs_a_device_for_each(monkeypatch, mapping, both):
+def test_both_systems_need_a_device_each(monkeypatch, mapping, both):
     monkeypatch.setattr(handlers.config, "cdm", mapping, raising=False)
-    assert handlers.lists_both_systems("EXAMPLE1", handlers.config) is both
+    assert choose_cdm(handlers.config.cdm, "EXAMPLE1").both is both
 
 
 @pytest.mark.parametrize("cdm_type", [5, ["playready"], {"a": 1}])

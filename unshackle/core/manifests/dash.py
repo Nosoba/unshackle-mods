@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
-import html
 import logging
 import math
+import mmap
+import os
 import re
 import shutil
-from concurrent.futures import Future
-from contextlib import ExitStack, closing
+from bisect import bisect_right
+from contextlib import suppress
 from copy import deepcopy
 from functools import lru_cache, partial
 from pathlib import Path
@@ -26,24 +27,28 @@ from requests import Session
 
 from unshackle.core import binaries
 from unshackle.core.config import config
-from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, AnyTrack
+from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_LICENCE_ONLY, AnyTrack
 from unshackle.core.downloaders.requests import parse_content_range
 from unshackle.core.drm import DRM_T, ClearKeyCENC, PlayReady, Widevine
 from unshackle.core.drm.segment_decrypt import SEGMENT_DRM_T, SegmentDecrypter, can_use
-from unshackle.core.drm.verify import decrypt_track
-from unshackle.core.events import events
+from unshackle.core.drm.verify import walk
+from unshackle.core.manifests.segment_pipeline import (
+    append_segment,
+    check_merged,
+    complete_track,
+    fetch_segments,
+    license_drm,
+    licensing,
+)
+from unshackle.core.manifests.trim import trim_overlaps
 from unshackle.core.session import RnetSession
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
-from unshackle.core.tracks.track import (
-    DRM_PREFERENCE_TYPES,
-    Track,
-    assert_fragments_decrypted,
-    parse_sidx,
-)
+from unshackle.core.tracks.track import DRM_PREFERENCE_TYPES, Track, parse_sidx
 from unshackle.core.utilities import is_close_match, log_event, try_ensure_utf8
 from unshackle.core.utils import run_proxy
 from unshackle.core.utils.bitrate import ranged_get
 from unshackle.core.utils.redact import safe_display_url
+from unshackle.core.utils.webvtt import shift_webvtt, webvtt_block_offsets
 from unshackle.core.utils.xml import load_xml
 
 DOLBY_CHANNEL_SCHEMES = (
@@ -90,61 +95,105 @@ def missing_language(where: str, fallback: Any) -> MissingLanguageError:
     return MissingLanguageError(f"No language for {where}")
 
 
-def append_segment(dst: BinaryIO, segment_file: Path, is_text_subtitle: bool) -> None:
-    """Append one segment file to the output, with the text subtitle fixups when they apply."""
-    if is_text_subtitle:
-        segment_data = try_ensure_utf8(segment_file.read_bytes())
-        segment_data = (
-            segment_data.decode("utf8")
-            .replace("&lrm;", html.unescape("&lrm;"))
-            .replace("&rlm;", html.unescape("&rlm;"))
-            .encode("utf8")
-        )
-        dst.write(segment_data)
-    else:
-        with open(segment_file, "rb") as src:
-            shutil.copyfileobj(src, dst, 1024 * 1024)
+def rebase_webvtt_files(groups: list[list[Path]], bounds_ms: list[int]) -> None:
+    """Rewrite the WebVTT segment files of each period or discontinuity block, shifted by webvtt_block_offsets."""
+    texts = [[try_ensure_utf8(path.read_bytes()).decode("utf8") for path in group] for group in groups]
+    for group, parts, offset in zip(groups, texts, webvtt_block_offsets(["\n\n".join(t) for t in texts], bounds_ms)):
+        if not offset:
+            continue
+        for path, text in zip(group, parts):
+            path.write_bytes(shift_webvtt(text, offset).encode("utf8"))
 
 
-class RollingMerge:
-    """Appends segments to the output in index order as they arrive, out of order, and unlinks them.
+def mdhd_timescale(init_data: bytes) -> Optional[int]:
+    """The media timescale of the first track in an init segment, or None when it has no mdhd."""
+    for kind, body, box_end in walk(init_data):
+        if kind == b"mdhd":
+            at = body + (20 if body < box_end and init_data[body] == 1 else 12)
+            return int.from_bytes(init_data[at : at + 4], "big") if at + 4 <= box_end else None
+    return None
 
-    A cursor holds the next expected index; every `add` records one ready segment and then drains
-    every contiguous ready segment from the cursor onward. A segment that carries a future (per-segment
-    decryption) waits for that future before the append, so the output never holds raw bytes.
 
-    `append(dst, segment_file)` writes one segment; the default is a plain byte copy. A parser
-    whose merge needs a per-segment transform, or a head that only exists once segment 0 has
-    landed (ISM), passes its own.
+def tfdt_fields(data: bytes) -> list[tuple[int, int, int]]:
+    """(offset, width, value) of each tfdt baseMediaDecodeTime in a fragment; a tfdt too short for its field is skipped."""
+    fields = []
+    for kind, body, box_end in walk(data):
+        if kind != b"tfdt" or box_end - body < 8:
+            continue
+        width = 8 if data[body] == 1 else 4
+        if body + 4 + width <= box_end:
+            fields.append((body + 4, width, int.from_bytes(data[body + 4 : body + 4 + width], "big")))
+    return fields
+
+
+class PeriodRebase:
+    """Appends segments and moves the tfdt of each period whose timeline restarts to its place in the output.
+
+    A stitched manifest can package each content period on its own, so every period starts at tfdt 0
+    again. A period whose first tfdt falls before the middle of the previous period restarted: its
+    presentationTimeOffset moves to the period's output start, or to the previous period's end when
+    that is later. Any other period keeps the shift before it, or drops it when its own timeline is
+    nearer its output start, so a continuous timeline keeps its decode times and gaps. A track whose
+    first period starts later in the output but whose timeline starts near 0 is placed at that start.
+    Only tfdt moves; sidx, emsg and prft stay as they are. ``joins`` collects the output decode time of
+    each period after the first.
     """
 
-    def __init__(self, dst: BinaryIO, append: Optional[Callable[[BinaryIO, Path], None]] = None) -> None:
-        self.dst = dst
-        self.append = append or (lambda dst, path: append_segment(dst, path, is_text_subtitle=False))
-        self.cursor = 0
-        self.ready: dict[int, tuple[Path, Optional[Future]]] = {}
+    def __init__(self, periods: dict[int, tuple[float, float, float]], timescale: int) -> None:
+        self.periods = periods
+        self.timescale = timescale
+        self.offset = 0
+        self.base: Optional[int] = None
+        self.previous: Optional[tuple[int, int, int]] = None
+        self.joins: set[int] = set()
 
-    def add(self, index: int, segment_file: Path, future: Optional[Future] = None) -> None:
-        # runs on the downloader's own loop, so a decrypt wait or a catch-up burst
-        # delays new submissions; move the drain to a writer thread if throughput measurably drops
-        self.ready[index] = (segment_file, future)
-        while self.cursor in self.ready:
-            path, pending = self.ready.pop(self.cursor)
-            if pending is not None:
-                pending.result()
-            self.append(self.dst, path)
-            self.cursor += 1
-            # the bytes are already in the output; a handle another process still holds on
-            # the just-replaced file (Windows) must not fail the track, the segment dir sweep
-            # after the download removes any leftover
-            try:
-                path.unlink()
-            except OSError:
-                pass
+    def append(self, dst: BinaryIO, segment_file: Path) -> None:
+        period = self.periods.get(int(segment_file.stem))
+        if period is None and not self.offset:
+            append_segment(dst, segment_file, is_text_subtitle=False)
+            return
+        with open(segment_file, "rb") as src:
+            fields: list[tuple[int, int, int]] = []
+            if os.fstat(src.fileno()).st_size:
+                with mmap.mmap(src.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    fields = tfdt_fields(cast(bytes, data))
+            if period and fields:
+                self.start_period(fields[0][2], *period)
+            start = dst.tell()
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+        if self.offset and fields:
+            end = dst.tell()
+            for at, width, value in fields:
+                shifted = value + self.offset
+                if not 0 <= shifted < 1 << (width * 8):
+                    raise ValueError(f"Shifted tfdt {shifted} does not fit its {width * 8}-bit field: {segment_file}")
+                dst.seek(start + at)
+                dst.write(shifted.to_bytes(width, "big"))
+            dst.seek(end)
 
-    @property
-    def merged(self) -> int:
-        return self.cursor
+    def start_period(self, first: int, out_start: float, duration: float, pto: float) -> None:
+        """Set the shift for a period from its first tfdt and its manifest timing.
+
+        A period's media start is its presentationTimeOffset, or its first tfdt when it declares none.
+        """
+        media_start = round(pto * self.timescale) if pto else first
+        placed = round(out_start * self.timescale)
+        length = round(duration * self.timescale)
+        if self.base is None:
+            if placed and media_start < placed // 2:
+                self.base, self.offset = 0, placed - media_start
+            else:
+                self.base = media_start - placed
+        elif self.previous:
+            previous_first, previous_length, previous_end = self.previous
+            target = self.base + placed
+            if first + self.offset < previous_first + previous_length // 2:
+                self.offset = max(target, previous_end) - media_start
+            elif self.offset and abs(media_start - target) < abs(media_start + self.offset - target):
+                self.offset = max(0, previous_end - media_start)
+        if self.previous:
+            self.joins.add(first + self.offset)
+        self.previous = (first + self.offset, length, media_start + self.offset + length)
 
 
 def rep_shape(adaptation_set: Element, rep: Element) -> tuple[Optional[str], ...]:
@@ -433,15 +482,10 @@ class DASH:
         save_path = ctx.save_path
         save_dir = ctx.save_dir
         progress = ctx.progress
-        proxy = ctx.proxy
-        max_workers = ctx.max_workers
-        adaptive = ctx.adaptive_workers
-        processes = ctx.download_processes
-        license_widevine = ctx.license_widevine
         cdm = ctx.cdm
 
-        if proxy:
-            session.proxies.update({"all": proxy})
+        if ctx.proxy:
+            session.proxies.update({"all": ctx.proxy})
 
         log = logging.getLogger("DASH")
         assert isinstance(track.url, str)
@@ -515,9 +559,18 @@ class DASH:
         segment_timescale: float = 0
         init_data: Optional[bytes] = None
         track_kid: Optional[UUID] = None
+        period_starts: dict[int, tuple[float, float, float]] = {}
+        timed = True
 
         content_periods = [p for p in all_periods if DASH.is_content_period(p, filtered_period_ids)]
         period_count = len(content_periods)
+        durations = dict(zip(map(id, all_periods), DASH.period_durations(manifest)))
+        content_timing: list[tuple[Optional[float], Optional[float]]] = []
+        elapsed: Optional[float] = 0.0
+        for content_period in content_periods:
+            duration = durations[id(content_period)]
+            content_timing.append((elapsed, duration))
+            elapsed = elapsed + duration if elapsed is not None and duration is not None else None
 
         if period_count > 1:
             log.debug(f"Multi-period manifest detected with {period_count} content periods")
@@ -548,6 +601,7 @@ class DASH:
                 session=session,
                 probe_kid=period_idx == 0,
                 window=config.sample,
+                duration=content_timing[period_idx][1],
             )
 
             if period_idx == 0:
@@ -556,10 +610,18 @@ class DASH:
                 track_kid = p_kid
                 segment_timescale = p_timescale
 
+            first_segment = len(segments)
             for seg in p_segments:
                 if seg not in seen_segments:
                     seen_segments.add(seg)
                     segments.append(seg)
+            if len(segments) > first_segment:
+                out_start, duration = content_timing[period_idx]
+                if out_start is None or duration is None:
+                    timed = False
+                else:
+                    pto = DASH.presentation_time_offset(matched_as, matched_rep)
+                    period_starts[first_segment] = (out_start, duration, pto)
             segment_durations.extend(p_durations)
             if config.sample and segments:
                 break
@@ -581,39 +643,16 @@ class DASH:
         elif DOWNLOAD_ALL_DRM.is_set() and init_data and binaries.FFProbe and isinstance(track, (Video, Audio)):
             track.add_init_drm(init_data, cdm)
         elif not track.drm and init_data and isinstance(track, (Video, Audio)):
-            prefers_playready = track.prefers_playready(cdm)
-            if prefers_playready:
-                try:
-                    track.drm = [PlayReady.from_init_data(init_data)]
-                except PlayReady.Exceptions.PSSHNotFound:
-                    try:
-                        track.drm = [Widevine.from_init_data(init_data)]
-                    except Widevine.Exceptions.PSSHNotFound:
-                        log.debug("No PlayReady or Widevine PSSH was found for this track, is it DRM free?")
-            else:
-                try:
-                    track.drm = [Widevine.from_init_data(init_data)]
-                except Widevine.Exceptions.PSSHNotFound:
-                    try:
-                        track.drm = [PlayReady.from_init_data(init_data)]
-                    except PlayReady.Exceptions.PSSHNotFound:
-                        log.debug("No Widevine or PlayReady PSSH was found for this track, is it DRM free?")
+            pssh_init = init_data
+            track.drm_from_pssh(cdm, lambda system: system.from_init_data(pssh_init), log)
 
         if track.drm:
             track_kid = track_kid or track.get_key_id(url=segments[0][0], session=session)
             drm = track.get_drm_for_cdm(cdm)
             if isinstance(drm, (Widevine, PlayReady, ClearKeyCENC)):
                 # license and grab content keys (ClearKeyCENC uses no CDM)
-                try:
-                    if not license_widevine:
-                        raise ValueError("license_widevine func must be supplied to use DRM")
-                    progress(downloaded="LICENSING")
-                    license_widevine(drm, track_kid=track_kid)
-                    progress(downloaded="[yellow]LICENSED")
-                except Exception:  # noqa
-                    DOWNLOAD_CANCELLED.set()  # skip pending track downloads
-                    progress(downloaded="[red]FAILED")
-                    raise
+                with licensing(ctx):
+                    license_drm(drm, ctx, track_kid=track_kid)
         else:
             drm = None
 
@@ -622,8 +661,6 @@ class DASH:
             return
 
         progress(total=len(segments))
-
-        downloader = track.downloader
 
         # A parent resource that is itself a valid MP4 downloads in one pass to save_path,
         # replacing the per-segment files, init write and merge pass.
@@ -654,37 +691,16 @@ class DASH:
             if can_resume:
                 resume.write_sidecar(save_dir, digest)
 
-        downloader_args: dict[str, Any]
+        urls: list[dict[str, Any]]
         if collapse_single_url:
             # must carry no Range header, or the downloader would skip its ranged-parallel path
-            downloader_args = dict(
-                urls=[{"url": segments[0][0]}],
-                output_dir=save_path.parent,
-                filename=save_path.name,
-                headers=session.headers,
-                cookies=session.cookies,
-                proxy=proxy,
-                max_workers=max_workers,
-                session=session,
-                adaptive=adaptive,
-                processes=processes,
-            )
+            urls, output_dir, filename = [{"url": segments[0][0]}], save_path.parent, save_path.name
         else:
-            downloader_args = dict(
-                urls=[
-                    {"url": url, "headers": {"Range": f"bytes={bytes_range}"} if bytes_range else {}}
-                    for url, bytes_range in segments
-                ],
-                output_dir=save_dir,
-                filename="{i:0%d}.mp4" % (len(str(len(segments)))),
-                headers=session.headers,
-                cookies=session.cookies,
-                proxy=proxy,
-                max_workers=max_workers,
-                session=session,
-                adaptive=adaptive,
-                processes=processes,
-            )
+            urls = [
+                {"url": url, "headers": {"Range": f"bytes={bytes_range}"} if bytes_range else {}}
+                for url, bytes_range in segments
+            ]
+            output_dir, filename = save_dir, "{i:0%d}.mp4" % (len(str(len(segments))))
 
         log_event(
             "manifest_dash_download_start",
@@ -707,43 +723,28 @@ class DASH:
 
         decrypter: Optional[SegmentDecrypter] = None
         if use_segment_decrypt and init_data:
-            decrypter = SegmentDecrypter(cast(SEGMENT_DRM_T, drm), init_data, save_dir.parent, max_workers)
+            decrypter = SegmentDecrypter(cast(SEGMENT_DRM_T, drm), init_data, save_dir.parent, ctx.max_workers)
 
-        merger: Optional[RollingMerge] = None
-        try:
-            with ExitStack() as stack:
-                if use_rolling_merge:
-                    output = stack.enter_context(open(save_path, "wb"))
-                    head = decrypter.init_bytes() if decrypter else init_data
-                    if head:
-                        output.write(head)
-                    merger = RollingMerge(output)
+        rebase: Optional[PeriodRebase] = None
+        known = timed and len(period_starts) > 1
+        timescale = mdhd_timescale(init_data) if known and init_data and not is_text_subtitle else None
+        if timescale:
+            rebase = PeriodRebase(period_starts, timescale)
+        append = rebase.append if rebase else partial(append_segment, is_text_subtitle=is_text_subtitle)
 
-                # an exception raised in this body (a decrypt failure re-raised by the merge)
-                # must close the generator now, so its finally aborts the workers
-                stream = stack.enter_context(closing(downloader(**downloader_args)))
-                for status_update in stream:
-                    file_downloaded = status_update.get("file_downloaded")
-                    if file_downloaded:
-                        future = decrypter.submit(file_downloaded) if decrypter else None
-                        # listeners get the segment while it still exists; the merge unlinks it
-                        events.emit(events.Types.SEGMENT_DOWNLOADED, track=track, segment=file_downloaded)
-                        if merger:
-                            merger.add(int(file_downloaded.stem), file_downloaded, future)
-                    else:
-                        downloaded = status_update.get("downloaded")
-                        if downloaded and downloaded.endswith("/s"):
-                            status_update["downloaded"] = f"DASH {downloaded}"
-                        progress(**status_update)
-
-            if decrypter:
-                init_data = decrypter.finish()
-        except BaseException:
-            if decrypter:
-                decrypter.close()
-            if merger:
-                save_path.unlink(missing_ok=True)
-            raise
+        merger, init_data = fetch_segments(
+            track,
+            ctx,
+            session,
+            "DASH",
+            urls,
+            output_dir,
+            filename,
+            rolling=use_rolling_merge,
+            init=init_data,
+            append=append,
+            decrypter=decrypter,
+        )
 
         if collapse_span:
             with open(save_path, "r+b") as collapsed:
@@ -751,22 +752,7 @@ class DASH:
         elif merger:
             for control_file in save_dir.glob("*.!dev"):
                 control_file.unlink(missing_ok=True)
-            if merger.merged != len(segments):
-                error_msg = f"Rolling merge appended {merger.merged} of {len(segments)} segments: {save_dir}"
-                log_event(
-                    "manifest_dash_rolling_merge_incomplete",
-                    level="ERROR",
-                    message=error_msg,
-                    context={
-                        "track_id": getattr(track, "id", None),
-                        "track_type": track.__class__.__name__,
-                        "save_dir": str(save_dir),
-                        "merged": merger.merged,
-                        "total_segments": len(segments),
-                        "downloader": "requests",
-                    },
-                )
-                raise FileNotFoundError(error_msg)
+            check_merged(merger, len(segments), track, ctx, "DASH")
         else:
             if not save_dir.exists():
                 error_msg = f"Output directory does not exist: {save_dir}"
@@ -821,36 +807,34 @@ class DASH:
                 )
                 raise FileNotFoundError(error_msg)
 
+            if known and is_text_subtitle and track.codec == Subtitle.Codec.WebVTT:
+                firsts = sorted(period_starts)
+                groups: list[list[Path]] = [[] for _ in firsts]
+                for segment_file in segments_to_merge:
+                    groups[bisect_right(firsts, int(segment_file.stem)) - 1].append(segment_file)
+                last_start, last_duration, _ = period_starts[firsts[-1]]
+                bounds = [*(period_starts[i][0] for i in firsts), last_start + last_duration]
+                rebase_webvtt_files(groups, [round(t * 1000) for t in bounds])
+
             with open(save_path, "wb") as f:
                 if init_data:
                     f.write(init_data)
                 if len(segments_to_merge) > 1:
                     progress(downloaded="Merging", completed=0, total=len(segments_to_merge))
                 for segment_file in segments_to_merge:
-                    append_segment(f, segment_file, is_text_subtitle)
-                    segment_file.unlink()
+                    append(f, segment_file)
+                    with suppress(OSError):
+                        segment_file.unlink()
                     progress(advance=1)
 
-        track.path = save_path
-        events.emit(events.Types.TRACK_DOWNLOADED, track=track)
-
-        if drm:
-            progress(downloaded="Decrypting", completed=0, total=None)
-            decrypt_track(drm, save_path, license_widevine, decrypt=not decrypter)
-            assert_fragments_decrypted(save_path)
-            track.drm = None
-            events.emit(events.Types.TRACK_DECRYPTED, track=track, drm=drm, segment=None)
-            progress(downloaded="Decrypted", completed=100, total=100)
-
-        if save_dir.exists() and save_dir.name.endswith("_segments"):
+        if rebase and rebase.joins and isinstance(track, Audio):
             try:
-                save_dir.rmdir()
-            except OSError:
-                # Directory might not be empty, try removing recursively
-                shutil.rmtree(save_dir, ignore_errors=True)
-        resume.clear_sidecar(save_dir)
+                if dropped := trim_overlaps(save_path, rebase.joins):
+                    log.debug(f"Dropped {dropped} audio samples that overlap the next period: {save_path.name}")
+            except Exception as e:
+                log.warning(f"Could not trim the audio overlaps of {save_path.name}: {e}")
 
-        progress(downloaded="Downloaded")
+        complete_track(track, ctx, drm, decrypt=not decrypter)
 
     @staticmethod
     def find_segment_element(name: str, adaptation_set: Element, representation: Element) -> Optional[Element]:
@@ -953,6 +937,59 @@ class DASH:
         return True
 
     @staticmethod
+    def period_durations(manifest: ElementTree) -> list[Optional[float]]:
+        """The duration in seconds of every Period, None where the manifest does not give it.
+
+        A Period without @start starts at 0 when it is the first, else where the previous Period
+        ends (ISO/IEC 23009-1 5.3.2.1). A Period without @duration lasts to the next Period's start,
+        or to the end of the presentation. A duration that is not positive counts as unknown.
+        """
+        periods = manifest.findall("Period")
+        starts: list[Optional[float]] = []
+        for i, period in enumerate(periods):
+            previous = periods[i - 1] if i else None
+            if period.get("start"):
+                starts.append(DASH.pt_to_sec(period.get("start")))
+            elif previous is None:
+                starts.append(0.0)
+            elif starts[-1] is not None and previous.get("duration"):
+                starts.append(cast(float, starts[-1]) + DASH.pt_to_sec(previous.get("duration")))
+            else:
+                starts.append(None)
+        total = manifest.get("mediaPresentationDuration")
+        durations: list[Optional[float]] = []
+        for i, (period, start) in enumerate(zip(periods, starts)):
+            duration: Optional[float] = None
+            if period.get("duration"):
+                duration = DASH.pt_to_sec(period.get("duration"))
+            elif start is not None and i + 1 < len(periods):
+                following = starts[i + 1]
+                duration = following - start if following is not None else None
+            elif start is not None and total:
+                duration = DASH.pt_to_sec(total) - start
+            durations.append(duration if duration is not None and duration > 0 else None)
+        return durations
+
+    @staticmethod
+    def period_duration(manifest: ElementTree, period: Element) -> Optional[float]:
+        """The duration in seconds of one Period, by DASH.period_durations."""
+        index = next((i for i, p in enumerate(manifest.findall("Period")) if p is period), None)
+        if index is None:
+            return DASH.pt_to_sec(period.get("duration")) if period.get("duration") else None
+        return DASH.period_durations(manifest)[index]
+
+    @staticmethod
+    def presentation_time_offset(adaptation_set: Element, representation: Element) -> float:
+        """The presentationTimeOffset of a Representation's segment element in seconds, 0 when it has none."""
+        element = DASH.merge_segment_templates(adaptation_set, representation)
+        for name in ("SegmentList", "SegmentBase"):
+            if element is None:
+                element = DASH.find_segment_element(name, adaptation_set, representation)
+        if element is None:
+            return 0.0
+        return int(element.get("presentationTimeOffset") or 0) / (float(element.get("timescale") or 1) or 1.0)
+
+    @staticmethod
     def merge_segment_templates(adaptation_set: Element, representation: Element) -> Optional[Element]:
         """
         Assemble the effective SegmentTemplate for a Representation by cascading the
@@ -989,6 +1026,7 @@ class DASH:
         session: Union[Session, RnetSession],
         probe_kid: bool = True,
         window: Optional[tuple[int, int]] = None,
+        duration: Optional[float] = None,
     ) -> tuple[
         Optional[bytes],
         list[tuple[str, Optional[str]]],
@@ -1004,6 +1042,7 @@ class DASH:
                 the caller needs neither the init data nor the Key ID of this period. False
                 drops the FFprobe call, and also the init request where the rest of the parse
                 does not need those bytes.
+            duration: The Period's duration in seconds, when the caller already has it.
 
         Returns:
             A tuple of (init_data, segments, segment_timescale, segment_durations, track_kid).
@@ -1017,7 +1056,10 @@ class DASH:
         adaptation_set_base_url = urljoin(period_base_url, adaptation_set.findtext("BaseURL") or "")
         rep_base_url = urljoin(adaptation_set_base_url, representation.findtext("BaseURL") or "")
 
-        period_duration = period.get("duration") or manifest.get("mediaPresentationDuration")
+        total = manifest.get("mediaPresentationDuration")
+        period_duration = (
+            duration or DASH.period_duration(manifest, period) or (DASH.pt_to_sec(total) if total else None)
+        )
         init_data: Optional[bytes] = None
 
         segment_template = DASH.merge_segment_templates(adaptation_set, representation)
@@ -1086,7 +1128,7 @@ class DASH:
                         if next_time:
                             end_time = int(next_time)
                         elif period_duration:
-                            end_time = timeline_start + DASH.pt_to_sec(period_duration) * segment_timescale
+                            end_time = timeline_start + period_duration * segment_timescale
                         else:
                             raise ValueError("Duration of the Period was unable to be determined.")
                         # round off float noise from the duration so it cannot add a segment
@@ -1118,7 +1160,6 @@ class DASH:
             else:
                 if not period_duration:
                     raise ValueError("Duration of the Period was unable to be determined.")
-                period_duration = DASH.pt_to_sec(period_duration)
                 segment_duration = float(segment_template.get("duration")) or 1
 
                 if not end_number:

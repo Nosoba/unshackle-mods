@@ -8,12 +8,16 @@ from pathlib import PureWindowsPath
 from typing import Optional
 
 MAX_CACHE_KEY_DEPTH = 8
-MAX_SESSION_CACHE_KEYS = 64
+MAX_SESSION_CACHE_KEYS = 256
 
 
-def sanitize_log(value: object) -> str:
-    """Sanitise a value for safe logging by removing newlines and control characters."""
-    return str(value).replace("\n", "").replace("\r", "").replace("\x00", "")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+CONTROL_CHARS_BUT_LF = re.compile(r"[\x00-\x09\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_log(value: object, keep_lines: bool = False) -> str:
+    """Remove control characters, and so ANSI escapes, from a value; newlines too unless ``keep_lines``."""
+    return (CONTROL_CHARS_BUT_LF if keep_lines else CONTROL_CHARS).sub("", str(value))
 
 
 def safe_cache_key(key: object) -> Optional[str]:
@@ -48,23 +52,27 @@ SAFE_PICKLE_TAGS = frozenset({"py/object", "py/type", "py/reduce", "py/tuple", "
 SAFE_PICKLE_TYPES = frozenset(
     {"datetime.datetime", "datetime.date", "datetime.time", "datetime.timedelta", "datetime.timezone"}
 )
+MAX_CACHE_PAYLOAD_DEPTH = 100
 
 
 def safe_cache_payload(text: str) -> bool:
     """True when a peer-supplied cache file is JSON that jsonpickle decodes to plain data and datetimes only.
 
     ``Cacher`` decodes cache files with jsonpickle, which imports and calls any type a file names,
-    so a file from another machine may name the datetime types and nothing else.
+    so a file from another machine may name the datetime types and nothing else. Nesting deeper than
+    ``MAX_CACHE_PAYLOAD_DEPTH`` is refused, because the jsonpickle decode is recursive.
     """
     try:
         root = json.loads(text)
     except (ValueError, RecursionError):
         return False
-    stack = [root]
+    stack = [(root, 0)]
     while stack:
-        node = stack.pop()
+        node, depth = stack.pop()
+        if depth > MAX_CACHE_PAYLOAD_DEPTH:
+            return False
         if isinstance(node, list):
-            stack.extend(node)
+            stack.extend((item, depth + 1) for item in node)
         elif isinstance(node, dict):
             for key, value in node.items():
                 if key.startswith("py/") and key not in SAFE_PICKLE_TAGS:
@@ -75,5 +83,5 @@ def safe_cache_payload(text: str) -> bool:
                     isinstance(value, list) and value and isinstance(value[0], dict) and value[0].keys() == {"py/type"}
                 ):
                     return False
-                stack.append(value)
+                stack.append((value, depth + 1))
     return True
