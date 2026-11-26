@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any
 from uuid import UUID
 
 import m3u8
@@ -41,8 +41,8 @@ def playready_object(kid: UUID) -> str:
     return base64.b64encode(pro).decode()
 
 
-def widevine() -> Widevine:
-    return Widevine(pssh=PSSH.new(system_id=PSSH.SystemId.Widevine, key_ids=[KID]))
+def widevine(kid: UUID = KID) -> Widevine:
+    return Widevine(pssh=PSSH.new(system_id=PSSH.SystemId.Widevine, key_ids=[kid]))
 
 
 def playready(kid: UUID = KID) -> PlayReady:
@@ -53,20 +53,20 @@ def playready(kid: UUID = KID) -> PlayReady:
 class Run:
     """A ContentKeyResolver whose DRM objects license with fixed content keys, for one track in an --all-drm run."""
 
-    def __init__(self, vault: Optional[dict[UUID, str]] = None, **flags: Any) -> None:
+    def __init__(self, vault: dict[UUID, str] | None = None, **flags: Any) -> None:
         self.requests: list[str] = []
         self.held: list[dict[UUID, str]] = []
         self.vault_queries: list[UUID] = []
         self.keys = resolver(Vault(self.get_key(vault or {})), tag="EXAMPLE", **flags)
 
     def get_key(self, vault: dict[UUID, str]) -> Any:
-        def get_key(kid: UUID) -> tuple[Optional[str], Optional[str]]:
+        def get_key(kid: UUID) -> tuple[str | None, str | None]:
             self.vault_queries.append(kid)
             return vault.get(kid), "vault" if kid in vault else None
 
         return get_key
 
-    def drm(self, drm: Any, keys: Optional[dict[UUID, str]] = None, fail: bool = False) -> Any:
+    def drm(self, drm: Any, keys: dict[UUID, str] | None = None, fail: bool = False) -> Any:
         """Give ``drm`` a licence that returns ``keys`` (KID:KEY by default), or that is refused."""
 
         def get_content_keys(cdm: Any, certificate: Any = None, licence: Any = None) -> None:
@@ -79,7 +79,7 @@ class Run:
         drm.get_content_keys = get_content_keys
         return drm
 
-    def run(self, drm: Any, *others: Any, track_kid: Optional[UUID] = KID) -> None:
+    def run(self, drm: Any, *others: Any, track_kid: UUID | None = KID) -> None:
         track = SimpleNamespace(drm=[drm, *others], id="track", height=None)
         self.keys.licence_for(track, None, key_table(), all_drm=True)(drm, track_kid=track_kid)
 
@@ -330,7 +330,7 @@ def test_the_server_cdm_stub_is_the_first_drm_system_of_the_config_entry(
 ) -> None:
     monkeypatch.setattr("unshackle.core.config.config.cdm", {"EXAMPLE": entry})
     monkeypatch.setattr(
-        "unshackle.core.api.handlers.detect_cdm_type",
+        "unshackle.core.api.handlers.device_system",
         lambda name, _: "playready" if name == "pr_device" else "widevine",
     )
 

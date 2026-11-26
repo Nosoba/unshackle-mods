@@ -13,12 +13,13 @@ import pywidevine.pssh as wv_pssh_mod
 
 import unshackle.core.drm as drm_mod
 from tests.core.key_resolver import key_table, resolver
-from tests.remote.key_source import CAPPED, PR_DEVICE, one_title, remote_keys, remote_session
+from tests.remote.key_source import CAPPED, PR_DEVICE, MemoryKeySource, one_title, remote_session
 from tests.remote.sessions import session_entry
 from unshackle.commands.dl import dl
 from unshackle.core import remote_channel
-from unshackle.core.api import handlers
+from unshackle.core.api import handlers, key_policy
 from unshackle.core.api.errors import APIError
+from unshackle.core.api.key_policy import KeyPolicy
 from unshackle.core.config import cdm_entry_names_device
 from unshackle.core.drm import Widevine
 from unshackle.core.remote_protocol import APIErrorCode
@@ -55,21 +56,6 @@ def video(height, width=None):
 
 
 @pytest.mark.parametrize(
-    ("key", "service", "cap"),
-    [
-        ("flat", "EXAMPLE1", 1080),
-        ("mapped", "EXAMPLE1", 720),
-        ("mapped", "EXAMPLE2", 1080),
-        ("partial", "EXAMPLE2", None),
-        ("open", "EXAMPLE1", None),
-        ("admin", "EXAMPLE1", None),
-    ],
-)
-def test_cap_per_key_and_service(key, service, cap):
-    assert handlers.server_cdm_max_height(request(key), service) == cap
-
-
-@pytest.mark.parametrize(
     ("key", "data", "expected"),
     [
         ("open", {"quality": [2160]}, (True, None)),
@@ -87,35 +73,44 @@ def test_cap_per_key_and_service(key, service, cap):
 )
 def test_session_mode(key, data, expected, monkeypatch):
     monkeypatch.setattr(handlers.Services, "load", lambda tag: type("Svc", (), {}))
-    assert handlers.choose_session_cdm(request(key), "EXAMPLE1", data) == expected
+    assert handlers.choose_session_cdm(KeyPolicy(USERS[key]), "EXAMPLE1", data) == expected
 
 
 def test_a_server_device_option_keeps_the_server_cdm_against_the_clients_choice(monkeypatch):
     svc = type("Svc", (), {"SERVER_DEVICE_OPTIONS": ("server_side",)})
     monkeypatch.setattr(handlers.Services, "load", lambda tag: svc)
     data = {"cdm_type": "widevine", "server_cdm": False, "server_side": True}
-    assert handlers.choose_session_cdm(request("flat"), "EXAMPLE1", data) == (True, 1080)
-    assert handlers.choose_session_cdm(request("flat"), "EXAMPLE1", {**data, "quality": [2160]}) == (False, 1080)
-    assert handlers.choose_session_cdm(request("flat"), "EXAMPLE1", {**data, "server_side": False}) == (False, None)
-    assert handlers.choose_session_cdm(request("flat"), "EXAMPLE1", {**data, "server_side": "yes"}) == (True, 1080)
+    assert handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", data) == (True, 1080)
+    assert handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", {**data, "quality": [2160]}) == (
+        False,
+        1080,
+    )
+    assert handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", {**data, "server_side": False}) == (
+        False,
+        None,
+    )
+    assert handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", {**data, "server_side": "yes"}) == (
+        True,
+        1080,
+    )
 
     nested = {"cdm_type": "widevine", "server_cdm": False, "service_params": {"server_side": True}}
-    assert handlers.choose_session_cdm(request("flat"), "EXAMPLE1", nested) == (True, 1080)
+    assert handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", nested) == (True, 1080)
     # with service_params present a flat key is a dl value, as it is when the service is built
     nested["server_side"], nested["service_params"] = True, {}
-    assert handlers.choose_session_cdm(request("flat"), "EXAMPLE1", nested) == (False, None)
+    assert handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", nested) == (False, None)
 
 
 def test_above_the_cap_without_a_device_is_refused_at_create():
     with pytest.raises(APIError) as ei:
-        handlers.choose_session_cdm(request("flat"), "EXAMPLE1", {"quality": [2160]})
+        handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", {"quality": [2160]})
     assert ei.value.error_code is APIErrorCode.SERVER_CDM_CAPPED
     assert ei.value.details == {"reason": "server_cdm_max_height", "max_height": 1080}
 
 
 def test_bad_quality_is_invalid_input():
     with pytest.raises(APIError) as ei:
-        handlers.choose_session_cdm(request("flat"), "EXAMPLE1", {"quality": ["best"]})
+        handlers.choose_session_cdm(KeyPolicy(USERS["flat"]), "EXAMPLE1", {"quality": ["best"]})
     assert ei.value.error_code is APIErrorCode.INVALID_INPUT
 
 
@@ -183,21 +178,6 @@ def test_download_jobs_stay_inside_the_cap(quality, allowed):
         assert ei.value.error_code is APIErrorCode.SERVER_CDM_CAPPED
 
 
-@pytest.mark.parametrize(
-    ("value", "ok"),
-    [
-        (None, True),
-        (1080, True),
-        ({"EXAMPLE1": 720, "default": None}, True),
-        (True, False),
-        ("1080", False),
-        (-1, False),
-    ],
-)
-def test_config_shape(value, ok):
-    assert (handlers.server_cdm_max_height_error("serve.users.x", value) is None) is ok
-
-
 class _WV:
     pssh = SimpleNamespace(dumps=lambda: "WV")
 
@@ -234,7 +214,7 @@ def fails_at_the_track_licence(local_cdm, match):
 
     svc.client.post = None
     with pytest.raises(click.ClickException, match=match):
-        svc.proxy_license(b"", track, "widevine")
+        svc.license_track(track, None)
 
 
 def test_a_capped_track_without_a_local_device_fails_clearly():
@@ -257,12 +237,6 @@ def test_a_server_vault_miss_without_the_local_drm_system_fails_at_once():
     with pytest.raises(click.ClickException, match="server vault") as ei:
         svc.resolve_server_keys(one_title(track))
     assert "-q" not in ei.value.message
-
-
-def test_a_null_service_in_the_cap_map_falls_through_to_the_default(monkeypatch):
-    users = {"k": {"server_cdm": True, "server_cdm_max_height": {"EXAMPLE1": None, "default": 1080}}}
-    monkeypatch.setattr(handlers.config, "serve", {"users": users}, raising=False)
-    assert handlers.server_cdm_max_height(request("k"), "EXAMPLE1") == 1080
 
 
 def test_an_ultrawide_track_is_measured_as_the_smallest_quality_that_selects_it():
@@ -335,7 +309,7 @@ def test_a_service_click_default_stays_out_of_the_download_gate(monkeypatch):
     monkeypatch.setattr(dm, "get_download_manager", Manager)
     body = {"service": "EXAMPLE1", "title_id": "t1", "quality": [1080]}
     asyncio.run(handlers.download_handler(body, request("flat")))
-    assert jobs[0]["service_params"] == {"best_available": True}
+    assert jobs[0]["service_params"] == {}
     assert not jobs[0].get("best_available")
 
 
@@ -414,7 +388,6 @@ def licence_env(monkeypatch):
             raise refusal
         return {KID.hex: "k"}
 
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda track, session=None, init_data=None: None)
     monkeypatch.setattr(handlers, "find_title_for_track", lambda tid, session: SimpleNamespace())
     monkeypatch.setattr(handlers, "detect_cdm_type_for_service", lambda tag, cfg: "widevine")
@@ -478,7 +451,7 @@ def test_a_client_device_session_builds_the_service_on_a_stub_of_that_device(mon
     def no_server_device(*a, **k):
         raise AssertionError("a client-device session must not load the server's device")
 
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda tag: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda tag: {})
     monkeypatch.setattr(handlers, "load_full_cdm", no_server_device)
     monkeypatch.setattr(handlers, "served_context", lambda obj, *a: built.update(cdm=obj.cdm))
     monkeypatch.setattr(handlers.Services, "load", lambda tag: object)
@@ -497,7 +470,6 @@ def test_the_tracks_response_echoes_the_session_choice(monkeypatch):
     from unshackle.core.api import session_store as store_mod
     from unshackle.core.tracks import Tracks
 
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
     monkeypatch.setattr(store_mod.bus, "publish", lambda topic, data: None)
 
     class StubService:
@@ -539,13 +511,13 @@ class _LocalWidevine(Widevine):
         raise self.Used(cdm)
 
 
-def server_stub_resolver(svc, licence, cdm_for=None):
+def server_stub_resolver(svc, cdm_for=None):
     """Content-key resolution for a --cdm-only remote run, whose loaded CDM is the server stub."""
-    return resolver(cdm="server stub", licence=licence, cdm_for=cdm_for, tag="EXAMPLE1", source=svc, cdm_only=True)
+    return resolver(cdm="server stub", cdm_for=cdm_for, tag="EXAMPLE1", source=svc, cdm_only=True)
 
 
-def prepare(svc, licence, drm=None, track=None, cdm_for=None):
-    keys = server_stub_resolver(svc, licence, cdm_for)
+def prepare(svc, drm=None, track=None, cdm_for=None):
+    keys = server_stub_resolver(svc, cdm_for)
     drm = drm or _LocalWidevine()
     track = track or SimpleNamespace(id="vid", drm=None, get_drm_for_cdm=lambda cdm: None)
     with pytest.raises(_LocalWidevine.Used) as ei:
@@ -554,17 +526,16 @@ def prepare(svc, licence, drm=None, track=None, cdm_for=None):
 
 
 def test_dl_licenses_a_client_licensed_track_with_the_local_device():
-    svc = remote_keys(client_licensed={"vid"}, local_cdm="local device")
+    svc = MemoryKeySource(local_cdm="local device", client_licensed={"vid"})
 
-    server_calls: list = []
-
-    assert prepare(svc, lambda **kwargs: server_calls.append(kwargs)) == "local device"
-    assert server_calls == []
+    assert prepare(svc) == "local device"
+    assert svc.asked == []
 
 
 def test_dl_takes_the_local_path_when_the_server_hands_the_track_over():
-    svc = remote_keys(local_cdm="local device")
-    assert prepare(svc, lambda **kwargs: svc.client_licensed.add("vid")) == "local device"
+    svc = MemoryKeySource(None, local_cdm="local device")
+    assert prepare(svc) == "local device"
+    assert svc.asked == [("vid", None)]
 
 
 class _KeyedWidevine(_LocalWidevine):
@@ -583,8 +554,8 @@ class PlayReady:
 
 def test_a_mid_download_handover_puts_the_keys_on_the_callers_drm():
     """The caller decrypts with the DRM object it passed in, so the local licence must fill that one."""
-    svc = remote_keys(local_cdm="local device")
-    keys = server_stub_resolver(svc, lambda **k: svc.client_licensed.add("vid"))
+    svc = MemoryKeySource(None, local_cdm="local device")
+    keys = server_stub_resolver(svc)
     server_drm, local_drm = PlayReady(), _KeyedWidevine()
     track = SimpleNamespace(id="vid", drm=[server_drm, local_drm], get_drm_for_cdm=lambda cdm: local_drm)
 
@@ -592,6 +563,17 @@ def test_a_mid_download_handover_puts_the_keys_on_the_callers_drm():
     keys.wait_vault_writes()
 
     assert server_drm.content_keys == {UUID(int=0xCA9): "ab" * 16}
+
+
+def test_a_capped_answer_to_the_track_licence_moves_dl_to_the_local_device():
+    refusal = {"status": "error", "error_code": "SERVER_CDM_CAPPED", "details": CAP_DETAILS}
+    local_device = SimpleNamespace(is_playready=False, security_level=1)
+    svc = remote_session(local_device, refusal)
+    drm = _LocalWidevine()
+    track = SimpleNamespace(id="vid", drm=[_WV()], drm_preference=None, get_drm_for_cdm=lambda cdm: drm)
+
+    assert prepare(svc, drm, track) is local_device
+    assert svc.client_licensed == {"vid"}
 
 
 def test_a_capped_hls_track_with_no_drm_yet_moves_to_the_local_device():
@@ -615,7 +597,7 @@ def test_a_single_licence_refusal_hands_the_track_to_the_local_device():
     refusal = {"status": "error", "error_code": "SERVER_CDM_CAPPED", "details": CAP_DETAILS}
     svc = remote_session(SimpleNamespace(is_playready=False, security_level=1), refusal)
 
-    assert svc.proxy_license(b"", track, "widevine") == b""
+    assert svc.license_track(track, None) is None
     assert svc.client_licensed == {"vid"}
     assert track.drm_preference == "widevine"
 
@@ -643,9 +625,10 @@ class _SentCreate(Exception):
     pass
 
 
-def sent_create(
-    server_cdm, cdm_name=None, local_cdm=SimpleNamespace(is_playready=False), cdm_entry=False, cdm_map=None
-):
+WIDEVINE_CDM = SimpleNamespace(is_playready=False)
+
+
+def sent_create(server_cdm, cdm_name=None, local_cdm=WIDEVINE_CDM, cdm_entry=False, cdm_map=None):
     def post(path, data):
         raise _SentCreate(data)
 
@@ -906,11 +889,11 @@ def test_a_capped_track_keeps_the_refusal_when_the_client_has_no_device_for_its_
 
 
 def test_dl_licenses_a_handed_over_track_with_the_device_of_its_drm_system():
-    svc = remote_keys(client_licensed={"vid"}, local_cdm=PR_DEVICE)
+    svc = MemoryKeySource(local_cdm=PR_DEVICE, client_licensed={"vid"})
     widevine_device = SimpleNamespace(is_playready=False)
     drm = _LocalWidevine()
     track = SimpleNamespace(id="vid", drm=[drm], get_drm_for_cdm=lambda cdm: drm)
 
-    used = prepare(svc, lambda **k: None, drm, track, lambda system, quality: widevine_device)
+    used = prepare(svc, drm, track, lambda system, quality: widevine_device)
 
     assert used is widevine_device

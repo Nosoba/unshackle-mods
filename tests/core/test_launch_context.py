@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
 
 import click
 import pytest
@@ -54,7 +55,7 @@ def cli_search(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> click.Context
 
 def rest_handlers(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict]:
     """The handlers module with the service, its config, CDM and proxy stubbed, and the context it builds."""
-    from unshackle.core.api import handlers
+    from unshackle.core.api import handlers, key_policy
 
     seen: dict = {}
 
@@ -62,7 +63,7 @@ def rest_handlers(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict]:
         seen["ctx"] = parent_ctx
         return SimpleNamespace(authenticate=lambda cookies, credential: None)
 
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda tag: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda tag: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", lambda *a: (None, []))
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: None)
     monkeypatch.setattr(handlers.Services, "load", lambda tag: SimpleNamespace())

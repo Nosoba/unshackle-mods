@@ -1,28 +1,63 @@
 import logging
+from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import Any, Iterable, Optional
+from typing import Any
 from uuid import UUID
 
 from unshackle.core.remote_service import RemoteService, ServerVault
+from unshackle.core.title_source import KeyArrival
 
 
 def remote_keys(
-    server_cdm: Optional[bool] = True,
+    server_cdm: bool | None = True,
     server_cdm_type: str = "widevine",
-    client_licensed: Iterable[str] = (),
     local_cdm: Any = None,
-    server_vault_keys: Optional[dict[UUID, str]] = None,
 ) -> RemoteService:
     """A RemoteService with only the state dl reads through ServerKeySource, and no server."""
     svc = RemoteService.__new__(RemoteService)
     svc._server_cdm = server_cdm
     svc.server_cdm_type = server_cdm_type
-    svc.client_licensed = set(client_licensed)
+    svc.client_licensed = set()
     svc.deferred_refusals = {}
-    svc.server_vault_keys = dict(server_vault_keys or {})
+    svc.server_vault_keys = {}
+    svc.served_keys = set()
     svc.server_vault = ServerVault(svc)
     svc.ctx = SimpleNamespace(obj=SimpleNamespace(cdm=local_cdm, cdm_for=None))
     return svc
+
+
+class MemoryKeySource:
+    """A ServerKeySource in memory: ``license_track`` answers with ``licence`` and records each call in ``asked``.
+
+    A ``licence`` of None hands the track to this machine, as a capped server does.
+    """
+
+    key_arrival = KeyArrival.SERVER
+    server_cdm_type = "widevine"
+    server_vault: Any = None
+
+    def __init__(self, licence: Any = (), local_cdm: Any = None, client_licensed: Iterable[str] = ()) -> None:
+        self.licence = licence
+        self.local_cdm = local_cdm
+        self.client_licensed = set(client_licensed)
+        self.server_vault_keys: dict[UUID, str] = {}
+        self.asked: list[tuple[Any, UUID | None]] = []
+
+    def resolve_server_keys(self, title: Any) -> None:
+        pass
+
+    def licenses_locally(self, track: Any) -> bool:
+        return str(track.id) in self.client_licensed
+
+    def license_track(self, track: Any, drm: Any, kid: UUID | None = None) -> dict[UUID, str] | None:
+        self.asked.append((track.id, kid))
+        if self.licence is None:
+            self.client_licensed.add(str(track.id))
+            return None
+        return dict(self.licence)
+
+    def vault_source(self, kid: UUID, key: str) -> Any:
+        return self.server_vault if self.server_vault_keys.get(kid) == key else None
 
 
 CAPPED = {"keys": {}, "capped_tracks": {"vid": {"reason": "server_cdm_max_height", "max_height": 1080}}}

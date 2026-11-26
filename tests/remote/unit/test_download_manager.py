@@ -253,8 +253,7 @@ def test_perform_download_passes_episode_options_to_dl_result(
             raise _CapturedCtx(kwargs)
 
     class FakeService:
-        def __init__(self, ctx: click.Context) -> None:
-            pass
+        cli = click.Command("svc", callback=lambda title: object())
 
     monkeypatch.setattr(dl_module, "dl", FakeDl)
     monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
@@ -291,8 +290,9 @@ def test_perform_download_gives_dl_the_defaults_for_null_and_empty_values(
             raise RuntimeError("stop")
 
     class FakeService:
-        def __init__(self, ctx: click.Context) -> None:
-            seen["parent"] = dict(ctx.parent.params)
+        cli = click.Command(
+            "svc", callback=click.pass_context(lambda ctx, title: seen.update(parent=dict(ctx.parent.params)))
+        )
 
     monkeypatch.setattr(dl_module, "dl", FakeDl)
     monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
@@ -321,13 +321,15 @@ def test_perform_download_casts_service_options(tmp_path: Path, monkeypatch: pyt
         def __init__(self, ctx: click.Context, **kwargs: object) -> None:
             pass
 
+    def build(title: str, episodes: object, tag: object) -> None:
+        raise _CapturedCtx(episodes, tag)
+
     class FakeService:
         cli = click.Command(
-            "svc", params=[click.Option(["--episodes"], type=int), click.Option(["--tag"], multiple=True)]
+            "svc",
+            params=[click.Option(["--episodes"], type=int), click.Option(["--tag"], multiple=True)],
+            callback=build,
         )
-
-        def __init__(self, ctx: click.Context, episodes: object = None, tag: object = ()) -> None:
-            raise _CapturedCtx(episodes, tag)
 
     monkeypatch.setattr(dl_module, "dl", FakeDl)
     monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
@@ -420,6 +422,7 @@ def test_a_prompt_discards_an_answer_sent_before_it(tmp_path: Path, monkeypatch:
         set_prompt_handler(None)
         set_notice_handler(None)
     assert categorize_exception(exc_info.value).error_code is APIErrorCode.AUTH_FAILED
+    assert exc_info.value.error_code is APIErrorCode.AUTH_FAILED  # type: ignore[attr-defined]
 
 
 def test_concurrent_prompts_go_out_one_at_a_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -705,7 +708,7 @@ def test_a_stopped_run_names_its_reason_in_the_job_error(
         cli = dl_module.dl.cli
 
         def __init__(self, ctx: click.Context, **kwargs: object) -> None:
-            self.stop_reason = None
+            pass
 
         def result(self, **kwargs: object) -> None:
             print("stdout: test-private-token")
@@ -718,8 +721,7 @@ def test_a_stopped_run_names_its_reason_in_the_job_error(
             sys.exit(1)
 
     class FakeService:
-        def __init__(self, ctx: click.Context) -> None:
-            pass
+        cli = click.Command("svc", callback=lambda title: object())
 
     monkeypatch.setattr(dl_module, "dl", FakeDl)
     monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
@@ -753,3 +755,48 @@ def test_job_history_keeps_the_skipped_titles(tmp_path: Path, manager: DownloadQ
     record_job_history(job)
     entry = json.loads((tmp_path / "api_history.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert entry["skipped_titles"] == job.skipped_titles
+
+
+@pytest.mark.parametrize("carrier", ["error", "cause", "none"])
+def test_a_download_error_keeps_the_code_its_raiser_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, carrier: str
+) -> None:
+    import click
+
+    import unshackle.commands.dl as dl_module
+    from unshackle.core.api import download_manager, handlers
+    from unshackle.core.api.errors import APIError
+    from unshackle.core.remote_protocol import APIErrorCode, coded
+    from unshackle.core.run_plan import RunOutcome
+    from unshackle.core.services import Services
+
+    error = ValueError("no key for the track")
+    if carrier == "error":
+        coded(error, APIErrorCode.DRM_ERROR)
+    elif carrier == "cause":
+        error.__cause__ = coded(KeyError("kid"), APIErrorCode.DRM_ERROR)
+
+    class FakeDl:
+        cli = dl_module.dl.cli
+
+        def __init__(self, ctx: click.Context, **kwargs: object) -> None:
+            pass
+
+        def result(self, **kwargs: object) -> RunOutcome:
+            return RunOutcome(error=error)
+
+        def failure_lines(self, error: BaseException) -> tuple[str, str]:
+            return "", str(error)
+
+    class FakeService:
+        cli = click.Command("svc", callback=lambda title: object())
+
+    monkeypatch.setattr(dl_module, "dl", FakeDl)
+    monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
+    monkeypatch.setattr(Services, "load", staticmethod(lambda s: FakeService))
+    monkeypatch.setattr(handlers, "load_full_cdm", lambda *a: None)
+
+    with pytest.raises(APIError, match="^download worker failed: no key for the track$") as exc:
+        download_manager.perform_download("job-1", "EXAMPLE1", "t1", {})
+
+    assert exc.value.error_code == (APIErrorCode.WORKER_ERROR if carrier == "none" else APIErrorCode.DRM_ERROR)

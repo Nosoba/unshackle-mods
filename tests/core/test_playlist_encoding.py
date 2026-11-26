@@ -1,11 +1,11 @@
 """Unit tests for manifest response decoding. Reading `.text` on a response with no encoding
-makes requests run chardet over the whole body, so the playlist fetch paths set utf-8
+makes requests run charset detection over the whole body, so the playlist fetch paths set utf-8
 first. A charset the server did send must survive. An MPD is parsed from bytes, so the
 XML declaration gives the encoding."""
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 import requests
@@ -21,7 +21,7 @@ MASTER = b'#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720,CODE
 MEDIA = b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg1.ts\n#EXT-X-ENDLIST\n"
 
 
-def make_response(body: bytes, url: str, encoding: Optional[str]) -> requests.Response:
+def make_response(body: bytes, url: str, encoding: str | None) -> requests.Response:
     res = requests.Response()
     res.status_code = 200
     res._content = body

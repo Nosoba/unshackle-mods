@@ -2,7 +2,7 @@
 
 Covers serialize_title's conditional `part` key, the list-tracks wanted filter
 routing through Episode.matches_wanted, the discrete season/episode/part request
-fields, and download_manager's already-internal wanted sniff.
+fields, and SeasonRange.convert passing already-parsed wanted keys through.
 """
 
 from __future__ import annotations
@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import pytest
 
 from unshackle.core.api import handlers
 from unshackle.core.api.errors import APIError
 from unshackle.core.titles.episode import Episode
+from unshackle.core.utils.click_types import SEASON_RANGE
 from unshackle.core.wire import build_title, serialize_title
 
 pytestmark = pytest.mark.unit
@@ -26,8 +27,8 @@ class _FakeSvc:
     pass
 
 
-def ep(season: int = 1, number: int = 1, part: Optional[int] = None, **overrides: Any) -> Episode:
-    base: Dict[str, Any] = dict(
+def ep(season: int = 1, number: int = 1, part: int | None = None, **overrides: Any) -> Episode:
+    base: dict[str, Any] = dict(
         id_=f"ep-{season}-{number}-{part or 0}",
         service=_FakeSvc,
         title="My Show",
@@ -42,23 +43,23 @@ def ep(season: int = 1, number: int = 1, part: Optional[int] = None, **overrides
 
 
 class _FakeTracks:
-    videos: List[Any] = []
-    audio: List[Any] = []
-    subtitles: List[Any] = []
+    videos: list[Any] = []
+    audio: list[Any] = []
+    subtitles: list[Any] = []
 
 
 class _FakeService:
-    def __init__(self, titles: List[Episode]) -> None:
+    def __init__(self, titles: list[Episode]) -> None:
         self._titles = titles
 
-    def get_titles(self) -> List[Episode]:
+    def get_titles(self) -> list[Episode]:
         return self._titles
 
     def get_tracks(self, title: Episode) -> _FakeTracks:
         return _FakeTracks()
 
 
-def run_list_tracks(monkeypatch: pytest.MonkeyPatch, titles: List[Episode], **data: Any) -> Dict[str, Any]:
+def run_list_tracks(monkeypatch: pytest.MonkeyPatch, titles: list[Episode], **data: Any) -> dict[str, Any]:
     """Drive list_tracks_handler end to end with the service layer stubbed out."""
     monkeypatch.setattr(handlers, "validate_service", lambda tag, request=None: "FAKE")
     monkeypatch.setattr(handlers, "setup_list_service", lambda *a, **kw: _FakeService(titles))
@@ -71,7 +72,7 @@ def run_list_tracks(monkeypatch: pytest.MonkeyPatch, titles: List[Episode], **da
     return json.loads(response.body)
 
 
-def selected(result: Dict[str, Any]) -> List[str]:
+def selected(result: dict[str, Any]) -> list[str]:
     """Selection-syntax keys of whatever the handler returned, single or multi."""
     entries = result["episodes"] if "episodes" in result else [{"title": result["title"]}]
     keys = []
@@ -133,7 +134,7 @@ def test_movie_json_unaffected() -> None:
 
 
 @pytest.fixture
-def split_titles() -> List[Episode]:
+def split_titles() -> list[Episode]:
     """E1 split into three parts, E2 unsplit."""
     return [ep(1, 1, 1), ep(1, 1, 2), ep(1, 1, 3), ep(1, 2, None)]
 
@@ -202,68 +203,29 @@ def test_rest_multi_episode_order_is_stable_across_parts(monkeypatch) -> None:
     assert selected(result) == ["1x1.1", "1x1.2", "1x1.3", "1x2"]
 
 
-SNIFF = r"^!?\d+x\d+(\.\d+)?$"
-
-
 @pytest.mark.parametrize(
-    "wanted, internal",
+    ("wanted", "parsed"),
     [
-        (["1x1"], True),  # today's pre-parsed form
-        (["1x1", "1x2"], True),
-        (["1x1.2"], True),  # part key
-        (["!1x1.2"], True),  # negative part key
-        (["1x1", "!1x1.2"], True),
-        (["S01E01"], False),
-        (["s1e1.2"], False),
-        (["S01"], False),
-        (["1x1", "S01E02"], False),
+        (["1x1"], ["1x1"]),
+        (["1x1.2"], ["1x1.2"]),
+        (["!1x1.2"], ["!1x1.2"]),
+        (["1x1", "!1x1.2"], ["1x1", "!1x1.2"]),
+        ("1x1, 1x2", ["1x1", "1x2"]),
+        (["1x01"], ["1x1"]),
     ],
 )
-def test_download_manager_sniff_regex(wanted: List[str], internal: bool) -> None:
-    needs_conversion = any(not re.match(SNIFF, w) for w in wanted)
-    assert needs_conversion is (not internal)
+def test_parsed_keys_pass_unchanged(wanted: Any, parsed: list[str]) -> None:
+    """A pre-parsed part or negative key never reaches parse_tokens, which cannot read it."""
+    assert SEASON_RANGE.convert(wanted) == parsed
 
 
-def test_sniff_regex_matches_the_one_in_download_manager() -> None:
-    """Guard the copy above against drift from the production regex."""
-    from pathlib import Path
-
-    import unshackle.core.api.download_manager as dm
-
-    source = Path(dm.__file__).read_text(encoding="utf8")
-    assert f'needs_conversion = any(not re.match(r"{SNIFF}", w) for w in wanted_raw)' in source
+@pytest.mark.parametrize("wanted", [["S01E01"], "S01E01", ["s1e1"], "s1e1; S01E01"])
+def test_tokens_parse_from_a_list_or_a_separated_string(wanted: Any) -> None:
+    assert SEASON_RANGE.convert(wanted) == ["1x1"]
 
 
-def test_perform_download_skips_reconversion_for_preparsed_part_keys(monkeypatch) -> None:
-    """A pre-parsed list with part and negative keys must not reach parse_tokens."""
-    from unshackle.core.api.download_manager import perform_download
-    from unshackle.core.utils.click_types import SeasonRange
-
-    calls = []
-    monkeypatch.setattr(SeasonRange, "parse_tokens", lambda self, *t: calls.append(t) or [])
-
-    params: Dict[str, Any] = {"wanted": ["1x1", "1x1.2", "!1x1.3"]}
-    with pytest.raises(BaseException):
-        # blows up later on the unknown service; the wanted block runs first
-        perform_download("job-1", "NoSuchServiceXYZ", "t1", params)
-
-    assert calls == []
-    assert params["wanted"] == ["1x1", "1x1.2", "!1x1.3"]
-
-
-def test_perform_download_still_converts_cli_style_tokens(monkeypatch) -> None:
-    from unshackle.core.api.download_manager import perform_download
-    from unshackle.core.utils.click_types import SeasonRange
-
-    calls = []
-    monkeypatch.setattr(SeasonRange, "parse_tokens", lambda self, *t: calls.append(t) or ["1x1"])
-
-    params: Dict[str, Any] = {"wanted": "S01E01"}
-    with pytest.raises(BaseException):
-        perform_download("job-2", "NoSuchServiceXYZ", "t1", params)
-
-    assert calls == [("S01E01",)]
-    assert params["wanted"] == ["1x1"]
+def test_a_mixed_list_parses_every_token() -> None:
+    assert sorted(SEASON_RANGE.convert(["1x1", "S01E02"])) == ["1x1", "1x2"]
 
 
 def test_dl_and_handlers_share_the_one_match_helper() -> None:

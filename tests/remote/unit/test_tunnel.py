@@ -8,7 +8,7 @@ import socket
 import socketserver
 import threading
 import time
-from typing import Callable, Iterator
+from collections.abc import Callable, Iterator
 
 import aiohttp
 import click
@@ -507,8 +507,6 @@ def test_a_download_job_refuses_a_tunnel_proxy(monkeypatch: pytest.MonkeyPatch) 
     from unshackle.core.api import handlers
     from unshackle.core.api.errors import APIError
 
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, service: True)
-    monkeypatch.setattr(handlers, "server_cdm_max_height", lambda request, service: None)
     with pytest.raises(APIError, match="tunnel"):
         handlers.enforce_download_gates({"service": "EXAMPLE", "proxy": "tunnel:abc"}, None)
 
@@ -545,7 +543,7 @@ def spy_links(monkeypatch: pytest.MonkeyPatch) -> list:
     return links
 
 
-def wait_until(check: "Callable[[], bool]", seconds: float = 3) -> bool:
+def wait_until(check: Callable[[], bool], seconds: float = 3) -> bool:
     deadline = time.monotonic() + seconds
     while not check() and time.monotonic() < deadline:
         time.sleep(0.05)

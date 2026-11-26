@@ -4,14 +4,17 @@ Device names start with the system they are for: ``wv_`` is Widevine, ``pr_`` is
 ``stub:pr``. Each answer tuple runs over the named systems of its column.
 """
 
+from collections.abc import Callable
+from functools import partial
 from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from typing import Any
 
 import pytest
 
 import unshackle.core.cdm as cdm_mod
 from unshackle.commands.dl import dl
 from unshackle.core.api import handlers
+from unshackle.core.api.key_policy import KeyPolicy
 from unshackle.core.cdm.choice import choose_cdm, drm_system
 from unshackle.core.cdm.detect import is_playready_cdm
 
@@ -22,7 +25,7 @@ SERVER = ("widevine", "playready", "wv")
 TIER = {"devices": ["wv_tier"], "playready_devices": ["pr_tier"]}
 DUAL = {"widevine": "wv_dev", "playready": "pr_dev"}
 
-ROWS: dict[str, tuple[dict, Optional[str], Optional[dict]]] = {
+ROWS: dict[str, tuple[dict, str | None, dict | None]] = {
     "string widevine": ({"EXAMPLE": "wv_dev"}, None, None),
     "string playready": ({"EXAMPLE": "pr_dev"}, None, None),
     "profile mapping, no profile": ({"EXAMPLE": {"alice": "pr_alice", "default": "wv_dev"}}, None, None),
@@ -69,9 +72,7 @@ ROWS: dict[str, tuple[dict, Optional[str], Optional[dict]]] = {
 def devices(monkeypatch: pytest.MonkeyPatch) -> None:
     """A device loads as its own name, and its name says its DRM system in place of a device file."""
     monkeypatch.setitem(cdm_mod.__dict__, "load_cdm", lambda name, **_: name)
-    monkeypatch.setattr(
-        handlers, "detect_cdm_type", lambda name, _: {"wv": "widevine", "pr": "playready"}.get(name[:2])
-    )
+    monkeypatch.setattr(handlers, "device_system", lambda name, _: {"wv": "widevine", "pr": "playready"}.get(name[:2]))
 
 
 def shown(value: Any) -> Any:
@@ -91,14 +92,15 @@ def attempt(answer: Callable[[], Any]) -> Any:
 
 def each(systems: tuple, answer: Callable[[Any], Any]) -> tuple:
     """``answer`` for each named system."""
-    return tuple(attempt(lambda: answer(system)) for system in systems)
+    return tuple(attempt(partial(answer, system)) for system in systems)
 
 
-def answers(monkeypatch: pytest.MonkeyPatch, cdm: dict, profile: Optional[str], key_cdm: Optional[dict]) -> dict:
+def answers(monkeypatch: pytest.MonkeyPatch, cdm: dict, profile: str | None, key_cdm: dict | None) -> dict:
     """What every ladder answers for one config row."""
     monkeypatch.setattr(handlers.config, "cdm", cdm, raising=False)
     user = {**TIER, **({"cdm": key_cdm} if key_cdm else {})}
-    view = handlers.key_cdm_config(user)
+    policy = KeyPolicy(user)
+    view = policy.cdm_config()
     cmd = dl.__new__(dl)
     cmd.vaults = None
     track = SimpleNamespace(drm_preference=None)
@@ -106,10 +108,10 @@ def answers(monkeypatch: pytest.MonkeyPatch, cdm: dict, profile: Optional[str], 
         "dl": each(LOCAL, lambda s: cmd.get_cdm("EXAMPLE", profile, drm=s)),
         "load": each(LOCAL, lambda s: handlers.load_full_cdm("EXAMPLE", profile, s, view)),
         "stub": each(LOCAL, lambda s: handlers.resolve_server_cdm("EXAMPLE", profile, s, view)),
-        "device": each(SERVER, lambda s: handlers.resolve_device_name(user, s, "EXAMPLE")),
+        "device": each(SERVER, lambda s: handlers.resolve_device_name(policy, s, "EXAMPLE")),
         "settled": attempt(lambda: handlers.detect_cdm_type_for_service("EXAMPLE", view)),
         "both": attempt(lambda: choose_cdm(view.cdm, "EXAMPLE").both),
-        "candidates": each(SERVER, lambda s: handlers.server_drm_candidates("EXAMPLE", user, s, track)),
+        "candidates": each(SERVER, lambda s: handlers.server_drm_candidates("EXAMPLE", policy, s, track)),
     }
 
 
@@ -338,7 +340,7 @@ def test_each_ladder_gives_the_pinned_choice(monkeypatch: pytest.MonkeyPatch, de
     ("name", "system"),
     [("wv", "widevine"), ("PlayReady", "playready"), ("PR", "playready"), ("clearkey", None), (5, None), (None, None)],
 )
-def test_drm_system_reads_each_name_of_a_system(name: Any, system: Optional[str]) -> None:
+def test_drm_system_reads_each_name_of_a_system(name: Any, system: str | None) -> None:
     assert drm_system(name) == system
 
 
@@ -346,5 +348,5 @@ def test_drm_system_reads_each_name_of_a_system(name: Any, system: Optional[str]
     ("entry", "system"),
     [({"widevine": "wv_dev"}, "widevine"), (DUAL, None), ({"default": "pr_dev"}, None), ("pr_dev", None)],
 )
-def test_the_entry_settles_a_system_only_when_it_names_one(entry: Any, system: Optional[str]) -> None:
+def test_the_entry_settles_a_system_only_when_it_names_one(entry: Any, system: str | None) -> None:
     assert choose_cdm({"EXAMPLE": entry}, "EXAMPLE").system == system

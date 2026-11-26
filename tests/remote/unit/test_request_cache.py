@@ -13,7 +13,7 @@ import zlib
 import click
 import pytest
 
-from unshackle.core.api import handlers
+from unshackle.core.api import handlers, key_policy
 from unshackle.core.api.stats import stats
 from unshackle.core.cacher import Cacher
 from unshackle.core.config import config
@@ -59,13 +59,13 @@ def seen(tmp_path, monkeypatch):
     monkeypatch.setattr(config.directories, "cache", tmp_path)
     monkeypatch.setattr(stats, "mode", "remote_only")
     monkeypatch.setattr(handlers, "validate_service", lambda tag, request=None: tag)
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda service: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", lambda *args: (None, []))
     monkeypatch.setattr(handlers, "resolve_server_account", lambda *args: None)
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
     monkeypatch.setattr(handlers.Services, "load", staticmethod(lambda service: module))
-    monkeypatch.setattr("unshackle.commands.dl.dl.get_cookie_jar", staticmethod(lambda service, profile: None))
-    monkeypatch.setattr("unshackle.commands.dl.dl.get_credentials", staticmethod(lambda service, profile: None))
+    monkeypatch.setattr("unshackle.core.login.get_cookie_jar", lambda service, profile: None)
+    monkeypatch.setattr("unshackle.core.login.get_credentials", lambda service, profile: None)
     return _CacheService.seen
 
 
@@ -222,7 +222,6 @@ async def test_samples_answers_a_service_exit_in_decrypts_samples(monkeypatch):
 
     monkeypatch.setattr(handlers, "get_validated_session", get_session)
     monkeypatch.setattr(handlers, "require_authenticated", lambda s: None)
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
     with pytest.raises(handlers.APIError) as e:
         await handlers.session_samples_handler("sid", "t", "1", b"")
     assert e.value.error_code.value == "SERVICE_ERROR"

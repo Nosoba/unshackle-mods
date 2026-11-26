@@ -1,7 +1,8 @@
 import re
+from collections.abc import Callable, Sequence
 from datetime import date, timedelta
 from enum import Enum
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Any
 
 import click
 from click.shell_completion import CompletionItem
@@ -35,7 +36,7 @@ class VideoCodecChoice(click.Choice):
 
         super().__init__(list(self._name_to_codec), case_sensitive=False)
 
-    def convert(self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None) -> Any:
+    def convert(self, value: Any, param: click.Parameter | None = None, ctx: click.Context | None = None) -> Any:
         if not value:
             return None
         if isinstance(value, self.codec_enum):
@@ -57,9 +58,7 @@ class MultipleVideoCodecChoice(VideoCodecChoice):
 
     name = "multiple_video_codec_choice"
 
-    def convert(
-        self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
-    ) -> list[Any]:
+    def convert(self, value: Any, param: click.Parameter | None = None, ctx: click.Context | None = None) -> list[Any]:
         if not value:
             return []
         if isinstance(value, list):
@@ -136,8 +135,8 @@ class SubtitleCodecChoice(click.Choice):
         super().__init__(choices, case_sensitive=False)
 
     def convert(
-        self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
-    ) -> Union[Subtitle.Codec, str, None]:
+        self, value: Any, param: click.Parameter | None = None, ctx: click.Context | None = None
+    ) -> Subtitle.Codec | str | None:
         if not value:
             return None
 
@@ -164,9 +163,9 @@ class ContextData:
         config: dict,
         cdm: Any,
         proxy_providers: list,
-        profile: Optional[str] = None,
+        profile: str | None = None,
         cdm_entry: bool = False,
-        cdm_for: Optional[Callable[[str, Optional[int]], Any]] = None,
+        cdm_for: Callable[[str, int | None], Any] | None = None,
     ) -> None:
         self.config = config
         self.cdm = cdm
@@ -207,7 +206,7 @@ class SeasonRange(click.ParamType):
             self.fail(f"Invalid range, a date range cannot span more than {self.MAX_DATE_SPAN} days: {token}")
         return [(left + timedelta(days=i)).isoformat() for i in range(span)]
 
-    def token_sides(self, match: re.Match) -> tuple[int, Optional[int], Optional[int]]:
+    def token_sides(self, match: re.Match) -> tuple[int, int | None, int | None]:
         """Read one side of a token as (season, episode, part), episode/part None when absent.
 
         A music disc x track token shares this (season, episode, part) space, disc reading
@@ -322,17 +321,25 @@ class SeasonRange(click.ParamType):
                 computed = [k for k in computed if k != exclusion and not k.startswith(prefix)]
         return list(set(computed))
 
+    PARSED_KEY = re.compile(r"^!?(0|[1-9]\d*)x(0|[1-9]\d*)(\.[1-9]\d?)?$")
+
     def convert(
-        self, value: str, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
+        self, value: str | list, param: click.Parameter | None = None, ctx: click.Context | None = None
     ) -> list[str]:
-        return self.parse_tokens(*re.split(r"\s*[,;]\s*", value))
+        """Parse a comma or semicolon separated string, or a list of tokens; parsed keys such as ``!1x2.3`` pass."""
+        tokens = re.split(r"\s*[,;]\s*", value) if isinstance(value, str) else value
+        if not isinstance(tokens, list) or not all(isinstance(t, str) for t in tokens):
+            self.fail("expected a string or a list of strings", param, ctx)
+        if all(self.PARSED_KEY.match(t) for t in tokens):
+            return list(tokens)
+        return self.parse_tokens(*tokens)
 
 
 class LanguageRange(click.ParamType):
     name = "lang_range"
 
     def convert(
-        self, value: Union[str, list], param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
+        self, value: str | list, param: click.Parameter | None = None, ctx: click.Context | None = None
     ) -> list[str]:
         if isinstance(value, list):
             return value
@@ -346,9 +353,9 @@ class QualityList(click.ParamType):
 
     def convert(
         self,
-        value: Union[str, int, Sequence[Union[str, int]]],
-        param: Optional[click.Parameter] = None,
-        ctx: Optional[click.Context] = None,
+        value: str | int | Sequence[str | int],
+        param: click.Parameter | None = None,
+        ctx: click.Context | None = None,
     ) -> list[int]:
         if not value:
             return []
@@ -398,7 +405,7 @@ class AudioCodecList(click.ParamType):
     def get_metavar(self, *args: Any, **kwargs: Any) -> str:
         return f"[{'|'.join(self.choices)}]"
 
-    def convert(self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None) -> list:
+    def convert(self, value: Any, param: click.Parameter | None = None, ctx: click.Context | None = None) -> list:
         if not value:
             return []
         if isinstance(value, self.codec_enum):
@@ -447,9 +454,7 @@ class MultipleChoice(click.Choice):
     def __repr__(self) -> str:
         return f"MultipleChoice({list(self.choices)})"
 
-    def convert(
-        self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
-    ) -> list[Any]:
+    def convert(self, value: Any, param: click.Parameter | None = None, ctx: click.Context | None = None) -> list[Any]:
         if not value:
             return []
         if isinstance(value, str):
@@ -493,13 +498,13 @@ class SlowDelayRange(click.ParamType):
 
     name = "delay_range"
 
-    def convert(
-        self, value: Any, param: Optional[click.Parameter], ctx: Optional[click.Context]
-    ) -> Optional[tuple[int, int]]:
+    def convert(self, value: Any, param: click.Parameter | None, ctx: click.Context | None) -> tuple[int, int] | None:
         if isinstance(value, tuple):
             return value
         if isinstance(value, bool):
             return (60, 120) if value else None
+        if isinstance(value, list) and len(value) == 2:
+            value = f"{value[0]}-{value[1]}"
 
         match = re.match(r"^(\d+)-(\d+)$", str(value))
         if not match:
@@ -519,9 +524,7 @@ class SampleRange(click.ParamType):
 
     name = "sample_range"
 
-    def convert(
-        self, value: Any, param: Optional[click.Parameter], ctx: Optional[click.Context]
-    ) -> Optional[tuple[int, int]]:
+    def convert(self, value: Any, param: click.Parameter | None, ctx: click.Context | None) -> tuple[int, int] | None:
         if isinstance(value, bool):
             return DEFAULT_SAMPLE if value else None
         if isinstance(value, (list, tuple)) and len(value) == 2:
@@ -547,8 +550,8 @@ class EpisodeNumber(click.ParamType):
     name = "episode_number"
 
     def convert(
-        self, value: Any, param: Optional[click.Parameter] = None, ctx: Optional[click.Context] = None
-    ) -> Union[int, tuple[int, int]]:
+        self, value: Any, param: click.Parameter | None = None, ctx: click.Context | None = None
+    ) -> int | tuple[int, int]:
         if isinstance(value, bool):
             self.fail(f"'{value}' is not a valid episode number", param, ctx)
         if isinstance(value, int):

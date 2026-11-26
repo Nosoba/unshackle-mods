@@ -7,7 +7,6 @@ import socket
 import ssl
 import threading
 from functools import cache, cached_property, partial
-from typing import Optional
 
 import certifi
 import requests
@@ -15,6 +14,7 @@ import requests
 from unshackle.core.proxies.asn import describe, fold, is_ip, mapped_query, select, split_selector
 from unshackle.core.proxies.controld import build_query, parse_a_records
 from unshackle.core.proxies.proxy import Proxy, cached_catalogue
+from unshackle.core.remote_protocol import APIErrorCode, coded
 from unshackle.core.utilities import COUNTRY_CODE_ALIASES
 
 log = logging.getLogger("proxies.surfsharkvpn")
@@ -25,7 +25,7 @@ CONNECT_TIMEOUT = 30
 CHUNK = 65536
 TLS = ssl.create_default_context(cafile=certifi.where())  # the same CA bundle as requests
 PINS: dict[tuple[str, str], int] = {}
-LOOP: Optional[asyncio.AbstractEventLoop] = None
+LOOP: asyncio.AbstractEventLoop | None = None
 STATE = threading.Lock()
 
 
@@ -83,7 +83,7 @@ def pinned(ip: str, hostname: str) -> int:
 
 
 class SurfsharkVPN(Proxy):
-    def __init__(self, username: str, password: str, server_map: Optional[dict[str, str]] = None) -> None:
+    def __init__(self, username: str, password: str, server_map: dict[str, str] | None = None) -> None:
         """
         Proxy provider that uses SurfsharkVPN Service Credentials.
 
@@ -95,7 +95,10 @@ class SurfsharkVPN(Proxy):
         if not password:
             raise ValueError("No password for the SurfsharkVPN proxy provider")
         if not re.match(r"^[a-z0-9]{48}$", username + password, re.IGNORECASE) or "@" in username:
-            raise ValueError("SurfsharkVPN needs its Service Credentials, not your login credentials")
+            raise coded(
+                ValueError("SurfsharkVPN needs its Service Credentials, not your login credentials"),
+                APIErrorCode.INVALID_PROXY,
+            )
 
         if server_map is not None and not isinstance(server_map, dict):
             raise TypeError(
@@ -118,7 +121,7 @@ class SurfsharkVPN(Proxy):
             country, sep, city = str(region).lower().partition(":")
             self.server_map[COUNTRY_CODE_ALIASES.get(country, country) + sep + city] = server
 
-        self.last_server: Optional[tuple[str, str]] = None
+        self.last_server: tuple[str, str] | None = None
 
     @cached_property
     def countries(self) -> list[dict]:
@@ -131,7 +134,7 @@ class SurfsharkVPN(Proxy):
 
         return f"{countries} Countr{['ies', 'y'][countries == 1]} ({servers} Server{['s', ''][servers == 1]})"
 
-    def get_proxy(self, query: str) -> Optional[str]:
+    def get_proxy(self, query: str) -> str | None:
         """
         Get an HTTP(SSL) proxy URI for a SurfsharkVPN server.
 
@@ -182,7 +185,7 @@ class SurfsharkVPN(Proxy):
         self.last_server = (hostname, ip)
         return f"http://{self.username}:{self.password}@127.0.0.1:{pinned(ip, hostname)}"
 
-    def last_connection_display(self) -> Optional[str]:
+    def last_connection_display(self) -> str | None:
         """Name the pinned server with its IP and network, so it can be pinned again or excluded with '@-'."""
         return describe(*self.last_server) if self.last_server else None
 
@@ -226,7 +229,7 @@ class SurfsharkVPN(Proxy):
         server = server.lower()
         return server if server.endswith(".surfshark.com") else f"{server}.prod.surfshark.com"
 
-    def get_city_servers(self, servers: list[dict], city: Optional[str] = None) -> list[dict]:
+    def get_city_servers(self, servers: list[dict], city: str | None = None) -> list[dict]:
         """
         Get a country's servers, optionally filtered by city.
 
@@ -262,4 +265,4 @@ class SurfsharkVPN(Proxy):
         try:
             return res.json()
         except json.JSONDecodeError:
-            raise ValueError("Could not decode list of SurfsharkVPN countries, not JSON data.")
+            raise ValueError("Could not decode list of SurfsharkVPN countries, not JSON data.") from None

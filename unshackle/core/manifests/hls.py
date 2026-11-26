@@ -9,11 +9,12 @@ import re
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from functools import partial
 from itertools import accumulate
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Optional, Union, cast
+from typing import Any, BinaryIO, cast
 from urllib.parse import urljoin, urlparse
 from uuid import UUID
 from zlib import crc32
@@ -23,8 +24,6 @@ import m3u8
 import requests
 from langcodes import Language, tag_is_valid
 from m3u8 import M3U8
-from pyplayready.system.pssh import PSSH as PR_PSSH
-from pywidevine.cdm import Cdm as WidevineCdm
 from pywidevine.pssh import PSSH as WV_PSSH
 from requests import Session
 
@@ -32,7 +31,8 @@ from unshackle.core import binaries
 from unshackle.core.cdm.detect import cdm_type_stub, is_playready_cdm, is_widevine_cdm
 from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_LICENCE_ONLY, AnyTrack
-from unshackle.core.drm import DRM_T, ClearKey, ClearKeyCENC, MonaLisa, PlayReady, Widevine
+from unshackle.core.drm import DRM_T, ClearKey, ClearKeyCENC, PlayReady, Widevine
+from unshackle.core.drm.cenc import PLAYREADY_ID, WIDEVINE_ID, hls_key_drm, key_data, key_system
 from unshackle.core.drm.segment_decrypt import SegmentDecrypter, can_use
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
@@ -48,7 +48,7 @@ from unshackle.core.manifests.segment_pipeline import (
 )
 from unshackle.core.session import RnetResponse, RnetSession, utf8_text
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Tracks, Video, resume
-from unshackle.core.tracks.track import DRM_PREFERENCE_TYPES, assert_fragments_decrypted
+from unshackle.core.tracks.track import DRM_PREFERENCE_TYPES, Track, assert_fragments_decrypted
 from unshackle.core.utilities import get_extension, is_close_match, log_event, try_ensure_utf8
 from unshackle.core.utils import run_proxy
 from unshackle.core.utils.redact import safe_display_url
@@ -61,9 +61,9 @@ class HLS:
     def __init__(
         self,
         manifest: M3U8,
-        session: Optional[Union[Session, RnetSession]] = None,
-        url: Optional[str] = None,
-        raw_text: Optional[str] = None,
+        session: Session | RnetSession | None = None,
+        url: str | None = None,
+        raw_text: str | None = None,
     ) -> None:
         if not manifest:
             raise ValueError("HLS manifest must be provided.")
@@ -78,7 +78,7 @@ class HLS:
         self.raw_text = raw_text
 
     @classmethod
-    def from_url(cls, url: str, session: Optional[Union[Session, RnetSession]] = None, **args: Any) -> HLS:
+    def from_url(cls, url: str, session: Session | RnetSession | None = None, **args: Any) -> HLS:
         if not url:
             raise requests.URLRequired("HLS manifest URL must be provided.")
         if not isinstance(url, str):
@@ -149,9 +149,7 @@ class HLS:
         return out
 
     @staticmethod
-    def select_audio_codec(
-        candidates: Optional[list[tuple[str, Audio.Codec]]], uri: Optional[str]
-    ) -> Optional[Audio.Codec]:
+    def select_audio_codec(candidates: list[tuple[str, Audio.Codec]] | None, uri: str | None) -> Audio.Codec | None:
         """
         Choose the Audio Codec of one rendition from the codecs its variant declares.
 
@@ -184,7 +182,7 @@ class HLS:
             )
         return candidates[0][1]
 
-    def to_tracks(self, language: Optional[Union[str, Language]]) -> Tracks:
+    def to_tracks(self, language: str | Language | None) -> Tracks:
         """
         Convert a Variant Playlist M3U(8) document to Video, Audio and Subtitle Track objects.
 
@@ -236,8 +234,8 @@ class HLS:
             (raw.get("stream_info") or {}).get("req_video_layout")
             for raw in (getattr(self.manifest, "data", None) or {}).get("playlists", [])
         ]
-        for playlist, video_layout in zip(self.manifest.playlists, video_layouts):
-            video_codec: Optional[Video.Codec] = None
+        for playlist, video_layout in zip(self.manifest.playlists, video_layouts, strict=False):
+            video_codec: Video.Codec | None = None
             primary_track_type: type[Audio] | type[Video]
             try:
                 # TODO: Any better way to figure out the primary track type?
@@ -403,8 +401,8 @@ class HLS:
 
     @staticmethod
     def probe_ts_info(
-        variant_url: str, session: Optional[Union[Session, RnetSession]] = None
-    ) -> Optional[tuple[int, int, Video.Codec]]:
+        variant_url: str, session: Session | RnetSession | None = None
+    ) -> tuple[int, int, Video.Codec] | None:
         """Probe a variant playlist's first segment to extract resolution and codec.
 
         Prefers the fMP4 init segment (EXT-X-MAP): its moov box states the resolution outright and
@@ -456,7 +454,7 @@ class HLS:
     }
 
     @staticmethod
-    def parse_mp4_init_info(data: bytes) -> Optional[tuple[int, int, Video.Codec]]:
+    def parse_mp4_init_info(data: bytes) -> tuple[int, int, Video.Codec] | None:
         """Read resolution and codec from an fMP4 init segment's visual sample entry.
 
         Walks moov > trak > mdia > minf > stbl > stsd and reads the width/height of the first
@@ -465,7 +463,7 @@ class HLS:
         """
         CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
 
-        def walk(buf: bytes, start: int, end: int) -> Optional[tuple[int, int, Video.Codec]]:
+        def walk(buf: bytes, start: int, end: int) -> tuple[int, int, Video.Codec] | None:
             pos = start
             while pos + 8 <= end:
                 size = int.from_bytes(buf[pos : pos + 4], "big")
@@ -517,7 +515,7 @@ class HLS:
             return None
 
     @staticmethod
-    def find_original_format(buf: bytes, start: int, end: int) -> Optional[Video.Codec]:
+    def find_original_format(buf: bytes, start: int, end: int) -> Video.Codec | None:
         """Find the codec named by a frma box inside a protected sample entry's sinf/rinf."""
         pos = start
         while pos + 8 <= end:
@@ -553,7 +551,7 @@ class HLS:
         return HLS.MIN_PLAUSIBLE_ASPECT <= (width / height) <= HLS.MAX_PLAUSIBLE_ASPECT
 
     @staticmethod
-    def parse_ts_video_info(data: bytes) -> Optional[tuple[int, int, Video.Codec]]:
+    def parse_ts_video_info(data: bytes) -> tuple[int, int, Video.Codec] | None:
         """Parse H.264/H.265 NAL units from TS segment data to extract resolution and codec.
 
         Returns None when no SPS yields a plausible resolution, leaving the track's width/height
@@ -716,10 +714,10 @@ class HLS:
 
     @staticmethod
     def resolve_segment_key(
-        segment_keys: list[Union[m3u8.model.SessionKey, m3u8.model.Key]],
+        segment_keys: list[m3u8.model.SessionKey | m3u8.model.Key],
         cdm: object,
-        drm_preference: Optional[str] = None,
-    ) -> Optional[m3u8.Key]:
+        drm_preference: str | None = None,
+    ) -> m3u8.Key | None:
         """Pick the EXT-X-KEY for a segment, preferring one the CDM can handle."""
         if cdm:
             cdm_segment_keys = HLS.filter_keys_for_cdm(segment_keys, cdm, drm_preference)
@@ -729,7 +727,7 @@ class HLS:
 
     @staticmethod
     def fetch_init_section(
-        session: Union[Session, RnetSession],
+        session: Session | RnetSession,
         init_section: m3u8.model.InitializationSection,
         range_offset: int,
     ) -> tuple[bytes, int]:
@@ -754,9 +752,9 @@ class HLS:
     @staticmethod
     def single_init_no_rotation(
         wanted_segments: list[Any],
-        initial_key: Optional[m3u8.Key],
+        initial_key: m3u8.Key | None,
         cdm: object,
-        drm_preference: Optional[str] = None,
+        drm_preference: str | None = None,
     ) -> bool:
         """Whether every wanted segment shares one init segment and one EXT-X-KEY, with no discontinuity.
 
@@ -853,7 +851,6 @@ class HLS:
                 )
                 media_drm = HLS.get_drm(media_playlist_key, session, **({"kid": init_kid} if init_kid else {}))
                 if isinstance(media_drm, (Widevine, PlayReady)):
-                    track_kid = init_kid or media_drm.kid
                     # Preserve pre-existing keys (e.g. from server_cdm)
                     if track.drm:
                         for existing_drm in track.drm:
@@ -862,8 +859,7 @@ class HLS:
                     track.drm = [media_drm]
                     if DOWNLOAD_ALL_DRM.is_set():
                         track.drm += HLS.alternate_drm(media_keys, media_drm, session, init_kid)
-                    with licensing(ctx):
-                        license_drm(media_drm, ctx, track_kid=track_kid)
+                    license_drm(track, media_drm, ctx, init_kid)
                     initial_drm_licensed = True
                     initial_drm_key = media_playlist_key
                     session_drm = media_drm
@@ -874,14 +870,8 @@ class HLS:
                     initial_drm_key = media_playlist_key
                     initial_drm_licensed = True
 
-        if not initial_drm_licensed and session_drm and isinstance(session_drm, (Widevine, PlayReady)):
-            with licensing(ctx):
-                track_kid = HLS.get_track_kid_from_init(master, track, session) or session_drm.kid
-                license_drm(session_drm, ctx, track_kid=track_kid)
-
-        if not initial_drm_licensed and session_drm and isinstance(session_drm, MonaLisa):
-            with licensing(ctx):
-                license_drm(session_drm, ctx)
+        if not initial_drm_licensed:
+            license_drm(track, session_drm, ctx, probe=lambda: HLS.get_track_kid_from_init(master, track, session))
 
         if DOWNLOAD_LICENCE_ONLY.is_set():
             # a playlist can change its key part-way, and only the download loop licenses the later keys
@@ -894,8 +884,7 @@ class HLS:
                     continue
                 licensed_keys.append(key)
                 later_drm = HLS.get_drm_or_probe(key, master, track, session, segment.init_section)
-                if isinstance(later_drm, (Widevine, PlayReady)) and license_widevine:
-                    license_widevine(later_drm, track_kid=later_drm.kid)
+                license_drm(track, later_drm, ctx)
             progress(downloaded="[yellow]SKIPPED")
             return
 
@@ -979,8 +968,8 @@ class HLS:
             },
         )
 
-        map_data: Optional[tuple[m3u8.model.InitializationSection, bytes]] = None
-        segment_decrypter: Optional[SegmentDecrypter] = None
+        map_data: tuple[m3u8.model.InitializationSection, bytes] | None = None
+        segment_decrypter: SegmentDecrypter | None = None
         if use_segment_decrypt or use_rolling_merge:
             init_section = wanted_segments[0].init_section
             init_content, _ = HLS.fetch_init_section(session, init_section, 0)
@@ -997,7 +986,7 @@ class HLS:
             "HLS",
             urls,
             segment_save_dir,
-            "{i:0%d}{ext}" % len(str(len(urls))),
+            f"{{i:0{len(str(len(urls)))}}}{{ext}}",
             rolling=use_rolling_merge,
             init=map_data[1] if map_data else None,
             decrypter=segment_decrypter,
@@ -1040,9 +1029,139 @@ class HLS:
         # First segment's Media Sequence Number - used as the AES-128 IV when EXT-X-KEY has
         # no explicit IV (RFC 8216 §5.2), where each segment's IV is its sequence number.
         media_sequence_start = getattr(master, "media_sequence", None) or 0
-        encryption_data: Optional[tuple[Optional[m3u8.Key], DRM_T]] = None
+        encryption_data: tuple[m3u8.Key | None, DRM_T] | None = None
         if session_drm:
             encryption_data = (initial_drm_key, session_drm)
+
+        def merge(to: Path, via: list[Path], delete: bool = False, include_map_data: bool = False) -> None:
+            """
+            Merge all files to a given path, optionally including map data.
+
+            Parameters:
+                to: The output file with all merged data.
+                via: List of files to merge, in sequence.
+                delete: Delete each source file after this function merges it.
+                include_map_data: Whether to include the init map data.
+            """
+            prepend = include_map_data and map_data and map_data[1]
+            if len(via) == 1 and not prepend and delete:
+                try:
+                    os.replace(via[0], to)
+                    return
+                except OSError:
+                    pass
+            with open(to, "wb") as x:
+                if prepend:
+                    assert map_data is not None
+                    x.write(map_data[1])
+                for file in via:
+                    with open(file, "rb") as segment:
+                        shutil.copyfileobj(segment, x, 1024 * 1024)
+                    x.flush()
+                    if delete:
+                        file.unlink()
+
+        def decrypt(include_this_segment: bool) -> Path | None:
+            """
+            Decrypt all segments that uses the currently set DRM.
+
+            This function merges every segment of this DRM together in sequence, adds
+            the init data (if any) at the start, and then deletes the segment files. It
+            then decrypts the merged file. The merged and decrypted file names state the
+            range of segments the file holds.
+
+            Parameters:
+                include_this_segment: Whether to include the current segment in the
+                    list of segments to merge and decrypt. This should be False if
+                    decrypting on EXT-X-KEY changes, or True when decrypting on the
+                    last segment.
+
+            Returns the decrypted path.
+            """
+            nonlocal map_data
+            assert encryption_data is not None
+            drm = encryption_data[1]
+            first_segment_i = next(
+                (int(file.stem) for file in sorted(segment_save_dir.iterdir()) if file.stem.isdigit()), None
+            )
+            last_segment_i = max(0, i - int(not include_this_segment))
+            if first_segment_i is None or first_segment_i > last_segment_i:
+                return None
+            range_len = (last_segment_i - first_segment_i) + 1
+
+            segment_range = f"{str(first_segment_i).zfill(name_len)}-{str(last_segment_i).zfill(name_len)}"
+            ext = get_extension(wanted_segments[last_segment_i].uri) or ""
+            merged_path = segment_save_dir / f"{segment_range}{ext}"
+            decrypted_path = segment_save_dir / f"{merged_path.stem}_decrypted{merged_path.suffix}"
+
+            files = [
+                file
+                for file in sorted(segment_save_dir.iterdir())
+                if file.stem.isdigit() and first_segment_i <= int(file.stem) <= last_segment_i
+            ]
+            if not files:
+                raise ValueError(f"None of the segment files for {segment_range} exist...")
+            elif len(files) != range_len:
+                raise ValueError(f"Missing {range_len - len(files)} segment files for {segment_range}...")
+
+            if isinstance(drm, (Widevine, PlayReady)):
+                if segment_decrypter:
+                    if not map_data:
+                        raise ValueError("Segment decryption needs an EXT-X-MAP init segment.")
+                    assert decrypted_init is not None
+                    map_data = (map_data[0], decrypted_init)
+                merge(to=merged_path, via=files, delete=True, include_map_data=True)
+                decrypt_track(drm, merged_path, license_widevine, decrypt=not segment_decrypter, track=track)
+                assert_fragments_decrypted(merged_path)
+                merged_path.rename(decrypted_path)
+            else:
+                # AES segments must be decrypted individually before merging: each segment
+                # likely carries its own 16-byte padding
+                key_obj = encryption_data[0]
+                # AES-128 with no explicit IV: each segment's IV is its media sequence
+                # number (RFC 8216 §5.2). Without this the engine used a zero IV and the
+                # output decrypted to garbage.
+                seq_iv = isinstance(drm, ClearKey) and not (key_obj and key_obj.iv)
+                for file in files:
+                    if seq_iv and isinstance(drm, ClearKey) and file.stem.isdigit():
+                        download_i = int(file.stem)
+                        seq = getattr(wanted_segments[download_i], "media_sequence", None)
+                        if seq is None:
+                            seq = media_sequence_start + download_i
+                        drm.iv = int(seq).to_bytes(16, "big")
+                    drm.decrypt(file)
+                merge(to=merged_path, via=files, delete=True, include_map_data=True)
+
+            events.emit(events.Types.TRACK_DECRYPTED, track=track, drm=drm, segment=decrypted_path)
+
+            return decrypted_path
+
+        def merge_discontinuity(include_this_segment: bool, include_map_data: bool = True) -> None:
+            """
+            Merge all segments of the discontinuity.
+
+            The caller must download every segment file of this discontinuity first.
+            The caller must also decrypt them, when they need decryption.
+
+            Parameters:
+                include_this_segment: Whether to include the current segment in the
+                    list of segments to merge and decrypt. This should be False if
+                    decrypting on EXT-X-KEY changes, or True when decrypting on the
+                    last segment.
+                include_map_data: Whether to prepend the init map data before the
+                    segment files when merging.
+            """
+            last_segment_i = max(0, i - int(not include_this_segment))
+
+            files = [
+                file
+                for file in sorted(segment_save_dir.iterdir())
+                if int(file.stem.replace("_decrypted", "").split("-")[-1]) <= last_segment_i
+            ]
+            if files:
+                to_dir = segment_save_dir.parent
+                to_path = to_dir / f"{str(discon_i).zfill(name_len)}{files[-1].suffix}"
+                merge(to=to_path, via=files, delete=True, include_map_data=include_map_data)
 
         i = -1
         for real_i, segment in enumerate(master.segments):
@@ -1050,136 +1169,6 @@ class HLS:
                 i += 1
 
             is_last_segment = (real_i + 1) == len(master.segments)
-
-            def merge(to: Path, via: list[Path], delete: bool = False, include_map_data: bool = False) -> None:
-                """
-                Merge all files to a given path, optionally including map data.
-
-                Parameters:
-                    to: The output file with all merged data.
-                    via: List of files to merge, in sequence.
-                    delete: Delete each source file after this function merges it.
-                    include_map_data: Whether to include the init map data.
-                """
-                prepend = include_map_data and map_data and map_data[1]
-                if len(via) == 1 and not prepend and delete:
-                    try:
-                        os.replace(via[0], to)
-                        return
-                    except OSError:
-                        pass
-                with open(to, "wb") as x:
-                    if prepend:
-                        assert map_data is not None
-                        x.write(map_data[1])
-                    for file in via:
-                        with open(file, "rb") as segment:
-                            shutil.copyfileobj(segment, x, 1024 * 1024)
-                        x.flush()
-                        if delete:
-                            file.unlink()
-
-            def decrypt(include_this_segment: bool) -> Optional[Path]:
-                """
-                Decrypt all segments that uses the currently set DRM.
-
-                This function merges every segment of this DRM together in sequence, adds
-                the init data (if any) at the start, and then deletes the segment files. It
-                then decrypts the merged file. The merged and decrypted file names state the
-                range of segments the file holds.
-
-                Parameters:
-                    include_this_segment: Whether to include the current segment in the
-                        list of segments to merge and decrypt. This should be False if
-                        decrypting on EXT-X-KEY changes, or True when decrypting on the
-                        last segment.
-
-                Returns the decrypted path.
-                """
-                nonlocal map_data
-                assert encryption_data is not None
-                drm = encryption_data[1]
-                first_segment_i = next(
-                    (int(file.stem) for file in sorted(segment_save_dir.iterdir()) if file.stem.isdigit()), None
-                )
-                last_segment_i = max(0, i - int(not include_this_segment))
-                if first_segment_i is None or first_segment_i > last_segment_i:
-                    return None
-                range_len = (last_segment_i - first_segment_i) + 1
-
-                segment_range = f"{str(first_segment_i).zfill(name_len)}-{str(last_segment_i).zfill(name_len)}"
-                ext = get_extension(wanted_segments[last_segment_i].uri) or ""
-                merged_path = segment_save_dir / f"{segment_range}{ext}"
-                decrypted_path = segment_save_dir / f"{merged_path.stem}_decrypted{merged_path.suffix}"
-
-                files = [
-                    file
-                    for file in sorted(segment_save_dir.iterdir())
-                    if file.stem.isdigit() and first_segment_i <= int(file.stem) <= last_segment_i
-                ]
-                if not files:
-                    raise ValueError(f"None of the segment files for {segment_range} exist...")
-                elif len(files) != range_len:
-                    raise ValueError(f"Missing {range_len - len(files)} segment files for {segment_range}...")
-
-                if isinstance(drm, (Widevine, PlayReady)):
-                    if segment_decrypter:
-                        if not map_data:
-                            raise ValueError("Segment decryption needs an EXT-X-MAP init segment.")
-                        assert decrypted_init is not None
-                        map_data = (map_data[0], decrypted_init)
-                    merge(to=merged_path, via=files, delete=True, include_map_data=True)
-                    decrypt_track(drm, merged_path, license_widevine, decrypt=not segment_decrypter)
-                    assert_fragments_decrypted(merged_path)
-                    merged_path.rename(decrypted_path)
-                else:
-                    # AES segments must be decrypted individually before merging: each segment
-                    # likely carries its own 16-byte padding
-                    key_obj = encryption_data[0]
-                    # AES-128 with no explicit IV: each segment's IV is its media sequence
-                    # number (RFC 8216 §5.2). Without this the engine used a zero IV and the
-                    # output decrypted to garbage.
-                    seq_iv = isinstance(drm, ClearKey) and not (key_obj and key_obj.iv)
-                    for file in files:
-                        if seq_iv and isinstance(drm, ClearKey) and file.stem.isdigit():
-                            download_i = int(file.stem)
-                            seq = getattr(wanted_segments[download_i], "media_sequence", None)
-                            if seq is None:
-                                seq = media_sequence_start + download_i
-                            drm.iv = int(seq).to_bytes(16, "big")
-                        drm.decrypt(file)
-                    merge(to=merged_path, via=files, delete=True, include_map_data=True)
-
-                events.emit(events.Types.TRACK_DECRYPTED, track=track, drm=drm, segment=decrypted_path)
-
-                return decrypted_path
-
-            def merge_discontinuity(include_this_segment: bool, include_map_data: bool = True) -> None:
-                """
-                Merge all segments of the discontinuity.
-
-                The caller must download every segment file of this discontinuity first.
-                The caller must also decrypt them, when they need decryption.
-
-                Parameters:
-                    include_this_segment: Whether to include the current segment in the
-                        list of segments to merge and decrypt. This should be False if
-                        decrypting on EXT-X-KEY changes, or True when decrypting on the
-                        last segment.
-                    include_map_data: Whether to prepend the init map data before the
-                        segment files when merging.
-                """
-                last_segment_i = max(0, i - int(not include_this_segment))
-
-                files = [
-                    file
-                    for file in sorted(segment_save_dir.iterdir())
-                    if int(file.stem.replace("_decrypted", "").split("-")[-1]) <= last_segment_i
-                ]
-                if files:
-                    to_dir = segment_save_dir.parent
-                    to_path = to_dir / f"{str(discon_i).zfill(name_len)}{files[-1].suffix}"
-                    merge(to=to_path, via=files, delete=True, include_map_data=include_map_data)
 
             if segment not in unwanted_segments:
                 if isinstance(track, Subtitle):
@@ -1224,8 +1213,7 @@ class HLS:
                     with licensing(ctx):
                         init_kid = track.get_key_id(map_data[1]) if map_data and key.method != "AES-128" else None
                         drm = HLS.get_drm(key, session, **({"kid": init_kid} if init_kid else {}))
-                        if isinstance(drm, (Widevine, PlayReady)):
-                            license_drm(drm, ctx, track_kid=init_kid or drm.kid)
+                    license_drm(track, drm, ctx, init_kid)
                     if (
                         encryption_data
                         and isinstance(drm, (Widevine, PlayReady))
@@ -1349,7 +1337,7 @@ class HLS:
         return plain
 
     @staticmethod
-    def merge_segments(segments: list[Path], save_path: Path, progress: Optional[Any] = None) -> int:
+    def merge_segments(segments: list[Path], save_path: Path, progress: Any | None = None) -> int:
         """
         Concatenate Segments using FFmpeg concat with binary fallback.
 
@@ -1455,9 +1443,7 @@ class HLS:
         return save_path.stat().st_size
 
     @staticmethod
-    def parse_session_data_keys(
-        manifest: M3U8, session: Optional[Union[Session, RnetSession]] = None
-    ) -> list[m3u8.model.Key]:
+    def parse_session_data_keys(manifest: M3U8, session: Session | RnetSession | None = None) -> list[m3u8.model.Key]:
         """Parse the `com.apple.hls.keys` `EXT-X-SESSION-DATA` entry into `Key` objects."""
         keys: list[m3u8.model.Key] = []
 
@@ -1494,25 +1480,17 @@ class HLS:
                     keyformat=item.get("keyformat"),
                     keyformatversions=",".join(item.get("keyformatversion") or item.get("keyformatversions") or []),
                 )
-                if key.method in {"AES-128", "ISO-23001-7"} or (
-                    key.keyformat
-                    and key.keyformat.lower()
-                    in {
-                        WidevineCdm.urn,
-                        f"urn:uuid:{PR_PSSH.SYSTEM_ID}",
-                        "com.microsoft.playready",
-                    }
-                ):
+                if key.method in {"AES-128", "ISO-23001-7"} or key_system(key):
                     keys.append(key)
 
         return keys
 
     @staticmethod
     def filter_keys_for_cdm(
-        keys: list[Union[m3u8.model.SessionKey, m3u8.model.Key]],
+        keys: list[m3u8.model.SessionKey | m3u8.model.Key],
         cdm: object,
-        drm_preference: Optional[str] = None,
-    ) -> list[Union[m3u8.model.SessionKey, m3u8.model.Key]]:
+        drm_preference: str | None = None,
+    ) -> list[m3u8.model.SessionKey | m3u8.model.Key]:
         """
         Filter EXT-X-KEY entries to only include those matching the CDM type.
 
@@ -1522,13 +1500,11 @@ class HLS:
         A track's drm_preference wins over the CDM. If the playlist has no EXT-X-KEY entry
         for it, the CDM decides as usual.
         """
-        playready_urn = f"urn:uuid:{PR_PSSH.SYSTEM_ID}"
-        playready_keyformats = {playready_urn, "com.microsoft.playready"}
         if drm_preference:
             if DRM_PREFERENCE_TYPES[drm_preference] is PlayReady:
-                preferred = [k for k in keys if k.keyformat and k.keyformat.lower() in playready_keyformats]
+                preferred = [k for k in keys if key_system(k) == PLAYREADY_ID]
             else:
-                preferred = [k for k in keys if k.keyformat and k.keyformat.lower() == WidevineCdm.urn]
+                preferred = [k for k in keys if key_system(k) == WIDEVINE_ID]
             if preferred:
                 return preferred
             logging.getLogger("HLS").warning(
@@ -1536,17 +1512,17 @@ class HLS:
                 "using the CDM's DRM instead"
             )
         if is_widevine_cdm(cdm):
-            return [k for k in keys if k.keyformat and k.keyformat.lower() == WidevineCdm.urn]
+            return [k for k in keys if key_system(k) == WIDEVINE_ID]
         elif is_playready_cdm(cdm):
-            return [k for k in keys if k.keyformat and k.keyformat.lower() in playready_keyformats]
+            return [k for k in keys if key_system(k) == PLAYREADY_ID]
         return keys
 
     @staticmethod
     def alternate_drm(
-        keys: list[Union[m3u8.model.SessionKey, m3u8.model.Key]],
+        keys: list[m3u8.model.SessionKey | m3u8.model.Key],
         chosen: DRM_T,
-        session: Optional[Union[Session, RnetSession]] = None,
-        kid: Optional[UUID] = None,
+        session: Session | RnetSession | None = None,
+        kid: UUID | None = None,
     ) -> list[DRM_T]:
         """Build the Widevine or PlayReady DRM that the EXT-X-KEY entries offer next to ``chosen``.
 
@@ -1565,10 +1541,10 @@ class HLS:
     @staticmethod
     def get_track_kid_from_init(
         master: M3U8,
-        track: AnyTrack,
-        session: Union[Session, RnetSession],
-        init_section: Optional[m3u8.model.InitializationSection] = None,
-    ) -> Optional[UUID]:
+        track: Track,
+        session: Session | RnetSession,
+        init_section: m3u8.model.InitializationSection | None = None,
+    ) -> UUID | None:
         """
         Extract the track's Key ID from an init segment (EXT-X-MAP), by default the first in the playlist.
 
@@ -1599,7 +1575,7 @@ class HLS:
         return None
 
     @staticmethod
-    def get_supported_key(keys: list[Union[m3u8.model.SessionKey, m3u8.model.Key]]) -> Optional[m3u8.Key]:
+    def get_supported_key(keys: list[m3u8.model.SessionKey | m3u8.model.Key]) -> m3u8.Key | None:
         """
         Get the first DRM system unshackle can use from the given `EXT-X-KEY` entries.
 
@@ -1624,12 +1600,7 @@ class HLS:
                 return key
             elif key.method == "ISO-23001-7":
                 return key
-            elif key.keyformat and key.keyformat.lower() == WidevineCdm.urn:
-                return key
-            elif key.keyformat and key.keyformat.lower() in {
-                f"urn:uuid:{PR_PSSH.SYSTEM_ID}",
-                "com.microsoft.playready",
-            }:
+            elif key_system(key):
                 return key
             else:
                 unsupported_systems.append(key.method + (f" ({key.keyformat})" if key.keyformat else ""))
@@ -1638,9 +1609,9 @@ class HLS:
 
     @staticmethod
     def get_drm(
-        key: Union[m3u8.model.SessionKey, m3u8.model.Key],
-        session: Optional[Union[Session, RnetSession]] = None,
-        kid: Optional[UUID] = None,
+        key: m3u8.model.SessionKey | m3u8.model.Key,
+        session: Session | RnetSession | None = None,
+        kid: UUID | None = None,
     ) -> DRM_T:
         """
         Convert HLS EXT-X-KEY data to an initialized DRM object.
@@ -1664,23 +1635,9 @@ class HLS:
         if key.method == "AES-128":
             drm = ClearKey.from_m3u_key(key, session)
         elif key.method == "ISO-23001-7":
-            drm = Widevine(pssh=WV_PSSH.new(key_ids=[key.uri.split(",")[-1]], system_id=WV_PSSH.SystemId.Widevine))
-        elif key.keyformat and key.keyformat.lower() == WidevineCdm.urn:
-            extra_params = dict(key._extra_params)  # noqa
-            pssh = WV_PSSH(key.uri.split(",")[-1])
-            if kid in Widevine.PLACEHOLDER_KIDS or any(k not in Widevine.PLACEHOLDER_KIDS for k in pssh.key_ids):
-                kid = None
-            # a v0 PSSH can carry no KID: the tag's own KEYID is the first source, the init segment the last
-            tag_kid = extra_params.pop("keyid", None) or extra_params.pop("kid", None)
-            if isinstance(tag_kid, str):
-                tag_kid = tag_kid.removeprefix("0x").removeprefix("0X")
-            drm = Widevine(
-                pssh=pssh,
-                kid=tag_kid or kid,
-                **extra_params,
-            )
-        elif key.keyformat and key.keyformat.lower() in {f"urn:uuid:{PR_PSSH.SYSTEM_ID}", "com.microsoft.playready"}:
-            drm = PlayReady.from_pssh_b64(key.uri.split(",")[-1])
+            drm = Widevine(pssh=WV_PSSH.new(key_ids=[key_data(key)], system_id=WV_PSSH.SystemId.Widevine))
+        elif cenc_drm := hls_key_drm(key, kid):
+            drm = cenc_drm
         else:
             raise NotImplementedError(f"The key system is not supported: {key}")
 
@@ -1688,11 +1645,11 @@ class HLS:
 
     @staticmethod
     def get_drm_or_probe(
-        key: Union[m3u8.model.SessionKey, m3u8.model.Key],
+        key: m3u8.model.SessionKey | m3u8.model.Key,
         master: M3U8,
-        track: AnyTrack,
-        session: Optional[Union[Session, RnetSession]] = None,
-        init_section: Optional[m3u8.model.InitializationSection] = None,
+        track: Track,
+        session: Session | RnetSession | None = None,
+        init_section: m3u8.model.InitializationSection | None = None,
         probe_session: Any = None,
     ) -> DRM_T:
         """
@@ -1711,9 +1668,7 @@ class HLS:
             return HLS.get_drm(key, session, kid=kid)
 
     @staticmethod
-    def get_all_drm(
-        keys: list[Union[m3u8.model.SessionKey, m3u8.model.Key]], proxy: Optional[str] = None
-    ) -> list[DRM_T]:
+    def get_all_drm(keys: list[m3u8.model.SessionKey | m3u8.model.Key], proxy: str | None = None) -> list[DRM_T]:
         """
         Convert HLS EXT-X-KEY data to initialized DRM objects.
 

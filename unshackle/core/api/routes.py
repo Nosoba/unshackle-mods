@@ -4,7 +4,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any, Optional
+from typing import Any
 
 import click
 from aiohttp import web
@@ -41,28 +41,28 @@ from unshackle.core.api.handlers import (
     download_job_events_handler,
     download_job_input_handler,
     env_check_handler,
-    get_allowed_services,
     get_download_job_handler,
-    is_admin,
     list_download_jobs_handler,
     list_titles_handler,
     list_tracks_handler,
+    owns_job,
     prioritize_download_job_handler,
     profiles_handler,
     refresh_services_handler,
     remote_login_input_handler,
     remote_logins_handler,
     remote_services_info,
+    request_policy,
     retry_download_job_handler,
     search_handler,
     server_account_regions,
-    server_accounts_allowed,
     server_config_handler,
     session_bad_key_handler,
     session_channel_handler,
     session_create_handler,
     session_delete_handler,
     session_info_handler,
+    session_keys_handler,
     session_license_handler,
     session_logs_handler,
     session_prompt_get_handler,
@@ -82,6 +82,7 @@ from unshackle.core.remote_protocol import (
     BAD_KEY_ROUTE,
     CHANNEL_ROUTE,
     HEALTH_ROUTE,
+    KEYS_ROUTE,
     LICENSE_ROUTE,
     LOGS_ROUTE,
     PROMPT_ROUTE,
@@ -182,7 +183,7 @@ def categorized(handler: Handler) -> Handler:
 MAX_LOGIN_BODY_BYTES = 8 * 1024 * 1024
 
 
-async def json_body(request: web.Request, max_size: Optional[int] = None) -> Any:
+async def json_body(request: web.Request, max_size: int | None = None) -> Any:
     """The request's JSON object; raises INVALID_INPUT when it does not parse or is not an object.
 
     ``max_size`` replaces the body limit of the application for this read.
@@ -254,10 +255,10 @@ def heartbeat(handler: Handler) -> Handler:
 
 
 UPDATE_CHECK_TTL = 300.0
-UPDATE_CHECK: list[tuple[float, Optional[str]]] = []
+UPDATE_CHECK: list[tuple[float, str | None]] = []
 
 
-async def latest_release() -> Optional[str]:
+async def latest_release() -> str | None:
     """The newer release the update check reports, kept for ``UPDATE_CHECK_TTL`` seconds: clients poll health."""
     if UPDATE_CHECK and time.monotonic() - UPDATE_CHECK[0][0] < UPDATE_CHECK_TTL:
         return UPDATE_CHECK[0][1]
@@ -566,7 +567,8 @@ async def services(request: web.Request) -> web.Response:
     """
     try:
         service_tags = Services.get_tags()
-        allowed = get_allowed_services(request)
+        policy = request_policy(request)
+        allowed = policy.services
         if allowed is not None:
             service_tags = [t for t in service_tags if t in allowed]
         if remote := request.query.get("remote"):
@@ -579,7 +581,7 @@ async def services(request: web.Request) -> web.Response:
             service_data: dict[str, Any] = {**catalogue[tag]}
             if tag in services_module.PENDING:
                 service_data["pending_update"] = True
-            if server_accounts_allowed(request, tag) and (server_accounts := server_account_regions(tag)) is not None:
+            if policy.allows("server_accounts", tag) and (server_accounts := server_account_regions(tag)) is not None:
                 service_data["server_accounts"] = server_accounts
 
             services_info.append(service_data)
@@ -587,7 +589,7 @@ async def services(request: web.Request) -> web.Response:
         # an import error names services outside the caller's allowlist
         load_errors = (
             [redact_path(re.sub(r" \([^()]*\)$", "", err)) for err in services_module.LOAD_ERRORS]
-            if is_admin(request)
+            if policy.admin
             else []
         )
         return web.json_response({"services": services_info, "load_errors": load_errors})
@@ -1157,7 +1159,7 @@ async def download(request: web.Request) -> web.Response:
                 description: Export manifest, DRM init data, keys, and track info to a JSON file in the exports directory (default - false)
               cdm_only:
                 type: boolean
-                description: Only use CDM for content key retrieval (true) or only vaults (false) (default - None)
+                description: Only use CDM for content key retrieval (true) or only vaults (false). With `remote`, true licenses every track with the CDM of this server and uses no CDM or vault of the remote server (default - None)
               cdm:
                 type: string
                 description: CDM device name on the server to license with, overriding the cdm config mapping. Requires serve.cdm_overrides to allow it (default - None)
@@ -1190,9 +1192,9 @@ async def download(request: web.Request) -> web.Response:
               daily:
                 type: boolean
                 description: Treat the title as daily content and fill missing air dates from TVDB. Needs enrich (default - false)
-              folder:
+              no_folder:
                 type: boolean
-                description: Enable folder creation for TV shows (default - false)
+                description: Disable folder creation for TV shows (default - false)
               no_source:
                 type: boolean
                 description: Disable source tag from output file name (default - false)
@@ -1622,6 +1624,190 @@ async def download_job_input(request: web.Request) -> web.Response:
     job_id = request.match_info["job_id"]
     data = await json_body(request)
     return await download_job_input_handler(data, job_id, request)
+
+
+def _owned_job(request: web.Request) -> tuple[str, Any]:
+    """The request's job, or JOB_NOT_FOUND when it is missing or owned by another key."""
+    from unshackle.core.api.download_manager import get_download_manager
+
+    job_id = request.match_info["job_id"]
+    job = get_download_manager().get_job(job_id)
+    if not job or not owns_job(job, request):
+        raise APIError(APIErrorCode.JOB_NOT_FOUND, "Job not found", details={"job_id": job_id})
+    return job_id, job
+
+
+@api_handler
+async def job_output_files(request: web.Request) -> web.Response:
+    """
+    List a job's output files.
+    ---
+    summary: List job output files
+    description: List the download outputs a job produced, as upload indices.
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    responses:
+      '200':
+        description: Output files
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      index:
+                        type: integer
+                      name:
+                        type: string
+                      size:
+                        type: integer
+      '404':
+        description: Job not found
+    """
+    from unshackle.core.api import upload
+
+    _job_id, job = _owned_job(request)
+    files = []
+    for index in range(len(getattr(job, "output_files", None) or [])):
+        try:
+            _path, name, size = upload.resolve_job_file(job, index)
+        except APIError:
+            continue
+        files.append({"index": index, "name": name, "size": size})
+    return web.json_response({"files": files})
+
+
+@api_handler
+async def upload_job_file(request: web.Request) -> web.Response:
+    """
+    Upload a job output file to the host.
+    ---
+    summary: Upload a job output file
+    description: >
+      Start a Buzzheavier upload (falling back to Gofile) for one output file. Poll
+      GET /api/download/jobs/{job_id}/upload-file/{index} for the result. A file larger than
+      `max_bytes` is deleted instead of uploaded and reports `quota_exceeded`.
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              index:
+                type: integer
+              max_bytes:
+                type: integer
+              folder_id:
+                type: string
+    responses:
+      '200':
+        description: Upload started or already cached
+      '400':
+        description: Invalid file index
+      '404':
+        description: Job not found
+    """
+    from unshackle.core.api import upload
+
+    data = await json_body(request)
+    job_id, job = _owned_job(request)
+    index = data.get("index", 0)
+    path, name, size = upload.resolve_job_file(job, index)
+    result = upload.start_upload(
+        job_id, index, path, name, size, data.get("max_bytes", 2**63), data.get("folder_id")
+    )
+    return web.json_response(result)
+
+
+@api_handler
+async def upload_job_file_status(request: web.Request) -> web.Response:
+    """
+    Poll a job output file upload.
+    ---
+    summary: Poll job output upload
+    description: The upload result, or a status of uploading while it runs.
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: index
+        in: path
+        required: true
+        schema:
+          type: integer
+    responses:
+      '200':
+        description: Upload result
+      '404':
+        description: Job not found or no upload started
+      '424':
+        description: Upload failed upstream
+    """
+    from unshackle.core.api import upload
+
+    job_id, _job = _owned_job(request)
+    index = request.match_info["index"]
+    if not index.isdigit():
+        raise APIError(APIErrorCode.INVALID_INPUT, "index must be a non-negative integer")
+    return web.json_response(upload.upload_status(job_id, int(index)))
+
+
+@api_handler
+async def delete_job_file(request: web.Request) -> web.Response:
+    """
+    Delete an uploaded job output file.
+    ---
+    summary: Delete an uploaded job output file
+    description: Delete a job output from disk after its upload link was posted.
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              index:
+                type: integer
+    responses:
+      '200':
+        description: Deletion result
+      '400':
+        description: Invalid file index
+      '404':
+        description: Job not found
+      '409':
+        description: File was not uploaded
+    """
+    from unshackle.core.api import upload
+
+    data = await json_body(request)
+    job_id, job = _owned_job(request)
+    index = data.get("index", 0)
+    path, _name, _size = upload.resolve_job_file(job, index)
+    return web.json_response(await upload.delete_uploaded_job_file(job_id, index, path))
 
 
 @api_handler
@@ -2492,6 +2678,52 @@ async def session_bad_key(request: web.Request) -> web.Response:
     session_id = request.match_info["session_id"]
     data = await json_body(request)
     return await session_bad_key_handler(data, session_id, request)
+
+
+@api_handler
+async def session_keys(request: web.Request) -> web.Response:
+    """
+    Store the content keys a client proved on a track in the server vaults.
+    ---
+    summary: Store proven content keys
+    description: >-
+      The client decrypted a track and the output decoded. It sends the content keys that the server
+      did not serve to this remote session. The server stores a content key only for a KID that a
+      track of the remote session names and that no server vault holds a content key for, and never
+      a pair flagged bad. The reply is always empty.
+    parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required:
+              - track_id
+              - keys
+            properties:
+              track_id:
+                type: string
+                description: The track the keys decrypted
+              keys:
+                type: object
+                description: Content key as hex, by KID as hex
+                additionalProperties:
+                  type: string
+    responses:
+      '200':
+        description: An empty object, whatever the server stored
+      '404':
+        description: Remote session not found
+    """
+    session_id = request.match_info["session_id"]
+    data = await json_body(request)
+    return await session_keys_handler(data, session_id, request)
 
 
 @api_handler
@@ -3452,6 +3684,10 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("POST", "/api/download/jobs/{job_id}/retry", retry_download_job, False),
     ("POST", "/api/download/jobs/{job_id}/priority", prioritize_download_job, False),
     ("POST", "/api/download/jobs/{job_id}/input", download_job_input, False),
+    ("GET", "/api/download/jobs/{job_id}/output-files", job_output_files, False),
+    ("POST", "/api/download/jobs/{job_id}/upload-file", upload_job_file, False),
+    ("GET", "/api/download/jobs/{job_id}/upload-file/{index}", upload_job_file_status, False),
+    ("DELETE", "/api/download/jobs/{job_id}/delete-file", delete_job_file, False),
     ("GET", "/api/profiles", profiles, False),
     ("GET", "/api/config", server_config, False),
     ("GET", "/api/history", download_history, False),
@@ -3471,6 +3707,7 @@ ROUTES: list[tuple[str, str, Handler, bool]] = [
     ("POST", SEGMENT_FILTER_ROUTE, session_segment_filter, True),
     ("POST", SAMPLES_ROUTE, session_samples, True),
     ("POST", LICENSE_ROUTE, session_license, True),
+    ("POST", KEYS_ROUTE, session_keys, True),
     ("POST", BAD_KEY_ROUTE, session_bad_key, True),
     ("GET", LOGS_ROUTE, session_logs, True),
     ("GET", PROMPT_ROUTE, session_prompt_get, True),

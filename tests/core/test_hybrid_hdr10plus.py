@@ -10,24 +10,20 @@ import json
 import logging
 import re
 import weakref
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator, Optional
+from typing import Any
 
 import pytest
 
 import unshackle.commands.dl as dl_module
 from tests.remote.unit.test_remote_service_helpers import _sent_create_data
-from unshackle.commands.dl import (
-    generated_dv_ranges,
-    hybrid_plan,
-    hybrid_source_tracks,
-    hybrid_step_error,
-    missing_hybrid_error,
-)
-from unshackle.core.api import download_manager, handlers
+from unshackle.core import mux_step
+from unshackle.core.api import download_manager, handlers, key_policy
 from unshackle.core.api.handlers import validate_download_parameters
 from unshackle.core.config import config
+from unshackle.core.mux_step import hybrid_plan, hybrid_source_tracks, hybrid_step_error, missing_hybrid_error
 from unshackle.core.service import Service, TrackRequest
 from unshackle.core.services import Services
 from unshackle.core.tracks import Audio, Chapter, Subtitle, Tracks, Video
@@ -41,7 +37,12 @@ from unshackle.core.tracks.hybrid import (
     nits_to_pq,
     pq_to_nits,
 )
-from unshackle.core.tracks.selection import hybrid_gate_failure, keep_generated_dv_bases, select_hybrid_bases
+from unshackle.core.tracks.selection import (
+    generated_dv_ranges,
+    hybrid_gate_failure,
+    keep_generated_dv_bases,
+    select_hybrid_bases,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -219,7 +220,7 @@ def make_hybrid() -> Hybrid:
     return obj
 
 
-def stub_hybrid_steps(monkeypatch: pytest.MonkeyPatch, *steps: str, tool: Optional[str] = "hdr10plus_tool") -> None:
+def stub_hybrid_steps(monkeypatch: pytest.MonkeyPatch, *steps: str, tool: str | None = "hdr10plus_tool") -> None:
     """Make the stream, Level 5 and inject steps (and those named) do nothing, with a fixed active area."""
     for name in ("extract_stream", "level_5", "injecting", *steps):
         monkeypatch.setattr(Hybrid, name, lambda self, *a, **k: None)
@@ -240,7 +241,7 @@ def capture_generate(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("top, expected", [(277, (2160 - 554) / 2160), (1000, None)])
-def test_active_area_share(top: int, expected: Optional[float], quiet: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_active_area_share(top: int, expected: float | None, quiet: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """A letterboxed picture gives its crop and share of the frame; an implausibly small one gives None.
 
     cropdetect settles over its frames, so the last crop line counts.
@@ -451,7 +452,7 @@ def test_a_conversion_run_removes_its_rpus_so_the_next_base_makes_its_own(
 
 @pytest.mark.parametrize("range_, tool", [(Video.Range.HDR10, "hdr10plus_tool"), (Video.Range.HDR10P, None)])
 def test_a_base_without_usable_hdr10plus_is_measured_inside_its_crop(
-    range_: Video.Range, tool: Optional[str], quiet: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    range_: Video.Range, tool: str | None, quiet: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     base = tmp_path / "base.mkv"
     base.write_bytes(b"")
@@ -594,7 +595,7 @@ def test_an_hdr10plus_conversion_fills_light_levels_the_stream_does_not_state(
     ],
 )
 def test_a_sample_rpu_is_shifted_to_the_first_frame_of_the_base(
-    dv_start: float, expected: Optional[dict[str, Any]], quiet: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    dv_start: float, expected: dict[str, Any] | None, quiet: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """--sample cuts each track on its own segment grid, so the RPU can start before or after the base."""
     seen: dict[str, Any] = {}
@@ -702,20 +703,20 @@ def test_a_hybrid_failure_is_reported_so_the_title_goes_on(monkeypatch: pytest.M
     def failed_hybrid(*args: Any, **kwargs: Any) -> None:
         raise error
 
-    monkeypatch.setattr(dl_module, "Hybrid", failed_hybrid)
+    monkeypatch.setattr(mux_step, "Hybrid", failed_hybrid)
 
     assert hybrid_step_error([], "TEST", "HDR10-DV-2160p.hevc") == str(error)
 
 
 def test_a_working_hybrid_reports_no_error_and_an_exit_passes_through(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
-    monkeypatch.setattr(dl_module, "Hybrid", lambda tracks, source, output_name: seen.update(name=output_name))
+    monkeypatch.setattr(mux_step, "Hybrid", lambda tracks, source, output_name: seen.update(name=output_name))
     assert hybrid_step_error([], "TEST", "HDR10-DV-2160p.hevc") is None and seen == {"name": "HDR10-DV-2160p.hevc"}
 
     def exiting(*args: Any, **kwargs: Any) -> None:
         raise SystemExit(1)
 
-    monkeypatch.setattr(dl_module, "Hybrid", exiting)
+    monkeypatch.setattr(mux_step, "Hybrid", exiting)
     with pytest.raises(SystemExit):
         hybrid_step_error([], "TEST", "HDR10-DV-2160p.hevc")
 
@@ -780,7 +781,8 @@ def test_the_hybrid_step_gets_the_base_alone_when_there_is_no_dv(tmp_path: Path)
     assert len(tracks) == 1 and tracks[0].range == Video.Range.HDR10P
 
 
-def test_the_api_takes_generate_dv_with_any_range_as_dl_does() -> None:
+def test_the_api_takes_generate_dv_with_any_range_as_dl_does(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("unshackle.core.binaries.DoviTool", Path("dovi_tool"))
     for data in ({}, {"range": ["SDR"]}, {"range": ["DV"]}, {"range": ["HYBRID"]}, {"range": ["HDR10"]}):
         assert validate_download_parameters({"generate_dv": True, **data}) is None
     assert "boolean" in (validate_download_parameters({"generate_dv": "yes", "range": ["HYBRID"]}) or "")
@@ -807,8 +809,7 @@ def test_a_rest_job_gives_the_flag_to_the_service_ctx_and_to_dl(
             raise _Captured(self.ctx.params["generate_dv"], kwargs["generate_dv"])
 
     class FakeService:
-        def __init__(self, ctx: click.Context) -> None:
-            pass
+        cli = click.Command("svc", callback=lambda title: object())
 
     monkeypatch.setattr(dl_module, "dl", FakeDl)
     monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
@@ -836,7 +837,7 @@ def test_a_remote_session_puts_the_flag_in_the_service_ctx(monkeypatch: pytest.M
         seen["ctx"] = parent_ctx
         return object()
 
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda service: {})
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
     monkeypatch.setattr(handlers.Services, "load", lambda service: None)
     monkeypatch.setattr(handlers, "instantiate_service", fake_instantiate)
@@ -851,7 +852,7 @@ def video(
     id_: str,
     range_: Video.Range,
     height: int = 2160,
-    codec: Optional[Video.Codec] = Video.Codec.HEVC,
+    codec: Video.Codec | None = Video.Codec.HEVC,
     native_hybrid: bool = False,
 ) -> Any:
     return SimpleNamespace(id=id_, height=height, range=range_, codec=codec, native_hybrid=native_hybrid, stereo=False)

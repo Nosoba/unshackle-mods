@@ -8,10 +8,11 @@ import re
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Iterator, Sequence
 from functools import partial
 from itertools import product
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Sequence, Union
+from typing import Any
 
 from langcodes import Language
 from rich.progress import Progress, SpinnerColumn, TaskID, TextColumn, TimeRemainingColumn
@@ -115,7 +116,7 @@ def video_rank(video: Video) -> tuple[int, bool, float, int]:
     )
 
 
-def pick_video(candidates: list[Video], worst: bool) -> Optional[Video]:
+def pick_video(candidates: list[Video], worst: bool) -> Video | None:
     """The best candidate by ``video_rank``, or with ``worst`` the lowest bitrate of the lowest resolution.
 
     ``worst`` prefers 2D and counts a track with no bitrate or no size as the highest. A full tie goes to the
@@ -130,7 +131,7 @@ def pick_video(candidates: list[Video], worst: bool) -> Optional[Video]:
     return max(candidates, key=video_rank, default=None)
 
 
-def video_language_groups(videos: list[Video], requests: Optional[list[str]], exact: bool) -> list[Optional[set[str]]]:
+def video_language_groups(videos: list[Video], requests: list[str] | None, exact: bool) -> list[set[str] | None]:
     """The tag sets to pick one video from each: one per request, or one per tag when ``requests`` is None.
 
     A request that matches several regional tags (en-AU, en-GB) is one set, so it gives one video. With no
@@ -147,7 +148,7 @@ def select_videos(
     qualities: Sequence[int],
     ranges: Sequence[Video.Range],
     codecs: Sequence[Video.Codec],
-    requests: Optional[list[str]],
+    requests: list[str] | None,
     exact: bool,
     worst: bool,
 ) -> list[Video]:
@@ -202,9 +203,9 @@ def remux_vvc(source: Path) -> Path:
     with video no player decodes, so the codec ID FFmpeg wrote is checked.
     """
     if not binaries.FFMPEG:
-        raise EnvironmentError('FFmpeg executable "ffmpeg" was not found but is required to mux H.266.')
+        raise OSError('FFmpeg executable "ffmpeg" was not found but is required to mux H.266.')
     output = config.directories.temp / f"vvcmux_{source.stem}_{os.getpid()}_{threading.get_ident()}.mkv"
-    cmd: list[Union[str, Path]] = [binaries.FFMPEG, "-nostdin", "-y", "-i", source, "-map", "0:v", "-map", "0:a?"]
+    cmd: list[str | Path] = [binaries.FFMPEG, "-nostdin", "-y", "-i", source, "-map", "0:v", "-map", "0:a?"]
     cmd += ["-map_metadata", "-1", "-fflags", "+bitexact", "-c", "copy", output]
     run_step(
         cmd,
@@ -221,7 +222,7 @@ def remux_vvc(source: Path) -> Path:
     return output
 
 
-def mp4_track_count(moov: Optional[bytes]) -> int:
+def mp4_track_count(moov: bytes | None) -> int:
     """How many tracks ``MP4Box -add`` takes from a file: each ``trak`` of its moov, or 1 for a file with none."""
     return sum(1 for kind, _, _ in children(moov or b"", 8) if kind == b"trak") or 1
 
@@ -236,17 +237,15 @@ class Tracks:
 
     def __init__(
         self,
-        *args: Union[
-            Tracks, Sequence[Union[AnyTrack, Chapter, Chapters, Attachment]], Track, Chapter, Chapters, Attachment
-        ],
-        manifest_url: Optional[str] = None,
+        *args: Tracks | Sequence[AnyTrack | Chapter | Chapters | Attachment] | Track | Chapter | Chapters | Attachment,
+        manifest_url: str | None = None,
     ) -> None:
         self.videos: list[Video] = []
         self.audio: list[Audio] = []
         self.subtitles: list[Subtitle] = []
         self.chapters = Chapters()
         self.attachments: list[Attachment] = []
-        self.manifest_url: Optional[str] = manifest_url
+        self.manifest_url: str | None = manifest_url
 
         if args:
             self.add(args)
@@ -259,9 +258,7 @@ class Tracks:
 
     def __add__(
         self,
-        other: Union[
-            Tracks, Sequence[Union[AnyTrack, Chapter, Chapters, Attachment]], Track, Chapter, Chapters, Attachment
-        ],
+        other: Tracks | Sequence[AnyTrack | Chapter | Chapters | Attachment] | Track | Chapter | Chapters | Attachment,
     ) -> Tracks:
         self.add(other)
         return self
@@ -388,7 +385,7 @@ class Tracks:
 
         return tree, progress_callables
 
-    def exists(self, by_id: Optional[str] = None, by_url: Optional[Union[str, list[str]]] = None) -> bool:
+    def exists(self, by_id: str | None = None, by_url: str | list[str] | None = None) -> bool:
         """Examine whether a track already exists, by various methods."""
         if by_id:
             return any(x.id == by_id for x in self)
@@ -398,14 +395,12 @@ class Tracks:
 
     def add(
         self,
-        tracks: Union[
-            Tracks,
-            Sequence[Union[Tracks, Sequence[Any], Track, Chapter, Chapters, Attachment]],
-            Track,
-            Chapter,
-            Chapters,
-            Attachment,
-        ],
+        tracks: Tracks
+        | Sequence[Tracks | Sequence[Any] | Track | Chapter | Chapters | Attachment]
+        | Track
+        | Chapter
+        | Chapters
+        | Attachment,
         warn_only: bool = False,
     ) -> None:
         """Add a provided track to its appropriate array.
@@ -501,9 +496,7 @@ class Tracks:
                 best[variant(sub)] = min(best.get(variant(sub), rank[sub.codec]), rank[sub.codec])
         self.subtitles = [s for s in self.subtitles if s.codec not in rank or rank[s.codec] == best[variant(s)]]
 
-    def sort_videos(
-        self, by_language: Optional[Sequence[Union[str, Language]]] = None, exact_match: bool = False
-    ) -> None:
+    def sort_videos(self, by_language: Sequence[str | Language] | None = None, exact_match: bool = False) -> None:
         """Sort video tracks by standard resolution, 2D before 3D, then bitrate, and optionally language.
 
         The standard resolution puts a 3840x1606 and a 3840x1610 crop in one 2160p group, ordered by bitrate.
@@ -525,8 +518,8 @@ class Tracks:
 
     def sort_audio(
         self,
-        by_language: Optional[Sequence[Union[str, Language]]] = None,
-        codec_priority: Optional[Sequence[str]] = None,
+        by_language: Sequence[str | Language] | None = None,
+        codec_priority: Sequence[str] | None = None,
         exact_match: bool = False,
     ) -> None:
         """Sort audio tracks by bitrate, codec priority, Atmos, descriptive, and optionally language."""
@@ -554,9 +547,9 @@ class Tracks:
 
     def sort_subtitles(
         self,
-        by_language: Optional[Sequence[Union[str, Language]]] = None,
-        type_priority: Optional[Sequence[str]] = None,
-        group_by: Optional[str] = None,
+        by_language: Sequence[str | Language] | None = None,
+        type_priority: Sequence[str] | None = None,
+        group_by: str | None = None,
         exact_match: bool = False,
     ) -> None:
         """
@@ -771,7 +764,7 @@ class Tracks:
         return selected
 
     @staticmethod
-    def _generate_auto_name(track: Union[Audio, Subtitle]) -> str:
+    def _generate_auto_name(track: Audio | Subtitle) -> str:
         """
         Build the track name a player shows, e.g. `Nihongo [\u30aa\u30ea\u30b8\u30ca\u30eb]` or `English`.
 
@@ -804,7 +797,7 @@ class Tracks:
         return original_tag(language, exact) if language else ""
 
     @staticmethod
-    def first_match_index(tracks: Sequence[AnyTrack], language: Optional[str]) -> Optional[int]:
+    def first_match_index(tracks: Sequence[AnyTrack], language: str | None) -> int | None:
         """The index of the first track that `language` asks for, matched against every track at once.
 
         Matching the whole list lets the RFC 4647 string preference pick en-US over en.
@@ -817,10 +810,10 @@ class Tracks:
     @staticmethod
     def default_subtitle_index(
         subtitles: Sequence[Subtitle],
-        language: Optional[str],
+        language: str | None,
         types: Sequence[str],
-        audio_language: Optional[Language] = None,
-    ) -> Optional[int]:
+        audio_language: Language | None = None,
+    ) -> int | None:
         """The index of the first subtitle of the first type in `types` that a track has.
 
         `language` limits the choice to the tracks it asks for. With no `types`, or no track
@@ -849,9 +842,9 @@ class Tracks:
         self,
         title: str,
         delete: bool = True,
-        progress: Optional[partial] = None,
+        progress: partial | None = None,
         skip_subtitles: bool = False,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
     ) -> tuple[Path, int, list[str]]:
         """
         Multiplex the Tracks into an MP4 Container with MP4Box.
@@ -1031,11 +1024,11 @@ class Tracks:
         self,
         title: str,
         delete: bool = True,
-        progress: Optional[partial] = None,
+        progress: partial | None = None,
         audio_expected: bool = True,
-        title_language: Optional[Language] = None,
+        title_language: Language | None = None,
         skip_subtitles: bool = False,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
     ) -> tuple[Path, int, list[str]]:
         """
         Multiplex all the Tracks into a Matroska Container file.
@@ -1119,7 +1112,7 @@ class Tracks:
         preferred_video_idx = self.first_match_index(self.videos, preferred_video_lang)
         preferred_audio_idx = self.first_match_index(self.audio, preferred_audio_lang)
         if preferred_audio_idx is not None:
-            default_audio: Optional[Audio] = self.audio[preferred_audio_idx]
+            default_audio: Audio | None = self.audio[preferred_audio_idx]
         else:
             default_audio = next(
                 (at for at in self.audio if at.is_original_lang), self.audio[0] if self.audio else None

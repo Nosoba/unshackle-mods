@@ -1,8 +1,9 @@
 """The dl option table: which dl options the REST API takes, their API defaults, and what a remote client forwards."""
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Mapping, Optional, get_args
+from typing import Any, Literal, get_args
 
 import click
 
@@ -22,18 +23,17 @@ RemoteKind = Literal["langs", "audio_codecs", "flag"]
 class ApiOption:
     """A dl option that a REST API client can set, with its API default.
 
-    ``raw`` keeps the API value uncast, because perform_download parses it. ``remote`` names how a remote client
-    sends the option to the server in ``dl_params``, for a service that reads it from ``ctx.parent.params``.
+    ``remote`` names how a remote client sends the option to the server in ``dl_params``, for a service that
+    reads it from ``ctx.parent.params``.
     """
 
     default: Any
-    raw: bool = False
-    remote: Optional[RemoteKind] = None
+    remote: RemoteKind | None = None
 
 
 CLI_ONLY = None
 
-DL_OPTIONS: Dict[str, Optional[ApiOption]] = {
+DL_OPTIONS: dict[str, ApiOption | None] = {
     "profile": ApiOption(None),
     "quality": ApiOption([]),
     "vcodec": ApiOption([]),
@@ -45,7 +45,7 @@ DL_OPTIONS: Dict[str, Optional[ApiOption]] = {
     "range": ApiOption(["SDR"]),
     "channels": ApiOption(None),
     "no_atmos": ApiOption(False),
-    "wanted": ApiOption([], raw=True),
+    "wanted": ApiOption([]),
     "latest_episode": ApiOption(False),
     "latest_episodes": ApiOption(None),
     "lang": ApiOption(["best"], remote="langs"),
@@ -74,7 +74,7 @@ DL_OPTIONS: Dict[str, Optional[ApiOption]] = {
     "no_attachments": ApiOption(False),
     "audio_description": ApiOption(False),
     "audio_description_only": ApiOption(False),
-    "slow": ApiOption(None, raw=True),
+    "slow": ApiOption(None),
     "split_audio": ApiOption(None),
     "skip_dl": ApiOption(False),
     "all_drm": ApiOption(False),
@@ -84,7 +84,7 @@ DL_OPTIONS: Dict[str, Optional[ApiOption]] = {
     "no_proxy": ApiOption(False),
     "no_proxy_download": ApiOption(False),
     "proxy_download": ApiOption(None),
-    "folder": ApiOption(False),
+    "no_folder": ApiOption(False),
     "no_source": ApiOption(False),
     "no_mux": ApiOption(False),
     "season_override": ApiOption(None),
@@ -137,8 +137,7 @@ DL_OPTIONS: Dict[str, Optional[ApiOption]] = {
 An option the REST API takes has an ``ApiOption``; a ``CLI_ONLY`` option never reaches dl from the API.
 """
 
-DEFAULT_DOWNLOAD_PARAMS: Dict[str, Any] = {name: option.default for name, option in DL_OPTIONS.items() if option}
-API_SHAPED_DL_PARAMS = frozenset(name for name, option in DL_OPTIONS.items() if option and option.raw)
+DEFAULT_DOWNLOAD_PARAMS: dict[str, Any] = {name: option.default for name, option in DL_OPTIONS.items() if option}
 FORWARDED_DL_PARAMS = [
     (name, option)
     for kind in get_args(RemoteKind)
@@ -147,21 +146,20 @@ FORWARDED_DL_PARAMS = [
 ]
 
 
-def cast_dl_params(cli: click.Command, params: Dict[str, Any]) -> Dict[str, Any]:
+def cast_dl_params(cli: click.Command, params: dict[str, Any]) -> dict[str, Any]:
     """Cast each ``DEFAULT_DOWNLOAD_PARAMS`` parameter in ``params`` by its dl click type, under its dl option name.
 
     A missing, ``None`` or empty-string parameter, and an empty ``range``, take the API default, so
-    ``output_dir: ""`` is not the working directory. An ``API_SHAPED_DL_PARAMS`` value stays as sent. A parameter
-    outside ``DEFAULT_DOWNLOAD_PARAMS`` never reaches dl, so a new CLI option is closed to API clients by default.
-    Raises ``click.BadParameter``.
+    ``output_dir: ""`` is not the working directory. A parameter outside ``DEFAULT_DOWNLOAD_PARAMS`` never reaches
+    dl, so API clients cannot set a new CLI option until the table opens it. Raises ``click.BadParameter``.
     """
-    kept: Dict[str, Any] = {}
-    to_cast: Dict[str, Any] = {}
+    kept: dict[str, Any] = {}
+    to_cast: dict[str, Any] = {}
     for key, default in DEFAULT_DOWNLOAD_PARAMS.items():
         value = params.get(key)
         if value is None or value == "" or (key == "range" and value == []):
             value = default
-        (kept if value is None or key in API_SHAPED_DL_PARAMS else to_cast)[DL_OPTION_ALIASES.get(key, key)] = value
+        (kept if value is None else to_cast)[DL_OPTION_ALIASES.get(key, key)] = value
     try:
         return {**kept, **cast_service_options(cli.params, click.Context(cli), to_cast)}
     except click.BadParameter as e:
@@ -170,12 +168,12 @@ def cast_dl_params(cli: click.Command, params: Dict[str, Any]) -> Dict[str, Any]
         raise click.BadParameter(f"Invalid {key}: {e.message}") from e
 
 
-def remote_dl_params(params: Mapping[str, Any]) -> Dict[str, Any]:
+def remote_dl_params(params: Mapping[str, Any]) -> dict[str, Any]:
     """The ``dl_params`` a remote client sends when it creates a remote session, from its dl context params.
 
     An empty list is sent as-is, because only an absent key falls back to the dl default on the server.
     """
-    sent: Dict[str, Any] = {}
+    sent: dict[str, Any] = {}
     for key, option in FORWARDED_DL_PARAMS:
         if option.remote == "flag":
             if key in params:
@@ -185,7 +183,7 @@ def remote_dl_params(params: Mapping[str, Any]) -> Dict[str, Any]:
     return sent
 
 
-def forwarded_dl_params(data: Dict[str, Any]) -> Dict[str, Any]:
+def forwarded_dl_params(data: dict[str, Any]) -> dict[str, Any]:
     """Read the dl track selection that a remote-dl client sends under ``dl_params``.
 
     Services read these values from ``ctx.parent.params`` to pick the manifests they
@@ -199,7 +197,7 @@ def forwarded_dl_params(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raw = {}
 
-    def str_list(key: str) -> Optional[List[str]]:
+    def str_list(key: str) -> list[str] | None:
         value = raw.get(key)
         if isinstance(value, list) and all(isinstance(v, str) for v in value):
             return list(value)
@@ -207,7 +205,7 @@ def forwarded_dl_params(data: Dict[str, Any]) -> Dict[str, Any]:
             log.warning(f"Ignoring dl_params.{key}: it must be an array of strings")
         return None
 
-    params: Dict[str, Any] = {}
+    params: dict[str, Any] = {}
     for key, option in FORWARDED_DL_PARAMS:
         if option.remote == "flag":
             params[key] = raw.get(key) is True

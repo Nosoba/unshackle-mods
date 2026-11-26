@@ -7,9 +7,10 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterator, Optional, ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar
 
 from filelock import FileLock, Timeout
 
@@ -71,7 +72,7 @@ def sweep_task_dirs(root: Path) -> None:
                 entry.unlink(missing_ok=True)
 
 
-def resume_stash() -> Optional[Path]:
+def resume_stash() -> Path | None:
     """The dir beside the task dirs that keeps a failed track's segments for the next run.
 
     None outside a task dir: there config.directories.temp itself outlives the run.
@@ -156,7 +157,7 @@ def remove_task_dir(task_dir: Path) -> bool:
 
 
 @contextmanager
-def task_temp_dir(task_id: Optional[str] = None) -> Iterator[Path]:
+def task_temp_dir(task_id: str | None = None) -> Iterator[Path]:
     """Point config.directories.temp at a private dir for this task. Remove it on any exit."""
     root = config.directories.temp
     root.mkdir(parents=True, exist_ok=True)

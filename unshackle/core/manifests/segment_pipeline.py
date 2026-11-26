@@ -8,18 +8,21 @@ from __future__ import annotations
 
 import html
 import shutil
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Iterator, Optional
+from typing import Any, BinaryIO
+from uuid import UUID
 
 from unshackle.core.constants import DOWNLOAD_CANCELLED, AnyTrack
-from unshackle.core.drm import DRM_T
+from unshackle.core.drm import DRM_T, ClearKeyCENC, MonaLisa, PlayReady, Widevine
 from unshackle.core.drm.segment_decrypt import SegmentDecrypter
 from unshackle.core.drm.verify import decrypt_track
 from unshackle.core.events import events
+from unshackle.core.remote_protocol import APIErrorCode, coded
 from unshackle.core.session import AnySession
-from unshackle.core.tracks import DownloadContext, resume
+from unshackle.core.tracks import DownloadContext, Track, resume
 from unshackle.core.tracks.track import assert_fragments_decrypted
 from unshackle.core.utilities import log_event, try_ensure_utf8
 
@@ -52,13 +55,13 @@ class RollingMerge:
     landed (ISM), passes its own.
     """
 
-    def __init__(self, dst: BinaryIO, append: Optional[Callable[[BinaryIO, Path], None]] = None) -> None:
+    def __init__(self, dst: BinaryIO, append: Callable[[BinaryIO, Path], None] | None = None) -> None:
         self.dst = dst
         self.append = append or (lambda dst, path: append_segment(dst, path, is_text_subtitle=False))
         self.cursor = 0
-        self.ready: dict[int, tuple[Path, Optional[Future]]] = {}
+        self.ready: dict[int, tuple[Path, Future | None]] = {}
 
-    def add(self, index: int, segment_file: Path, future: Optional[Future] = None) -> None:
+    def add(self, index: int, segment_file: Path, future: Future | None = None) -> None:
         # runs on the downloader's own loop, so a decrypt wait or a catch-up burst
         # delays new submissions; move the drain to a writer thread if throughput measurably drops
         self.ready[index] = (segment_file, future)
@@ -92,13 +95,46 @@ def licensing(ctx: DownloadContext) -> Iterator[None]:
         raise
 
 
-def license_drm(drm: DRM_T, ctx: DownloadContext, **kwargs: Any) -> None:
-    """Call ctx.license_widevine for one DRM, with the LICENSING and LICENSED progress around it."""
-    if not ctx.license_widevine:
-        raise ValueError("license_widevine func must be supplied to use DRM")
-    ctx.progress(downloaded="LICENSING")
-    ctx.license_widevine(drm, **kwargs)
-    ctx.progress(downloaded="[yellow]LICENSED")
+LICENSABLE: dict[Track.Descriptor, tuple[type, ...]] = {
+    Track.Descriptor.URL: (Widevine, PlayReady, ClearKeyCENC),
+    Track.Descriptor.DASH: (Widevine, PlayReady, ClearKeyCENC),
+    Track.Descriptor.HLS: (Widevine, PlayReady, MonaLisa),
+    Track.Descriptor.ISM: (Widevine, PlayReady),
+}
+"""The DRM systems the licence step licenses, by the kind of manifest the track comes from."""
+
+
+def license_drm(
+    track: AnyTrack,
+    drm: DRM_T | None,
+    ctx: DownloadContext,
+    kid: UUID | None = None,
+    probe: Callable[[], UUID | None] | None = None,
+) -> None:
+    """The licence step: get the content keys of `drm` for `track` through ctx.license_widevine, with progress.
+
+    A DRM system that LICENSABLE does not list for the track gets no licence. The track KID is `kid`, else
+    what `probe` reads from the init. An HLS or ISM DRM comes from the track's own key tag or protection
+    header, so its first KID stands in when the init names none. A MonaLisa DRM gets no KID: its ticket gives
+    the track's own key. A failed `probe` fails only this track; a failed licence cancels the run.
+    ctx.license_widevine licenses every DRM system; dl and services pass it by keyword.
+    """
+    if not isinstance(drm, LICENSABLE[track.descriptor]):
+        return
+    track_kid = None
+    if not isinstance(drm, MonaLisa):
+        track_kid = kid or (probe() if probe else None)
+        if not track_kid and track.descriptor in (Track.Descriptor.HLS, Track.Descriptor.ISM):
+            track_kid = getattr(drm, "kid", None)
+    with licensing(ctx):
+        if not ctx.license_widevine:
+            raise coded(
+                ValueError(f"No licence callback for the {type(drm).__name__} DRM of track {track.id}"),
+                APIErrorCode.DRM_ERROR,
+            )
+        ctx.progress(downloaded="LICENSING")
+        ctx.license_widevine(drm, track_kid=track_kid)
+        ctx.progress(downloaded="[yellow]LICENSED")
 
 
 def fetch_segments(
@@ -111,17 +147,17 @@ def fetch_segments(
     filename: str,
     *,
     rolling: bool = False,
-    init: Optional[bytes] = None,
-    append: Optional[Callable[[BinaryIO, Path], None]] = None,
-    decrypter: Optional[SegmentDecrypter] = None,
-) -> tuple[Optional[RollingMerge], Optional[bytes]]:
+    init: bytes | None = None,
+    append: Callable[[BinaryIO, Path], None] | None = None,
+    decrypter: SegmentDecrypter | None = None,
+) -> tuple[RollingMerge | None, bytes | None]:
     """Download the segment requests and return the rolling merge, if any, and the init that heads the output.
 
     With `rolling`, the init (or the decrypter's decrypted init) and each segment go into ctx.save_path
     as they land. A decrypter gets every segment before its SEGMENT_DOWNLOADED event. Any failure closes
     the decrypter and removes a rolling output. The returned init is the decrypter's decrypted init, else `init`.
     """
-    merger: Optional[RollingMerge] = None
+    merger: RollingMerge | None = None
     try:
         with ExitStack() as stack:
             if rolling:
@@ -201,7 +237,7 @@ def decrypt_output(track: AnyTrack, ctx: DownloadContext, drm: DRM_T, decrypt: b
     `decrypt=False` means a SegmentDecrypter already decrypted the segments, so only the check runs.
     """
     ctx.progress(downloaded="Decrypting", completed=0, total=None)
-    decrypt_track(drm, ctx.save_path, ctx.license_widevine, decrypt=decrypt)
+    decrypt_track(drm, ctx.save_path, ctx.license_widevine, decrypt=decrypt, track=track)
     assert_fragments_decrypted(ctx.save_path)
     track.drm = None
     events.emit(events.Types.TRACK_DECRYPTED, track=track, drm=drm, segment=None)
@@ -216,7 +252,7 @@ def remove_segment_dir(save_dir: Path) -> None:
             shutil.rmtree(save_dir, ignore_errors=True)
 
 
-def complete_track(track: AnyTrack, ctx: DownloadContext, drm: Optional[DRM_T], decrypt: bool = True) -> None:
+def complete_track(track: AnyTrack, ctx: DownloadContext, drm: DRM_T | None, decrypt: bool = True) -> None:
     """Hand the merged file to the track: TRACK_DOWNLOADED, then the decryption, then the segment directory cleanup."""
     track.path = ctx.save_path
     events.emit(events.Types.TRACK_DOWNLOADED, track=track)

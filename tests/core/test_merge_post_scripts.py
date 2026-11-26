@@ -20,6 +20,7 @@ import pytest
 from unshackle.commands.dl import dl, post_script_group, title_wanted
 from unshackle.core.config import config
 from unshackle.core.events import Events
+from unshackle.core.title_source import CacheIdentity, KeyArrival
 from unshackle.core.titles import Episode, Series
 from unshackle.core.tracks import Audio, Subtitle, Tracks
 
@@ -32,6 +33,14 @@ class Harness(dl):
 
 
 class FakeService:
+    ANIME = False
+    DAILY = False
+    NO_SUBTITLES = False
+    key_arrival = KeyArrival.CALLBACK
+    key_source = None
+    login_cookies = None
+    ctx = None
+
     def __init__(self, episodes, kind, before_tracks):
         self.titles = Series(
             Episode(id_=f"show-s{s}-e{n}", service=FakeService, title="Show", season=s, number=n, language="en")
@@ -76,6 +85,9 @@ class FakeService:
 
     def get_chapters(self, title):
         return []
+
+    def cache_identity(self):
+        return CacheIdentity(None, None, None, None)
 
     def close(self):
         pass
@@ -199,6 +211,7 @@ def offline_run(monkeypatch, tmp_path):
             workers=1,
             sub_format="original",
             folder=False,
+            no_folder=True,
             no_mux=False,
             audio_only=kind == "audio_description_only",
             subs_only=kind == "forced_subs_only",
@@ -257,7 +270,7 @@ def test_season_waits_for_last_selected_title_even_when_skipped(offline_run, ove
 @pytest.mark.parametrize("folder", [False, True])
 @pytest.mark.parametrize("override", [None, 0, 7])
 def test_original_seasons_can_collapse_without_changing_folder_opt_in(offline_run, folder, override):
-    result = offline_run([(1, 1, True), (2, 2, True), (3, 3, True)], season_override=override, folder=folder)
+    result = offline_run([(1, 1, True), (2, 2, True), (3, 3, True)], season_override=override, no_folder=not folder)
     assert result.exit_code is None
     seasons = [call for call in result.calls if call[1] == "season"]
     assert len(seasons) == (3 if override is None else 1)

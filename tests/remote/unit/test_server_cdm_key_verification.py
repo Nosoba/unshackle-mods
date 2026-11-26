@@ -17,6 +17,7 @@ from tests.remote.sessions import session_entry
 from unshackle.core.api import handlers
 from unshackle.core.api.errors import APIError
 from unshackle.core.drm import BlowfishStripe
+from unshackle.core.drm.cenc import drm_stub
 from unshackle.core.remote_service import RemoteService
 
 pytestmark = pytest.mark.unit
@@ -140,7 +141,6 @@ async def test_batch_reports_vault_keys_from_the_init_segment_pssh(monkeypatch):
         return {KID.hex: "c"}
 
     monkeypatch.setattr(handlers, "get_validated_session", validated)
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda track, session=None, init_data=None: None)
     monkeypatch.setattr(handlers, "find_title_for_track", lambda tid, session: SimpleNamespace())
     monkeypatch.setattr(handlers, "detect_cdm_type_for_service", lambda tag, cfg: "widevine")
@@ -188,7 +188,6 @@ async def test_batch_asks_again_when_a_cached_vault_answer_lacks_the_track_kid(m
         return {KID.hex: "v", CDM_KID.hex: "c"}
 
     monkeypatch.setattr(handlers, "get_validated_session", validated)
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda track, session=None, init_data=None: None)
     monkeypatch.setattr(handlers, "find_title_for_track", lambda tid, session: SimpleNamespace())
     monkeypatch.setattr(handlers, "detect_cdm_type_for_service", lambda tag, cfg: "widevine")
@@ -288,7 +287,7 @@ def test_resolve_server_keys_names_only_the_manifest_kids():
     widevine = Widevine(pssh=PSSH.new(system_id=PSSH.SystemId.Widevine, key_ids=[KID]))
     assert resolve([widevine]).kids == [KID]
 
-    playready = RemoteService.create_drm_stub("playready", [KID.hex])
+    playready = drm_stub("playready", [KID.hex])
     assert resolve([playready], "playready").kids == [KID]
 
 
@@ -334,7 +333,6 @@ async def test_a_stripe_cipher_track_is_clear_and_never_licensed(monkeypatch):
         return session
 
     monkeypatch.setattr(handlers, "get_validated_session", validated)
-    monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request, tag: True)
     monkeypatch.setattr(handlers, "ensure_track_drm", lambda track, session=None, init_data=None: None)
     monkeypatch.setattr(handlers, "find_title_for_track", lambda tid, session: SimpleNamespace())
     monkeypatch.setattr(handlers, "detect_cdm_type_for_service", lambda tag, cfg: "widevine")

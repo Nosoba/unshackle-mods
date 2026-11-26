@@ -6,19 +6,19 @@ import functools
 import http.server
 import struct
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Optional
 from unittest.mock import MagicMock
 
 import click
 import pytest
 from requests import Session
 
-from unshackle.commands.dl import sample_name
 from unshackle.core.api.handlers import validate_download_parameters
 from unshackle.core.config import config
 from unshackle.core.manifests.dash import DASH
+from unshackle.core.placement import sample_name
 from unshackle.core.services import Services
 from unshackle.core.titles import Episode, Movie
 from unshackle.core.tracks import Audio, Chapter, Subtitle, Tracks, Video
@@ -124,7 +124,7 @@ BASE_MPD = """
 WINDOW = (62, 120)
 
 
-def dash_names(mpd: str, window: Optional[tuple[int, int]]) -> tuple[list[str], float]:
+def dash_names(mpd: str, window: tuple[int, int] | None) -> tuple[list[str], float]:
     tree = load_xml(mpd.encode())
     period = tree.find("Period")
     aset = period.find("AdaptationSet")
@@ -296,7 +296,7 @@ def test_the_api_refuses_a_bad_sample_window(sample: object) -> None:
 
 
 def test_the_api_refuses_sample_with_include_sample() -> None:
-    assert "include_sample" in (validate_download_parameters({"sample": True, "include_sample": True}) or "")
+    assert "--include-sample" in (validate_download_parameters({"sample": True, "include_sample": True}) or "")
 
 
 def test_sample_name_uses_the_separator_of_the_template(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,9 +1,10 @@
 import inspect
 import logging
 import time
+from collections.abc import Collection, Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from functools import partial
-from typing import Any, Iterator, Optional, Union
+from typing import Any
 from uuid import UUID
 
 from unshackle.core.config import config
@@ -22,15 +23,15 @@ MODULES = {path.stem: getattr(import_module_by_path(path), path.stem) for path i
 class Vaults:
     """Keeps hold of Key Vaults with convenience functions, e.g. searching all vaults."""
 
-    def __init__(self, service: Optional[str] = None) -> None:
+    def __init__(self, service: str | None = None) -> None:
         self.service = service or ""
         self.vaults: list[Vault] = []
-        self.sources: dict[Union[UUID, str], tuple[str, Vault]] = {}
-        self.flagged: set[tuple[Union[UUID, str], str]] = set()
-        self.candidates: dict[Union[UUID, str], list[tuple[str, Vault]]] = {}
-        self.warned: set[tuple[str, Union[UUID, str], str]] = set()
+        self.sources: dict[UUID | str, tuple[str, Vault]] = {}
+        self.flagged: set[tuple[UUID | str, str]] = set()
+        self.candidates: dict[UUID | str, list[tuple[str, Vault]]] = {}
+        self.warned: set[tuple[str, UUID | str, str]] = set()
         self.unreachable: set[Vault] = set()
-        self.unreported: dict[tuple[Union[UUID, str], str], Vault] = {}
+        self.unreported: dict[tuple[UUID | str, str], Vault] = {}
 
     def __iter__(self) -> Iterator[Vault]:
         return iter(self.vaults)
@@ -38,32 +39,17 @@ class Vaults:
     def __len__(self) -> int:
         return len(self.vaults)
 
-    def load(self, type_: str, **kwargs: Any) -> bool:
-        """Load a Vault into the vaults list. Returns True if successful, False otherwise."""
+    def load(self, type_: str, **kwargs: Any) -> None:
+        """Load a Vault into the vaults list, or raise when it cannot be built."""
         module = MODULES.get(type_)
         if not module:
             raise ValueError(f"Unable to find vault command by the name '{type_}'.")
         # only pass the global default to vaults that declare a timeout param (per-vault config still wins)
         if "timeout" not in kwargs and "timeout" in inspect.signature(module).parameters:
             kwargs["timeout"] = config.vault_timeout
-        try:
-            vault = module(**kwargs)
-            self.vaults.append(vault)
-            return True
-        # one bad vault config must not stop the others from loading
-        except Exception as e:
-            log.debug(f"Vault '{type_}' failed to load: {e!r}")
-            return False
+        self.vaults.append(module(**kwargs))
 
-    def load_critical(self, type_: str, **kwargs: Any) -> None:
-        """Load a critical Vault that must succeed or raise an exception."""
-        module = MODULES.get(type_)
-        if not module:
-            raise ValueError(f"Unable to find vault command by the name '{type_}'.")
-        vault = module(**kwargs)
-        self.vaults.append(vault)
-
-    def get_key(self, kid: Union[UUID, str]) -> tuple[Optional[str], Optional[Vault]]:
+    def get_key(self, kid: UUID | str) -> tuple[str | None, Vault | None]:
         """Get Key from the first Vault it can by KID (Key ID) and Service.
 
         Local vaults go first, one at a time: a hit there costs nothing and skips the network.
@@ -100,7 +86,7 @@ class Vaults:
             # ones already running still finish and land in candidates through the callback
             pool.shutdown(wait=False, cancel_futures=True)
 
-    def remember_candidate(self, kid: Union[UUID, str], vault: Vault, future: Future) -> None:
+    def remember_candidate(self, kid: UUID | str, vault: Vault, future: Future) -> None:
         """Keep a remote answer for a later retry. Cancelled or failed queries leave nothing."""
         if future.cancelled() or future.exception():
             return
@@ -108,11 +94,11 @@ class Vaults:
         if key and (key, vault) not in self.candidates.setdefault(kid, []):
             self.candidates[kid].append((key, vault))
 
-    def is_flagged(self, kid: Union[UUID, str], key: str) -> bool:
+    def is_flagged(self, kid: UUID | str, key: str) -> bool:
         """True when a local vault has flagged the KID:KEY as wrong."""
         return any(v.is_bad_key(kid, key) for v in self.vaults if v.local)
 
-    def query_vault(self, vault: Vault, kid: Union[UUID, str]) -> Optional[str]:
+    def query_vault(self, vault: Vault, kid: UUID | str) -> str | None:
         """Ask one vault for a content key. A failure logs a warning and returns None.
 
         A flagged pair counts as no content key, so no vault can serve one again.
@@ -153,7 +139,7 @@ class Vaults:
             )
         return key if found else None
 
-    def flag_bad_key(self, kid: Union[UUID, str], key: str) -> None:
+    def flag_bad_key(self, kid: UUID | str, key: str) -> None:
         """Flag a KID:KEY in every local vault. A failed decode is no proof, so the remote vault that
         served it hears of it from ``report_replaced``, or at once when it sets ``report_now``."""
         self.flagged.add((kid, key))
@@ -168,7 +154,7 @@ class Vaults:
             else:
                 self.unreported[kid, key] = source[1]
 
-    def report_replaced(self, content_keys: dict[Union[UUID, str], str]) -> None:
+    def report_replaced(self, content_keys: dict[UUID | str, str]) -> None:
         """Tell each remote vault about its flagged pair once ``content_keys`` holds another key for the KID."""
         live = self.live()
         for (kid, key), vault in list(self.unreported.items()):
@@ -177,7 +163,7 @@ class Vaults:
                 if vault in live:
                     self.tell(vault, kid, key, vault.name)
 
-    def tell(self, vault: Vault, kid: Union[UUID, str], key: str, source: str) -> None:
+    def tell(self, vault: Vault, kid: UUID | str, key: str, source: str) -> None:
         """Flag one pair in one vault; a failure is only a debug line."""
         try:
             vault.flag_bad_key(self.service, kid, key, source)
@@ -191,7 +177,7 @@ class Vaults:
             self.unflag_bad_key(kid, content_keys[kid])
         return cleared
 
-    def unflag_bad_key(self, kid: Union[UUID, str], key: str) -> None:
+    def unflag_bad_key(self, kid: UUID | str, key: str) -> None:
         """Remove a flag from every Vault."""
         self.flagged.discard((kid, key))
         for vault in self.live():
@@ -200,7 +186,7 @@ class Vaults:
             except Exception as e:
                 log.debug(f"Could not unflag {key} in Vault '{vault.name}': {e!r}")
 
-    def add_key(self, kid: Union[UUID, str], key: str, excluding: Optional[Vault] = None) -> int:
+    def add_key(self, kid: UUID | str, key: str, excluding: Vault | None = None) -> int:
         """Add a KID:KEY to all Vaults, optionally with an exclusion.
 
         This method pushes to all Vaults at the same time, so one unreachable Vault costs only its
@@ -212,7 +198,7 @@ class Vaults:
         with ThreadPoolExecutor(len(vaults), thread_name_prefix="vault-push") as pool:
             return sum(pool.map(lambda vault: self.push_key(vault, kid, key), vaults))
 
-    def push_key(self, vault: Vault, kid: Union[UUID, str], key: str) -> int:
+    def push_key(self, vault: Vault, kid: UUID | str, key: str) -> int:
         """Push one Content Key to one Vault. Returns 1 if the Vault stored it, 0 otherwise."""
         dl = get_debug_logger()
         try:
@@ -229,7 +215,7 @@ class Vaults:
                 dl.log_vault_query(vault.name, "add_key", kid=str(kid), success=False, error=e)
             return 0
 
-    def add_keys(self, kid_keys: dict[Union[UUID, str], str]) -> int:
+    def add_keys(self, kid_keys: dict[UUID | str, str]) -> int:
         """
         Add multiple KID:KEYs to all Vaults. The Vaults skip duplicate Content Keys.
         This method absorbs and ignores the PermissionError a Vault raises when it cannot make Tables.
@@ -246,7 +232,7 @@ class Vaults:
         with ThreadPoolExecutor(len(vaults), thread_name_prefix="vault-push") as pool:
             return sum(pool.map(lambda vault: self.push_keys(vault, kid_keys), vaults))
 
-    def push_keys(self, vault: Vault, kid_keys: dict[Union[UUID, str], str]) -> int:
+    def push_keys(self, vault: Vault, kid_keys: dict[UUID | str, str]) -> int:
         """Push Content Keys to one Vault. Returns 1 if the Vault accepted them, 0 on any failure."""
         try:
             vault.add_keys(self.service, kid_keys)
@@ -262,7 +248,7 @@ class Vaults:
         """The vaults this run still uses."""
         return [vault for vault in self.vaults if vault not in self.unreachable]
 
-    def held_locally(self, kid: Union[UUID, str], key: str) -> bool:
+    def held_locally(self, kid: UUID | str, key: str) -> bool:
         """True when a local vault already holds this KID:KEY."""
         return any(self.query_vault(vault, kid) == key for vault in self.vaults if vault.local)
 
@@ -274,4 +260,39 @@ class Vaults:
             log.warning(f"Skipping Vault '{vault.name}' for the rest of this run")
 
 
-__all__ = ("Vaults",)
+__all__ = ("Vaults", "load_config_vaults")
+
+
+def load_config_vaults(
+    service: str | None = None,
+    configs: Iterable[dict[str, Any]] | None = None,
+    critical: Collection[str] = (),
+) -> tuple[Vaults, dict[str, BaseException]]:
+    """Load vault configs (the config's ``key_vaults`` by default) into one Vaults for a service.
+
+    A vault whose lower-case type is in ``critical`` raises when it fails to load; any other vault
+    that fails is left out and returned by name with its error. A DecryptLabs API vault with no
+    token of its own takes the global ``decrypt_labs_api_key``.
+    """
+    vaults = Vaults(service)
+    failed: dict[str, BaseException] = {}
+    for vault_config in config.key_vaults if configs is None else configs:
+        cfg = dict(vault_config)
+        type_ = str(cfg.pop("type", ""))
+        name = str(cfg.get("name") or type_)
+        if type_.lower() == "api" and "decrypt_labs" in name.lower() and not cfg.get("token"):
+            if config.decrypt_labs_api_key:
+                cfg["token"] = config.decrypt_labs_api_key
+            else:
+                log.warning(f"No token for DecryptLabs vault '{name}' and no global decrypt_labs_api_key")
+        try:
+            vaults.load(type_, **cfg)
+        except (Exception, SystemExit) as e:
+            if type_.lower() in critical:
+                log.error(f"vault failure: {name} ({type_}) - {e}")
+                raise
+            failed[name] = e
+            log.debug(f"Failed to load vault: {name} ({type_}): {e!r}")
+        else:
+            log.debug(f"Successfully loaded vault: {name} ({type_})")
+    return vaults, failed

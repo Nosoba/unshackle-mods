@@ -7,7 +7,7 @@ import logging
 import sys
 import threading
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from aiohttp import web
@@ -326,7 +326,7 @@ async def test_dashboard_log_read_does_not_touch_the_session() -> None:
     store = SessionStore()
     entry = await store.create("EXAMPLE", object())
 
-    stale = datetime.now(timezone.utc) - timedelta(seconds=1)
+    stale = datetime.now(UTC) - timedelta(seconds=1)
     entry.last_accessed = stale
     assert store.peek(entry.session_id) is entry
     assert entry.last_accessed == stale
@@ -531,8 +531,8 @@ async def test_health_vault_checks_are_told_apart_by_name(aiohttp_server, monkey
 
 
 def test_rate_limit_value_must_be_a_positive_whole_number() -> None:
-    """key_rate_limit reads anything else as unlimited, so it has to be caught at startup."""
-    from unshackle.core.api.stats import key_rate_limit, rate_limit_error
+    """KeyPolicy.rate_limit reads anything else as unlimited, so it has to be caught at startup."""
+    from unshackle.core.api.key_policy import KeyPolicy, rate_limit_error
 
     assert rate_limit_error("serve.tiers.bot", 600) is None
     assert rate_limit_error("serve.tiers.bot", None) is None
@@ -542,7 +542,7 @@ def test_rate_limit_value_must_be_a_positive_whole_number() -> None:
     with pytest.MonkeyPatch().context() as m:
         m.setitem(config.serve, "tiers", {"bot": {"rate_limit": "600"}})
         m.setitem(config.serve, "users", {"k": {"tier": "bot"}})
-        assert key_rate_limit("k") is None
+        assert KeyPolicy.of("k").rate_limit is None
 
 
 async def test_dashboard_key_gets_its_own_row(aiohttp_client, dashboard_cfg) -> None:

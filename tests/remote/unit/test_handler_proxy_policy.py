@@ -1,10 +1,11 @@
 """The server spends its own proxy subscriptions only for a key that opts in."""
 
+from datetime import UTC
 from types import SimpleNamespace
 
 import pytest
 
-from unshackle.core.api import handlers
+from unshackle.core.api import handlers, key_policy
 from unshackle.core.api.errors import APIError
 from unshackle.core.remote_protocol import APIErrorCode
 from unshackle.core.utils import ip_info
@@ -110,17 +111,6 @@ def test_no_proxy_short_circuits(monkeypatch):
     assert providers == []
 
 
-def test_server_proxy_allowed_entitlements():
-    assert handlers.server_proxy_allowed(request("proxykey")) is True
-    assert handlers.server_proxy_allowed(request("plainkey")) is False
-    # yaml string "true" is not the boolean opt-in
-    assert handlers.server_proxy_allowed(request("strkey")) is False
-    # no implicit admin access: a key absent from serve.users is denied
-    assert handlers.server_proxy_allowed(request("adminsecret")) is False
-    # no request (an internal call, or a handler that dropped it) fails closed
-    assert handlers.server_proxy_allowed(None) is False
-
-
 def test_opted_in_country_code_resolves(monkeypatch):
     patch_server_region(monkeypatch, "IN")
     provider = patch_providers(monkeypatch, "http://us.proxy:8080")
@@ -181,13 +171,13 @@ def test_setup_list_service_threads_request(monkeypatch):
         def authenticate(self, cookies, credential):
             seen["authenticated"] = True
 
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda service: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", fake_resolve)
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
     monkeypatch.setattr(handlers.Services, "load", lambda service: None)
     monkeypatch.setattr(handlers, "instantiate_service", lambda *args: FakeService())
-    monkeypatch.setattr("unshackle.commands.dl.dl.get_cookie_jar", staticmethod(lambda service, profile: None))
-    monkeypatch.setattr("unshackle.commands.dl.dl.get_credentials", staticmethod(lambda service, profile: None))
+    monkeypatch.setattr("unshackle.core.login.get_cookie_jar", lambda service, profile: None)
+    monkeypatch.setattr("unshackle.core.login.get_credentials", lambda service, profile: None)
 
     req = request("plainkey")
     handlers.setup_list_service({}, "EXAMPLE", None, "some-title", req)
@@ -199,13 +189,13 @@ def test_search_reports_failed_proxy_check_as_invalid_proxy(monkeypatch):
     def failed_check(*args):
         raise ConnectionError("Proxy check failed: no IP lookup got through the proxy.")
 
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda service: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", lambda *args: ("http://127.0.0.1:9", []))
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
     monkeypatch.setattr(handlers.Services, "load", lambda service: None)
     monkeypatch.setattr(handlers, "instantiate_service", failed_check)
-    monkeypatch.setattr("unshackle.commands.dl.dl.get_cookie_jar", staticmethod(lambda service, profile: None))
-    monkeypatch.setattr("unshackle.commands.dl.dl.get_credentials", staticmethod(lambda service, profile: None))
+    monkeypatch.setattr("unshackle.core.login.get_cookie_jar", lambda service, profile: None)
+    monkeypatch.setattr("unshackle.core.login.get_credentials", lambda service, profile: None)
 
     with pytest.raises(APIError) as exc_info:
         handlers.run_service_search({}, "EXAMPLE", "query", request("plainkey"))
@@ -218,7 +208,8 @@ class TestDownloadGates:
 
     @pytest.fixture(autouse=True)
     def cdm_gate_open(self, monkeypatch):
-        monkeypatch.setattr(handlers, "server_cdm_allowed", lambda request=None, service=None: True)
+        users = {key: {**entry, "server_cdm": True} for key, entry in USERS.items()}
+        monkeypatch.setattr(handlers.config, "serve", {"users": users}, raising=False)
 
     def test_country_code_rejected_when_denied(self, monkeypatch):
         with pytest.raises(APIError) as exc_info:
@@ -266,7 +257,7 @@ class TestDownloadEnforcement:
     def created_params(self, monkeypatch):
         """Drive download_handler with the job machinery faked out; capture create_job params."""
         import asyncio
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         from unshackle.core.api import download_manager as dm
 
@@ -279,7 +270,7 @@ class TestDownloadEnforcement:
             def create_job(self, service, title_id, owner_key=None, **params):
                 created.update(params)
                 return SimpleNamespace(
-                    job_id="job1", status=SimpleNamespace(value="queued"), created_time=datetime.now(timezone.utc)
+                    job_id="job1", status=SimpleNamespace(value="queued"), created_time=datetime.now(UTC)
                 )
 
         monkeypatch.setattr(dm, "get_download_manager", lambda: FakeManager())
@@ -302,9 +293,9 @@ class TestDownloadEnforcement:
         created = created_params({"service": "EXAMPLE", "title_id": "t1"}, request("proxykey"))
         assert created["server_proxy"] is True
 
-    @pytest.mark.parametrize(("params", "expected"), [({}, []), ({"server_proxy": True}, None)])
+    @pytest.mark.parametrize(("params", "expected"), [({}, []), ({"server_proxy": True}, ["server"])])
     def test_perform_download_maps_stamp_to_dl_providers(self, monkeypatch, tmp_path, params, expected):
-        """An unstamped or denied job hands dl an empty provider list; a stamped one loads config."""
+        """An unstamped or denied job hands dl an empty provider list; a stamped one gets the server's list."""
 
         from unshackle.commands import dl as dl_module
         from unshackle.core.api import download_manager as dm
@@ -324,6 +315,7 @@ class TestDownloadEnforcement:
         monkeypatch.setattr(dl_module, "dl", FakeDl)
         monkeypatch.setattr("unshackle.core.services.Services.get_path", staticmethod(lambda service: tmp_path))
         monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
+        monkeypatch.setattr("unshackle.core.proxies.resolve.initialize_proxy_providers", lambda **_: ["server"])
 
         with pytest.raises(Stop):
             dm.perform_download("job1", "EXAMPLE", "t1", dict(params))

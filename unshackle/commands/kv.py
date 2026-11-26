@@ -1,8 +1,9 @@
 import logging
 import re
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, Optional, Union, cast
+from typing import cast
 from uuid import UUID
 
 import click
@@ -24,12 +25,12 @@ from unshackle.core.console import GradientPulseBarColumn, console
 from unshackle.core.constants import context_settings
 from unshackle.core.services import Services
 from unshackle.core.vault import Vault, is_null_key
-from unshackle.core.vaults import Vaults
+from unshackle.core.vaults import Vaults, load_config_vaults
 
 
 def load_vaults(vault_names: list[str]) -> Vaults:
     """Load and validate vaults by config name, or by the path of an SQLite vault file."""
-    vaults = Vaults()
+    configs = []
     for vault_name in vault_names:
         vault_config = next((x for x in config.key_vaults if x["name"] == vault_name), None)
         if not vault_config:
@@ -37,14 +38,11 @@ def load_vaults(vault_names: list[str]) -> Vaults:
             if not path.is_file():
                 raise click.ClickException(f"Vault ({vault_name}) is not defined in the config or an existing file.")
             vault_config = {"type": "SQLite", "name": path.stem, "path": path}
+        configs.append(vault_config)
 
-        vault_type = vault_config["type"]
-        vault_args = vault_config.copy()
-        del vault_args["type"]
-
-        if not vaults.load(vault_type, **vault_args):
-            raise click.ClickException(f"Failed to load vault ({vault_name}).")
-
+    vaults, failed = load_config_vaults(configs=configs)
+    if failed:
+        raise click.ClickException(f"Failed to load vault ({next(iter(failed))}).")
     return vaults
 
 
@@ -74,7 +72,7 @@ class _PaddedProgress(Progress):
 def add_keys_with_progress(vault: Vault, service: str, kid_keys: dict[str, str], log: logging.Logger) -> int:
     """Add content keys to a vault. Network vaults write in batches behind a progress bar."""
     if type(vault).__name__ in ("MySQL", "SQLite"):
-        return vault.add_keys(service, cast(dict[Union[UUID, str], str], kid_keys))
+        return vault.add_keys(service, cast(dict[UUID | str, str], kid_keys))
 
     def chunk(i: int) -> int:
         # Probe with one key so a server that rejects batches costs one row, not 500.
@@ -100,7 +98,7 @@ def add_keys_with_progress(vault: Vault, service: str, kid_keys: dict[str, str],
         task = progress.add_task(f"{service} → {vault}", total=len(kids), added=0)
         i = 0
         while i < len(kids):
-            batch: dict[Union[UUID, str], str] = {kid: kid_keys[kid] for kid in kids[i : i + chunk(i)]}
+            batch: dict[UUID | str, str] = {kid: kid_keys[kid] for kid in kids[i : i + chunk(i)]}
             added += vault.add_keys(service, batch)
             i += len(batch)
             progress.update(task, advance=len(batch), added=added)
@@ -108,7 +106,7 @@ def add_keys_with_progress(vault: Vault, service: str, kid_keys: dict[str, str],
 
 
 def copy_service_data(
-    to_vault: Vault, from_vault: Vault, service: str, log: logging.Logger, to_service: Optional[str] = None
+    to_vault: Vault, from_vault: Vault, service: str, log: logging.Logger, to_service: str | None = None
 ) -> int:
     """Copy data for a single service between vaults, into the `to_service` table when given."""
     if service.lower() == "bad_keys":
@@ -163,7 +161,7 @@ def kv() -> None:
 def copy(
     to_vault_name: str,
     from_vault_names: list[str],
-    service: Optional[str] = None,
+    service: str | None = None,
     local_only: bool = False,
 ) -> None:
     """
@@ -195,14 +193,14 @@ def copy(
     if service and local_only:
         raise click.UsageError("--service and --local-only are mutually exclusive.")
 
-    source_tables: Optional[list[str]] = None
+    source_tables: list[str] | None = None
     if service:
         tag, service = Services.get_tag(service), Services.get_vault_tag(service)
         # a vault filled outside unshackle can hold the keys under the plain tag, not the VAULT_TAG
         source_tables = [service] if tag.lower() == service.lower() else [service, tag]
         log.info(f"Filtering by service: {service}")
 
-    installed: Optional[set[str]] = None
+    installed: set[str] | None = None
     if local_only:
         installed = {t.upper() for t in Services.get_tags()}
         log.info(f"Filtering by locally installed services ({len(installed)} found)")
@@ -249,7 +247,7 @@ def copy(
 def sync(
     ctx: click.Context,
     vaults: list[str],
-    service: Optional[str] = None,
+    service: str | None = None,
     local_only: bool = False,
 ) -> None:
     """
@@ -322,10 +320,10 @@ def add(file: Path, service: str, vaults: list[str]) -> None:
     log.info("Done!")
 
 
-def search_vault(vault: Vault, kid: str, services: list[str], log: logging.Logger) -> Optional[tuple[str, str]]:
+def search_vault(vault: Vault, kid: str, services: list[str], log: logging.Logger) -> tuple[str, str] | None:
     """Return the service and content key from the first service table in a vault holding the KID."""
 
-    def probe(svc: str) -> Optional[tuple[str, str]]:
+    def probe(svc: str) -> tuple[str, str] | None:
         try:
             key = vault.get_key(kid, svc)
         except Exception as e:
@@ -358,7 +356,7 @@ def search_vault(vault: Vault, kid: str, services: list[str], log: logging.Logge
 @click.option(
     "-v", "--vault", "vault_name", type=str, default=None, help="Limit search to a specific configured vault by name."
 )
-def search(kid: str, service: Optional[str], vault_name: Optional[str]) -> None:
+def search(kid: str, service: str | None, vault_name: str | None) -> None:
     """
     Examine configured Key Vault(s) for a KID and report the content key it finds.
 

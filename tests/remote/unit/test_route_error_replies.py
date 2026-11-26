@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn, Optional
+from typing import Any, NoReturn
 
 import pytest
 from aiohttp import web
@@ -30,6 +30,7 @@ from unshackle.core.api.stats import stats, stats_middleware
 from unshackle.core.config import config
 from unshackle.core.remote_protocol import (
     BAD_KEY_ROUTE,
+    KEYS_ROUTE,
     LICENSE_ROUTE,
     LOGS_ROUTE,
     PROMPT_ROUTE,
@@ -57,7 +58,7 @@ RELEASE = threading.Event()
 SEEN: list[dict[str, Any]] = []
 
 
-def raise_fault(kind: Optional[str]) -> NoReturn:
+def raise_fault(kind: str | None) -> NoReturn:
     if kind == "api":
         raise APIError(APIErrorCode.SERVICE_ERROR, "pinned refusal", details={"pinned": True})
     if kind == "exit":
@@ -68,7 +69,7 @@ def raise_fault(kind: Optional[str]) -> NoReturn:
 class Faulty:
     """A stand-in whose methods all raise the fault *kind*; a *late* one first waits for RELEASE."""
 
-    def __init__(self, kind: Optional[str] = None, late: bool = False, **attrs: Any) -> None:
+    def __init__(self, kind: str | None = None, late: bool = False, **attrs: Any) -> None:
         self.kind = kind
         self.late = late
         self.session = SimpleNamespace(headers={}, cookies=[], get=self.fail)
@@ -100,7 +101,7 @@ async def recorder(request: web.Request, handler: Any) -> web.StreamResponse:
 
 
 def fill(route: str) -> str:
-    return route.format(session_id=SESSION, job_id="no-such-job", login_id="no-such-login")
+    return route.format(session_id=SESSION, job_id="no-such-job", login_id="no-such-login", index="0")
 
 
 BODIES: dict[str, Any] = {
@@ -111,6 +112,7 @@ BODIES: dict[str, Any] = {
     SEGMENT_FILTER_ROUTE: {"track_id": "v1"},
     LICENSE_ROUTE: {"track_id": "v1", "challenge": "AAAA"},
     BAD_KEY_ROUTE: {"kid": "00" * 16, "key": "11" * 16},
+    KEYS_ROUTE: {"track_id": "v1", "keys": {"22" * 16: "33" * 16}},
     PROMPT_ROUTE: {"response": "1234"},
     "/api/list-titles": {"service": "EXAMPLE", "title_id": "title-0001"},
     "/api/list-tracks": {"service": "EXAMPLE", "title_id": "title-0001"},
@@ -118,7 +120,15 @@ BODIES: dict[str, Any] = {
     "/api/download/jobs/{job_id}/input": {"response": "1234"},
     "/api/remote/logins/{login_id}/input": {"response": "1234"},
 }
-AUTHENTICATED_ROUTES = [TITLES_ROUTE, TRACKS_ROUTE, SEGMENTS_ROUTE, SEGMENT_FILTER_ROUTE, LICENSE_ROUTE, BAD_KEY_ROUTE]
+AUTHENTICATED_ROUTES = [
+    TITLES_ROUTE,
+    TRACKS_ROUTE,
+    SEGMENTS_ROUTE,
+    SEGMENT_FILTER_ROUTE,
+    LICENSE_ROUTE,
+    BAD_KEY_ROUTE,
+    KEYS_ROUTE,
+]
 SAMPLES = fill(SAMPLES_ROUTE) + "?track_id=v1&entry=1"
 
 
@@ -129,11 +139,11 @@ class Case:
     method: str
     path: str
     body: Any = None
-    session: Optional[Faulty] = None
+    session: Faulty | None = None
     owner: str = KEY
     status: AuthStatus = AuthStatus.AUTHENTICATED
     patch: dict[str, Any] = field(default_factory=dict)
-    key: Optional[str] = KEY
+    key: str | None = KEY
 
 
 def generic_cases() -> dict[str, Case]:
@@ -196,6 +206,13 @@ def fault_cases() -> dict[str, Case]:
             "POST",
             fill(BAD_KEY_ROUTE),
             BODIES[BAD_KEY_ROUTE],
+            session=Faulty(),
+            patch={"load_server_vaults": Faulty(kind).fail},
+        )
+        cases[f"keys {kind}"] = Case(
+            "POST",
+            fill(KEYS_ROUTE),
+            BODIES[KEYS_ROUTE],
             session=Faulty(),
             patch={"load_server_vaults": Faulty(kind).fail},
         )
@@ -274,7 +291,7 @@ async def open_session(stand_in: Faulty, owner: str, status: AuthStatus) -> None
     session.served_keys["00" * 16] = ("11" * 16, "pinned-vault")
 
 
-def masked(value: Any, ref: Optional[str]) -> Any:
+def masked(value: Any, ref: str | None) -> Any:
     """*value* with the error ref and the timestamp replaced, at any depth.
 
     The longer Python 3.14 text of an unhashable key error reads as the 3.11 text.

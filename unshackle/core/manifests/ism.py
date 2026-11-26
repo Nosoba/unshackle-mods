@@ -10,7 +10,7 @@ import struct
 import urllib.parse
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, BinaryIO, Optional, Union
+from typing import Any, BinaryIO
 
 import requests
 from langcodes import Language, tag_is_valid
@@ -35,7 +35,6 @@ from unshackle.core.manifests.segment_pipeline import (
     complete_track,
     fetch_segments,
     license_drm,
-    licensing,
 )
 from unshackle.core.session import RnetSession
 from unshackle.core.tracks import Audio, DownloadContext, Subtitle, Track, Tracks, Video, resume
@@ -61,7 +60,7 @@ class ISM:
         self.url = url
 
     @classmethod
-    def from_url(cls, url: str, session: Optional[Union[Session, RnetSession]] = None, **kwargs: Any) -> "ISM":
+    def from_url(cls, url: str, session: Session | RnetSession | None = None, **kwargs: Any) -> ISM:
         if not url:
             raise requests.URLRequired("ISM manifest URL must be provided")
         if not session:
@@ -81,7 +80,7 @@ class ISM:
         return cls(load_xml(res.content), url)
 
     @classmethod
-    def from_text(cls, text: str, url: str) -> "ISM":
+    def from_text(cls, text: str, url: str) -> ISM:
         if not text:
             raise ValueError("ISM manifest text must be provided")
         if not url:
@@ -114,7 +113,7 @@ class ISM:
         return drm
 
     @staticmethod
-    def get_video_range_and_fps(fourcc: str, codec_private_data: str) -> tuple[Video.Range, Optional[float]]:
+    def get_video_range_and_fps(fourcc: str, codec_private_data: str) -> tuple[Video.Range, float | None]:
         """Derive colour range and fps from the SPS VUI in CodecPrivateData,
         since Smooth manifests carry neither as attributes. Range soft-fails to
         SDR. fps is None for non-HEVC codecs and VUIs without timing info."""
@@ -135,9 +134,7 @@ class ISM:
         return ISM.get_video_range_and_fps(fourcc, codec_private_data)[0]
 
     @staticmethod
-    def init_segment(
-        track: AnyTrack, session_drm: Optional[DRM_T], first_segment: Optional[bytes] = None
-    ) -> Optional[bytes]:
+    def init_segment(track: AnyTrack, session_drm: DRM_T | None, first_segment: bytes | None = None) -> bytes | None:
         # Smooth fragments are moof+mdat only; rebuild the ftyp+moov init box from
         # the manifest CodecPrivateData (and KID, when encrypted) so the merged file
         # is a valid MP4 that shaka/mp4decrypt can parse.
@@ -166,7 +163,7 @@ class ISM:
             except LookupError:
                 language = "und"
 
-        kid: Optional[bytes] = None
+        kid: bytes | None = None
         if session_drm is not None:
             kid_uuid = next(iter(getattr(session_drm, "kids", None) or []), None)
             if kid_uuid is not None:
@@ -234,7 +231,7 @@ class ISM:
             )
             return None
 
-    def to_tracks(self, language: Optional[Union[str, Language]] = None) -> Tracks:
+    def to_tracks(self, language: str | Language | None = None) -> Tracks:
         if (self.manifest.get("IsLive") or "").upper() == "TRUE":
             raise ValueError("Live Smooth Streaming manifests are not supported")
         tracks = Tracks()
@@ -424,14 +421,8 @@ class ISM:
             segments = segments[kept]
             track.data["ism"]["fragment_times"] = segment_times[kept]
 
-        session_drm = None
-        if track.drm:
-            # Mirror HLS.download_track: pick the DRM matching the provided CDM
-            # (or the first available) and license it if supported.
-            session_drm = track.get_drm_for_cdm(ctx.cdm)
-            if isinstance(session_drm, (Widevine, PlayReady)):
-                with licensing(ctx):
-                    license_drm(session_drm, ctx)
+        session_drm = track.get_drm_for_cdm(ctx.cdm)
+        license_drm(track, session_drm, ctx)
 
         if DOWNLOAD_LICENCE_ONLY.is_set():
             progress(downloaded="[yellow]SKIPPED")
@@ -489,7 +480,7 @@ class ISM:
             "ISM",
             [{"url": url} for url in segments],
             save_dir,
-            "{i:0%d}.mp4" % len(str(len(segments))),
+            f"{{i:0{len(str(len(segments)))}}}.mp4",
             rolling=use_rolling_merge,
             append=append_ism,
         )

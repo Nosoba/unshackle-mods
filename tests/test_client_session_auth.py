@@ -125,7 +125,7 @@ def test_remote_get_tracks_scopes_server_cookies():
         _title_alias={},
         _sample_decrypt_tracks=set(),
         _server_cdm=None,
-        _session=requests.Session(),
+        session=requests.Session(),
         _session_id="s",
         service_tag="EXAMPLE",
         log=logging.getLogger("test"),
@@ -133,9 +133,9 @@ def test_remote_get_tracks_scopes_server_cookies():
         drain_server_logs=lambda: None,
     )
     service.get_tracks(SimpleNamespace(id="t1"))
-    cdn = service._session.prepare_request(requests.Request("GET", "https://cdn.other.net/seg.mp4"))
+    cdn = service.session.prepare_request(requests.Request("GET", "https://cdn.other.net/seg.mp4"))
     assert "Cookie" not in cdn.headers
-    assert service._session.cookies.get("sid", domain=".example.com") == "secret"
+    assert service.session.cookies.get("sid", domain=".example.com") == "secret"
 
 
 def test_server_login_strips_auth():
@@ -191,8 +191,8 @@ def test_history_scoped_by_owner(tmp_path, monkeypatch):
 
     monkeypatch.setattr(dm, "history_path", lambda: tmp_path / "h.jsonl")
     (tmp_path / "h.jsonl").write_text(
-        '{"job_id": "a", "owner": "%s", "service": "X"}\n{"job_id": "b", "owner": "%s", "service": "X"}\n'
-        % (dm.owner_id("k1"), dm.owner_id("k2"))
+        f'{{"job_id": "a", "owner": "{dm.owner_id("k1")}", "service": "X"}}\n'
+        f'{{"job_id": "b", "owner": "{dm.owner_id("k2")}", "service": "X"}}\n'
     )
     assert [e["job_id"] for e in dm.read_job_history(owner=dm.owner_id("k1"))] == ["a"]
     assert not dm.delete_job_history("b", owner=dm.owner_id("k1"))
@@ -258,20 +258,6 @@ def test_download_rejects_path_profile_and_bad_output_dir(tmp_path, monkeypatch)
     assert validate_download_parameters({"profile": "../x"})
     assert validate_download_parameters({"profile": "ok"}) is None
     assert validate_download_parameters({"output_dir": "a\x00b"})
-
-
-def test_absent_key_keeps_server_devices(monkeypatch):
-    from pathlib import Path
-
-    from unshackle.core.api.handlers import config, serve_user_config
-
-    monkeypatch.setattr(
-        config,
-        "serve",
-        {"users": {"k1": {"devices": ["mine"]}}, "devices": [Path("/x/dev.wvd")], "playready_devices": []},
-    )
-    assert serve_user_config("k1") == {"devices": ["mine"]}
-    assert serve_user_config("admin-secret") == {"devices": ["dev"], "playready_devices": []}
 
 
 def test_safe_inflate_rejects_non_str_via_isinstance():

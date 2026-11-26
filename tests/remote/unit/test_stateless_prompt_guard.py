@@ -86,7 +86,6 @@ def services(monkeypatch):
         return service
 
     monkeypatch.setattr(handlers, "validate_service", lambda *args: "FAKE")
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda *args: {})
     monkeypatch.setattr(handlers, "resolve_handler_proxy", lambda *args: (None, []))
     monkeypatch.setattr(handlers, "resolve_server_account", lambda *args: None)
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)

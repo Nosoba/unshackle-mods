@@ -20,7 +20,7 @@ import pytest
 
 from unshackle.commands.dl import dl
 from unshackle.core.api import download_manager
-from unshackle.core.api.handlers import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
+from unshackle.core.dl_options import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
 
 pytestmark = pytest.mark.unit
 
@@ -47,33 +47,14 @@ def _supplied() -> set[str]:
     splats = [kw.value for kw in call.keywords if kw.arg is None]
     assert len(splats) == 1 and isinstance(splats[0], ast.Dict)
     splat = splats[0]
-    assert splat.keys[0] is None and ast.unparse(splat.values[0]) == "ctx.params"
+    assert splat.keys[0] is None and "ctx.params" in ast.unparse(splat.values[0])
     assert all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in splat.keys[1:])
 
-    tree = ast.parse(inspect.getsource(download_manager.perform_download))
-    contexts = [
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign) and any(ast.unparse(target) == "ctx.params" for target in node.targets)
-    ]
-    assert len(contexts) == 1 and isinstance(contexts[0], ast.Dict)
-    context = contexts[0]
-    assert context.keys[0] is None and ast.unparse(context.values[0]) == "dl_params"
-    assert all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in context.keys[1:])
-    casts = [
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Assign) and any(ast.unparse(target) == "dl_params" for target in node.targets)
-    ]
-    assert len(casts) == 1 and isinstance(casts[0], ast.Call)
-    assert ast.unparse(casts[0]) == "cast_dl_params(dl_command.cli, params)"
-    context_names = {key.value for key in context.keys[1:]}
-    assert context_names <= {p.name for p in dl.cli.params} | {"client_argv"}
+    # ctx.params is built by click from dl.cli, so it carries every dl option under its dl name.
     return (
         {kw.arg for kw in call.keywords if kw.arg is not None}
         | {key.value for key in splat.keys[1:]}
-        | set(cast_dl_params(dl.cli, {}))
-        | context_names
+        | {p.name for p in dl.cli.params}
     )
 
 

@@ -9,7 +9,7 @@ import click
 import pytest
 
 import unshackle.commands.dl as dl_module
-from unshackle.core.api import download_manager, handlers
+from unshackle.core.api import download_manager, handlers, key_policy
 from unshackle.core.api.handlers import validate_download_parameters
 from unshackle.core.services import Services
 
@@ -36,8 +36,7 @@ def test_a_rest_job_converts_quality_and_passes_cdm_only(tmp_path: Path, monkeyp
             raise _Captured(self.ctx.params["quality"], kwargs["quality"], self.ctx.params["cdm_only"])
 
     class FakeService:
-        def __init__(self, ctx: click.Context) -> None:
-            pass
+        cli = click.Command("svc", callback=lambda title: object())
 
     monkeypatch.setattr(dl_module, "dl", FakeDl)
     monkeypatch.setattr(Services, "get_path", staticmethod(lambda s: tmp_path))
@@ -58,7 +57,7 @@ def session_params(monkeypatch: pytest.MonkeyPatch, data: dict) -> dict:
         seen["params"] = parent_ctx.params
         return object()
 
-    monkeypatch.setattr(handlers, "load_service_yaml", lambda service: {})
+    monkeypatch.setattr(key_policy, "load_service_config", lambda service: {})
     monkeypatch.setattr(handlers, "load_full_cdm", lambda *args: None)
     monkeypatch.setattr(handlers.Services, "load", lambda service: None)
     monkeypatch.setattr(handlers, "instantiate_service", fake_instantiate)

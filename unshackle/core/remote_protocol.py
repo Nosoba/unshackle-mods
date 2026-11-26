@@ -9,7 +9,7 @@ older peer.
 from __future__ import annotations
 
 from enum import Enum, StrEnum
-from typing import Any, NotRequired, Optional, TypedDict
+from typing import Any, NotRequired, TypedDict, TypeVar
 
 HEALTH_ROUTE = "/api/health"
 SERVICES_ROUTE = "/api/services"
@@ -22,6 +22,7 @@ SEGMENTS_ROUTE = SESSION_ROUTE + "/segments"
 SEGMENT_FILTER_ROUTE = SESSION_ROUTE + "/segment_filter"
 SAMPLES_ROUTE = SESSION_ROUTE + "/samples"
 LICENSE_ROUTE = SESSION_ROUTE + "/license"
+KEYS_ROUTE = SESSION_ROUTE + "/keys"
 BAD_KEY_ROUTE = SESSION_ROUTE + "/keys/bad"
 LOGS_ROUTE = SESSION_ROUTE + "/logs"
 PROMPT_ROUTE = SESSION_ROUTE + "/prompt"
@@ -73,6 +74,15 @@ class APIErrorCode(str, Enum):
     WORKER_ERROR = "WORKER_ERROR"
 
 
+E = TypeVar("E", bound=BaseException)
+
+
+def coded(exc: E, code: APIErrorCode) -> E:
+    """``exc`` with the API error code that ``categorize_exception`` reports for it, whatever its message says."""
+    exc.error_code = code  # type: ignore[attr-defined]
+    return exc
+
+
 class ClientErrorKind(StrEnum):
     """The error kinds a remote client gives a failure of its own. The server never sends them.
 
@@ -99,7 +109,7 @@ class ClientInfo(TypedDict):
     """What a client tells the server about itself, for the server's logs."""
 
     version: str
-    code_hash: Optional[str]
+    code_hash: str | None
     platform: str
     argv: str
 
@@ -115,7 +125,7 @@ class SessionCreate(ClientLogin, total=False):
     episode: Any
     part: Any
     wanted: Any
-    proxy: Optional[str]
+    proxy: str | None
     no_proxy: bool
     client_region: str
     proxy_region: str
@@ -143,7 +153,7 @@ class SessionCreated(TypedDict, total=False):
     status: str
     server_account: bool
     server_cdm: bool
-    server_cdm_max_height: Optional[int]
+    server_cdm_max_height: int | None
     server_vault: bool
     server_device: bool
 
@@ -158,7 +168,7 @@ class TracksReply(TypedDict, total=False):
     session_headers: dict[str, str]
     session_cookies: dict[str, str]
     session_cookie_jar: list[dict[str, Any]]
-    server_cdm: Optional[bool]
+    server_cdm: bool | None
     server_cdm_type: str
     sample_decrypt_tracks: list[str]
 
@@ -170,7 +180,7 @@ class SegmentFilterRequest(TypedDict):
 class SegmentFilterReply(TypedDict):
     """The segment URIs to skip; None when the track has no segment filter."""
 
-    unwanted: Optional[list[str]]
+    unwanted: list[str] | None
 
 
 class LicenseRequest(TypedDict, total=False):
@@ -193,7 +203,7 @@ class LicenseReply(TypedDict, total=False):
     track gets no content keys: ``capped_tracks`` holds its refusal details, ``reason`` and ``max_height``.
     """
 
-    license: Optional[str]
+    license: str | None
     keys: dict[str, Any]
     vault_keys: list[str]
     clear_tracks: list[str]
@@ -207,11 +217,16 @@ class BadKeyReport(TypedDict):
     key: str
 
 
+class TrackKeys(TypedDict):
+    track_id: str
+    keys: dict[str, str]
+
+
 class PromptReply(TypedDict, total=False):
     """The login state of a remote session, and the prompt or CDM call that waits for the client."""
 
     status: str
-    prompt: Optional[str]
+    prompt: str | None
     cdm_call: dict[str, Any]
     error: str
 

@@ -19,7 +19,7 @@ from typing import Any
 import pytest
 
 from unshackle.commands.dl import dl
-from unshackle.core.api.handlers import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
+from unshackle.core.dl_options import DEFAULT_DOWNLOAD_PARAMS, cast_dl_params
 
 pytestmark = pytest.mark.unit
 

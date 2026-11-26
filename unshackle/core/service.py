@@ -1,18 +1,15 @@
 import logging
 import time
-from abc import ABCMeta, abstractmethod
-from collections.abc import Callable, Generator
+from abc import abstractmethod
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Sequence, TypeVar, Union
+from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
     from unshackle.core.api.input_bridge import InputBridge
-    from unshackle.core.drm.cbcs import SampleDecrypter
 
 import click
-import m3u8
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from rich.padding import Padding
@@ -21,12 +18,11 @@ from rich.rule import Rule
 from unshackle.core.cacher import Cacher
 from unshackle.core.config import config
 from unshackle.core.console import console, prompt_user, show_notice
-from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
-from unshackle.core.drm import DRM_T
 from unshackle.core.launch import launch_keys
 from unshackle.core.proxies.basic import Basic
 from unshackle.core.proxies.resolve import pick_proxy
+from unshackle.core.remote_protocol import APIErrorCode, coded
 from unshackle.core.search_result import SearchResult
 from unshackle.core.session import (
     BACKOFF_FACTOR,
@@ -38,12 +34,13 @@ from unshackle.core.session import (
     RETRY_METHODS,
     STATUS_FORCELIST,
 )
-from unshackle.core.title_cacher import TitleCacher, get_account_hash
+from unshackle.core.title_cacher import TitleCacher
+from unshackle.core.title_source import TitleSource
 from unshackle.core.titles import Title_T, Titles_T, remap_titles
 from unshackle.core.tracks import Chapters, Tracks
 from unshackle.core.tracks.video import Video
-from unshackle.core.utilities import declared_kwargs
 from unshackle.core.utils import run_proxy
+from unshackle.core.utils.collections import ci_get
 from unshackle.core.utils.ip_info import get_ip_info, verify_proxy_exit
 from unshackle.core.utils.redact import mask_proxy
 
@@ -130,7 +127,7 @@ class TrackRequest:
     generate_dv: bool = False
 
 
-def sanitize_proxy_for_log(uri: Optional[str], mask_host: bool = False) -> Optional[str]:
+def sanitize_proxy_for_log(uri: str | None, mask_host: bool = False) -> str | None:
     """
     Sanitise a proxy URI for logs by masking any embedded userinfo (username/password).
 
@@ -148,7 +145,7 @@ def sanitize_proxy_for_log(uri: Optional[str], mask_host: bool = False) -> Optio
 T = TypeVar("T")
 
 
-class Service(metaclass=ABCMeta):
+class Service(TitleSource):
     """The Service Base Class.
 
     A Service must define the abstract methods. The rest are optional overrides that fall back to the base
@@ -160,14 +157,12 @@ class Service(metaclass=ABCMeta):
     ALIASES: tuple[str, ...] = ()  # alternative tags for the service, matched without case.
     GEOFENCE: tuple[str, ...] = ()  # list of ip regions required to use the service. empty list == no specific region.
     GEOBLOCK: tuple[str, ...] = ()  # ip regions where the service refuses to work; everything else is allowed.
-    ANIME: bool = False  # service catalogue is anime; metadata lookups prefer AniList. Title.anime overrides per title.
-    DAILY: bool = False  # catalog is daily/date-based. episodes are named by air date. Title.daily overrides per title.
     ANONYMOUS_SEARCH: bool = False  # search() needs no login; a search then skips cookies and authenticate().
     # vault namespace override; when set, key vault read/write uses this tag instead of the service's own.
-    VAULT_TAG: Optional[str] = None
+    VAULT_TAG: str | None = None
     # Auth methods the service accepts ("cookies"/"credentials"); when None the REST /services
     # endpoint infers them from authenticate().
-    AUTH_METHODS: Optional[tuple[str, ...]] = None
+    AUTH_METHODS: tuple[str, ...] | None = None
     # Config keys a remote client may supply for a session its own device licenses (a device identity
     # such as an ESN); the server's own values for these keys are withheld from that session.
     CLIENT_CONFIG: tuple[str, ...] = ()
@@ -187,13 +182,13 @@ class Service(metaclass=ABCMeta):
 
         self.session = self.get_session()
         self.cache = Cacher(self.__class__.__name__)
-        self.title_cache = TitleCacher(self.__class__.__name__)
+        self.title_cache: TitleCacher = TitleCacher(self.__class__.__name__)
         self.cache_dir = config.directories.cache / self.__class__.__name__
 
         self.ctx = ctx
-        self.credential: Optional[Credential] = None  # Will be set in authenticate()
+        self.credential: Credential | None = None  # Will be set in authenticate()
         self.current_region = None  # Will be set based on proxy/geolocation
-        self._input_bridge: Optional[InputBridge] = None
+        self._input_bridge: InputBridge | None = None
 
         # Set track request from CLI params - services can read/override in their __init__
         vcodec = ctx.parent.params.get("vcodec") if ctx.parent else None
@@ -215,7 +210,7 @@ class Service(metaclass=ABCMeta):
             proxy_provider_name = keys.get("proxy_provider")
 
             service_name = self.__class__.__name__
-            service_config_dict = config.services.get(service_name, {})
+            service_config_dict = ci_get(config.services, service_name) or {}
             proxy_map = service_config_dict.get("proxy_map", {})
 
             if proxy_map and proxy_query:
@@ -251,8 +246,11 @@ class Service(metaclass=ABCMeta):
                             elif self.is_region_allowed(current_region):
                                 self.log.info("Service is not Geoblocked in your region")
                             elif not (fence_targets := [x for x in self.GEOFENCE if self.is_region_allowed(x)]):
-                                raise click.ClickException(
-                                    f"Service is not available in {whose} region ({current_region.upper()})"
+                                raise coded(
+                                    click.ClickException(
+                                        f"Service is not available in {whose} region ({current_region.upper()})"
+                                    ),
+                                    APIErrorCode.GEOFENCE,
                                 )
                             else:
                                 requested_proxy = fence_targets[0]  # first is likely main region
@@ -285,8 +283,11 @@ class Service(metaclass=ABCMeta):
                 self.current_region = exit_region
                 # Only GEOBLOCK applies here: an explicit --proxy outside GEOFENCE stays the user's call.
                 if exit_region and any(x.lower() == exit_region.lower() for x in self.GEOBLOCK):
-                    raise click.ClickException(
-                        f"Service is not available in {whose} proxy's region ({exit_region.upper()})"
+                    raise coded(
+                        click.ClickException(
+                            f"Service is not available in {whose} proxy's region ({exit_region.upper()})"
+                        ),
+                        APIErrorCode.GEOFENCE,
                     )
             else:
                 # No proxy, use cached IP info for title caching (non-critical)
@@ -299,8 +300,13 @@ class Service(metaclass=ABCMeta):
 
         run_proxy.watch(type(self), run_proxy.proxy_of(self.session))
 
+    @property
+    def login_cookies(self) -> CookieJar | None:
+        """The HTTP session cookies, which dl saves to the profile's cookie file after each title."""
+        return self.session.cookies
+
     @classmethod
-    def is_region_allowed(cls, region: Optional[str]) -> bool:
+    def is_region_allowed(cls, region: str | None) -> bool:
         """True when an exit IP in `region` (two-letter region code, any case) can use the service.
 
         An unknown region (None or empty) is allowed, because there is nothing to compare.
@@ -349,7 +355,7 @@ class Service(metaclass=ABCMeta):
             held = {Tracks.signature(track) for track in all_tracks}
             all_tracks.add([track for track in tracks if Tracks.signature(track) not in held], warn_only=True)
 
-        codecs: Sequence[Optional[Video.Codec]] = self.track_request.codecs or [None]
+        codecs: Sequence[Video.Codec | None] = self.track_request.codecs or [None]
         ranges = self.track_request.ranges or [Video.Range.SDR]
 
         for range_val in ranges:
@@ -437,7 +443,7 @@ class Service(metaclass=ABCMeta):
         """
         return []
 
-    def authenticate(self, cookies: Optional[CookieJar] = None, credential: Optional[Credential] = None) -> None:
+    def authenticate(self, cookies: CookieJar | None = None, credential: Credential | None = None) -> None:
         """
         Authenticate the Service with Cookies and/or Credentials (Email/Username and Password).
 
@@ -483,7 +489,7 @@ class Service(metaclass=ABCMeta):
         return prompt_user(prompt)
 
     def wait_for_approval(
-        self, message: str, check: Callable[[], Optional[T]], timeout: float, interval: float = 3.0
+        self, message: str, check: Callable[[], T | None], timeout: float, interval: float = 3.0
     ) -> T:
         """Show ``message``, then call ``check`` until it returns a value.
 
@@ -503,7 +509,7 @@ class Service(metaclass=ABCMeta):
                 if result is not None:
                     return result
                 if time.monotonic() + interval >= deadline:
-                    raise TimeoutError(f"No approval within {timeout:.0f}s")
+                    raise coded(TimeoutError(f"No approval within {timeout:.0f}s"), APIErrorCode.AUTH_FAILED)
                 time.sleep(interval)
         finally:
             show_notice(None)
@@ -518,87 +524,6 @@ class Service(metaclass=ABCMeta):
         unshackle displays the search results in the order yielded.
         """
         raise NotImplementedError(f"Search functionality has not been implemented by {self.__class__.__name__}")
-
-    def get_widevine_service_certificate(
-        self, *, challenge: bytes, title: Title_T, track: AnyTrack
-    ) -> Optional[Union[bytes, str]]:
-        """
-        Get the Widevine Service Certificate used for Privacy Mode.
-
-        :param challenge: The service challenge, providing this to a License endpoint should return the
-            privacy certificate that the service uses.
-        :param title: The current `Title` from get_titles that unshackle processes now. unshackle
-            gives this in case it holds data you need, for example for an HTTP request.
-        :param track: The current `Track` needing decryption. Provided for same reason as `title`.
-        :return: The Service Privacy Certificate as Bytes or a Base64 string. Do not Base64 Encode or
-            Decode the data, return as is to reduce unnecessary computations.
-        """
-
-    def get_widevine_license(self, *, challenge: bytes, title: Title_T, track: AnyTrack) -> Optional[Union[bytes, str]]:
-        """
-        Get a Widevine License message by sending a License Request (challenge).
-
-        This License message contains the encrypted content keys and will be
-        read by the Cdm and decrypted.
-
-        This is a very important request to get correct. A bad, unexpected, or missing
-        value in the request can cause the service to detect your CDM device.
-        The service can then ban, revoke, disable, or downgrade that device.
-
-        :param challenge: The license challenge from the Widevine CDM.
-        :param title: The current `Title` from get_titles that unshackle processes now. unshackle
-            gives this in case it holds data you need, for example for an HTTP request.
-        :param track: The current `Track` needing decryption. Provided for same reason as `title`.
-        :return: The License response as Bytes or a Base64 string. Do not Base64 Encode or
-            Decode the data, return as is to reduce unnecessary computations.
-        """
-
-    def get_playready_license(
-        self, *, challenge: bytes, title: Title_T, track: AnyTrack
-    ) -> Optional[Union[bytes, str]]:
-        """
-        Get a PlayReady License message by sending a License Request (challenge).
-
-        This License message contains the encrypted content keys and will be
-        read by the CDM and decrypted.
-
-        This is a very important request to get correct. A bad, unexpected, or missing
-        value in the request can cause the service to detect your CDM device.
-        The service can then ban, revoke, disable, or downgrade that device.
-
-        :param challenge: The license challenge from the PlayReady CDM.
-        :param title: The current `Title` from get_titles that unshackle processes now. unshackle
-            gives this in case it holds data you need, for example for an HTTP request.
-        :param track: The current `Track` needing decryption. Provided for same reason as `title`.
-        :return: The License response as Bytes or a Base64 string. Do not Base64 Encode or
-            Decode the data, return as is to reduce unnecessary computations.
-        """
-        # A service that implements Widevine licensing only still gets PlayReady, with the
-        # arguments its own signature declares.
-        return self.get_widevine_license(
-            **declared_kwargs(self.get_widevine_license, {"challenge": challenge, "title": title, "track": track})
-        )
-
-    def get_clearkey_license(
-        self, *, challenge: bytes, title: Title_T, track: AnyTrack
-    ) -> Optional[Union[bytes, str, dict]]:
-        """
-        Get a W3C ClearKey License (JWK Set) by sending a License Request (challenge).
-
-        Used for DASH `org.w3.clearkey` tracks. unshackle uses no CDM here: the challenge is
-        the W3C EME JSON license request, e.g. ``{"kids": ["<base64url>"], "type": "temporary"}``,
-        and the license is a JWK Set, e.g. ``{"keys": [{"kty": "oct", "k": "...", "kid": "..."}]}``.
-
-        :param challenge: The JSON license request bytes to POST to the license server.
-        :param title: The current `Title` from get_titles that unshackle processes now. unshackle
-            gives this in case it holds data you need, for example for an HTTP request.
-        :param track: The current `Track` needing decryption. Provided for same reason as `title`.
-        :return: The JWK Set license as a dict, JSON str, or raw bytes. Return None (the default)
-            to let the framework POST the challenge to the manifest-provided Laurl, if any.
-            Services with no license server can instead pre-populate the DRM object's
-            `signatures` in get_tracks.
-        """
-        return None
 
     @abstractmethod
     def get_titles(self) -> Titles_T:
@@ -615,7 +540,7 @@ class Service(metaclass=ABCMeta):
         This can be useful to store information on each title that you need later, like any sub-asset IDs, or such.
         """
 
-    def get_titles_cached(self, title_id: Optional[str] = None) -> Titles_T:
+    def get_titles_cached(self, title_id: str | None = None) -> Titles_T:
         """
         Cached wrapper around get_titles() to reduce redundant API calls.
 
@@ -629,16 +554,12 @@ class Service(metaclass=ABCMeta):
         Returns:
             Titles object (Movies, Series, or Album)
         """
+        identity = self.cache_identity()
         if title_id is None:
-            # Different services store the title ID in different attributes
-            if hasattr(self, "title"):
-                title_id = self.title
-            elif hasattr(self, "title_id"):
-                title_id = self.title_id
-            else:
-                # If we can't determine title_id, just call get_titles directly
-                self.log.debug("Cannot determine title_id for caching, bypassing cache")
-                return self.apply_title_map(self.get_titles())
+            title_id = identity.title_id
+        if title_id is None:
+            self.log.debug("Cannot determine title_id for caching, bypassing cache")
+            return self.apply_title_map(self.get_titles())
 
         no_cache = False
         reset_cache = False
@@ -646,14 +567,11 @@ class Service(metaclass=ABCMeta):
             no_cache = self.ctx.parent.params.get("no_cache", False)
             reset_cache = self.ctx.parent.params.get("reset_cache", False)
 
-        # Get account hash for cache key
-        account_hash = get_account_hash(self.credential)
-
         titles = self.title_cache.get_cached_titles(
             title_id=str(title_id),
             fetch_function=self.get_titles,
-            region=self.current_region,
-            account_hash=account_hash,
+            region=identity.region,
+            account_hash=identity.account_hash,
             no_cache=no_cache,
             reset_cache=reset_cache,
         )
@@ -717,70 +635,6 @@ class Service(metaclass=ABCMeta):
         You must not set Chapter names to "Chapter {n}" or such. If you (or the user)
         wants "Chapter {n}" style Chapter names (or similar) then they can use the config
         option `chapter_fallback_name`. For example, `"Chapter {i:02}"` for "Chapter 01".
-        """
-
-    # Optional sample decryption
-
-    def decrypts_samples(self, track: AnyTrack) -> bool:
-        """Whether this service decrypts the cbcs file of `track` after the download, through `get_sample_decrypter`."""
-        return False
-
-    def get_sample_decrypter(self, track: AnyTrack, entry: int) -> Union[bytes, "SampleDecrypter"]:
-        """The content key, or a `cbcs.SampleDecrypter`, for `stsd` entry `entry` (1-based) of `track`.
-
-        unshackle calls this only for a track `decrypts_samples` names. A remote session runs it on the
-        server, so a decrypter that needs a local process works for remote clients too.
-        """
-        raise NotImplementedError(f"{self.__class__.__name__} does not decrypt samples")
-
-    # Optional Event methods
-
-    def on_segment_downloaded(self, track: AnyTrack, segment: Path) -> None:
-        """
-        Called when one of a Track's Segments has finished downloading.
-
-        Parameters:
-            track: The Track object that had a Segment downloaded.
-            segment: The Path to the downloaded Segment.
-        """
-
-    def on_track_downloaded(self, track: AnyTrack) -> None:
-        """
-        Called when a Track has finished downloading.
-
-        Parameters:
-            track: The downloaded Track object.
-        """
-
-    def on_track_decrypted(self, track: AnyTrack, drm: DRM_T, segment: Optional[m3u8.Segment] = None) -> None:
-        """
-        Called when a Track has finished decrypting.
-
-        Parameters:
-            track: The decrypted Track object.
-            drm: The DRM object it decrypted with.
-            segment: The decrypted HLS segment information. None for DASH and ISM tracks and
-                for an HLS track that merged during the download (merge_segments).
-        """
-
-    def on_track_repacked(self, track: AnyTrack) -> None:
-        """
-        Called when a Track has finished repacking.
-
-        Parameters:
-            track: The repacked Track object.
-        """
-
-    def on_track_multiplex(self, track: AnyTrack) -> None:
-        """
-        Called immediately before unshackle multiplexes a Track into a Container.
-
-        Note: Right now unshackle multiplexes only MKV containers. In the future
-        unshackle can also call this when it multiplexes to other containers like
-        MP4 with FFmpeg/mp4box.
-
-        Parameters:
-            track: The repacked Track object.
         """
 
 
