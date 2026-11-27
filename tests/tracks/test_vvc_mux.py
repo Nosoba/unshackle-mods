@@ -51,7 +51,8 @@ def test_an_h266_track_is_muxed_as_vvc(tmp_path: Path, monkeypatch: pytest.Monke
     assert tracks.videos[0].path == tmp_path / "v.mp4" and tracks.videos[0].path.exists()
     assert not list((tmp_path / "temp").iterdir())
     movie = Movie(id_="movie-0001", service=type("EXAMPLE", (), {}), name="Some Movie", year=2024)
-    assert ".H.266" in movie.get_filename(MediaInfo.parse(out))
+    # The tag separator follows the configured template, so match the codec token only.
+    assert "H.266" in movie.get_filename(MediaInfo.parse(out))
 
 
 def test_the_mp4box_route_gets_the_original_h266_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

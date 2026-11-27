@@ -173,6 +173,10 @@ class TracksReply(TypedDict, total=False):
     sample_decrypt_tracks: list[str]
 
 
+class SegmentsRequest(TypedDict):
+    track_ids: list[str]
+
+
 class SegmentFilterRequest(TypedDict):
     track_id: str
 
@@ -201,10 +205,12 @@ class LicenseReply(TypedDict, total=False):
 
     ``keys`` maps KID to content key for one ``track_id``, and track id to that map for ``track_ids``. A capped
     track gets no content keys: ``capped_tracks`` holds its refusal details, ``reason`` and ``max_height``.
+    ``file_keys`` maps track id to the content key the server licensed for a track's whole-file cipher.
     """
 
     license: str | None
     keys: dict[str, Any]
+    file_keys: dict[str, str]
     vault_keys: list[str]
     clear_tracks: list[str]
     drm_type: str
@@ -227,6 +233,7 @@ class PromptReply(TypedDict, total=False):
 
     status: str
     prompt: str | None
+    qr: str
     cdm_call: dict[str, Any]
     error: str
 
@@ -236,10 +243,13 @@ class PromptAnswer(TypedDict):
 
 
 class LogRecord(TypedDict):
+    """One service log record; ``qr`` is the text of a QR code the client draws below the message."""
+
     seq: int
     level: str
     message: str
     ts: float
+    qr: NotRequired[str]
 
 
 class LogsReply(TypedDict):
@@ -274,11 +284,12 @@ class ChannelMessage(StrEnum):
 
 
 class ChannelPrompt(TypedDict):
-    """A prompt for the user; the answer names its ``id``."""
+    """A prompt for the user; the answer names its ``id``. ``qr`` is the text of a QR code to draw with it."""
 
     type: str
     id: str
     prompt: str
+    qr: NotRequired[str]
 
 
 class ChannelCdmCall(TypedDict):

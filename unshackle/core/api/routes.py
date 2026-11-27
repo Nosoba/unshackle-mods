@@ -1505,7 +1505,7 @@ async def retry_download_job(request: web.Request) -> web.Response:
     Retry download job.
     ---
     summary: Retry download job
-    description: Enqueue a new job reusing a completed, failed, or cancelled job's service, title, and parameters
+    description: Enqueue a new job from the request that made a completed, failed, or cancelled job, checked as a new submission
     parameters:
       - name: job_id
         in: path
@@ -1526,6 +1526,10 @@ async def retry_download_job(request: web.Request) -> web.Response:
                   type: string
                 created_time:
                   type: string
+      '400':
+        description: The service or a parameter no longer passes the checks of a new submission
+      '403':
+        description: The API key may no longer run this job
       '404':
         description: Job not found
       '409':
@@ -1584,7 +1588,8 @@ async def download_job_input(request: web.Request) -> web.Response:
       Submit the answer to the prompt a running job waits on (an OTP code, a PIN, a device-code
       confirmation). The job shows the prompt in its `input_prompt` field and in its SSE `progress`
       events. The job fails if nobody answers within the prompt timeout. A job that waits for an
-      approval on another device shows the message in its `notice` field, which takes no answer.
+      approval on another device shows the message in its `notice` field, which takes no answer. A login
+      to scan with a phone also sets `qr` to the text of the QR code.
     parameters:
       - name: job_id
         in: path
@@ -2240,7 +2245,8 @@ async def session_create(request: web.Request) -> web.Response:
                 description: |
                   DRM system of the client's local CDM; absent when the client has none.
                   A server CDM session loads the device of this system when the server's
-                  cdm entry for the service names both systems
+                  cdm entry for the service names both systems, unless the request sets one
+                  of the service's SERVER_DEVICE_OPTIONS: then the entry's first-listed device
               cdm_security_level:
                 type: integer
                 description: |
@@ -3627,6 +3633,10 @@ async def remote_logins(request: web.Request) -> web.Response:
                       notice:
                         type: string
                         nullable: true
+                      qr:
+                        type: string
+                        nullable: true
+                        description: The text of a QR code to scan with the prompt or notice, or null
     """
     return await remote_logins_handler(request)
 

@@ -158,6 +158,8 @@ class DownloadJob:
     input_prompt: str | None = None
     # Message a service shows through show_notice() while it waits for an approval; needs no answer.
     notice: str | None = None
+    # Text of the QR code that goes with input_prompt or notice.
+    qr: str | None = None
 
     # Subtitles skipped under skip_subtitle_errors (non-fatal). Each entry is a dl.SkippedSubtitle
     # dict (id / language / title) so a client can report which weren't available.
@@ -203,6 +205,7 @@ class DownloadJob:
             "input_prompt": self.input_prompt,
             "track_tree_text": self.track_tree_text,
             "notice": self.notice,
+            "qr": self.qr,
         }
 
         if include_full_details:
@@ -368,9 +371,24 @@ def delete_job_history(job_id: str, allowed: set | None = None, owner: str | Non
     return True
 
 
-def client_sent_keys(params: dict[str, Any]) -> set[str]:
-    """Pop the server's ``client_keys`` stamp; a job without one counts every parameter as client-sent."""
-    return set(params.pop("client_keys", params))
+def stamped_keys(params: dict[str, Any]) -> set[str]:
+    """The parameters the client sent, from the server's ``client_keys`` stamp; every parameter without one."""
+    return set(params.get("client_keys", params))
+
+
+def plan_keys(params: dict[str, Any]) -> set[str] | None:
+    """The parameters a job's dl plan counts as typed: :func:`stamped_keys`, or None (every one) for a relayed job.
+
+    The remote server's own defaults must never replace the values this server merged for a relayed job.
+    """
+    return None if params.get("remote") else stamped_keys(params)
+
+
+def client_sent_keys(params: dict[str, Any]) -> set[str] | None:
+    """Pop the ``client_keys`` stamp and give the :func:`plan_keys` it held."""
+    keys = plan_keys(params)
+    params.pop("client_keys", None)
+    return keys
 
 
 def perform_download(
@@ -962,6 +980,8 @@ class DownloadQueueManager:
                                 job.input_prompt = progress_data["input_prompt"]
                             if "notice" in progress_data:
                                 job.notice = progress_data["notice"]
+                            if "qr" in progress_data:
+                                job.qr = progress_data["qr"]
                             if progress_data.get("skipped_subtitles"):
                                 job.skipped_subtitles = progress_data["skipped_subtitles"]
                             if progress_data.get("track_tree_text"):
@@ -1064,6 +1084,7 @@ class DownloadQueueManager:
             self._download_processes.pop(job.job_id, None)
             job.input_prompt = None
             job.notice = None
+            job.qr = None
 
             temp_paths = self._job_temp_files.pop(job.job_id, {})
             for path in temp_paths.values():

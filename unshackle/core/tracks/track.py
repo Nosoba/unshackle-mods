@@ -28,8 +28,8 @@ from unshackle.core.cdm.detect import is_playready_cdm, is_widevine_cdm
 from unshackle.core.config import config
 from unshackle.core.constants import DOWNLOAD_ALL_DRM, DOWNLOAD_CANCELLED, DOWNLOAD_LICENCE_ONLY, DownloadCancelled
 from unshackle.core.downloaders.requests import requests
-from unshackle.core.drm import DRM_T, BlowfishStripe, PlayReady, Widevine
-from unshackle.core.drm.cenc import init_kid, key_system
+from unshackle.core.drm import DRM_T, WHOLE_FILE_DRM, PlayReady, Widevine
+from unshackle.core.drm.cenc import cenc_key, init_kid
 from unshackle.core.drm.verify import (
     children,
     decrypt_track,
@@ -486,6 +486,7 @@ class Track:
 
         self.path: Path | None = None
         self.url = url
+        self.resolve_url: Callable[[], str] | None = None
         self.language = language
         self.is_original_lang = is_original_lang
         self.descriptor = descriptor
@@ -743,6 +744,15 @@ class Track:
                 continue
         log.debug(f"No {systems[0].__name__} or {systems[1].__name__} PSSH was found for this track, is it DRM free?")
 
+    def ensure_url(self) -> None:
+        """Set the URL from ``resolve_url`` when the track has none.
+
+        A service sets ``resolve_url`` when each URL costs a request, so only a track that is downloaded or sent to a
+        remote client asks for its URL.
+        """
+        if not self.url and self.resolve_url:
+            self.url = self.resolve_url()
+
     def download(
         self,
         session: AnySession,
@@ -859,10 +869,12 @@ class Track:
                 manifest_parsers[self.descriptor].download_track(track=self, ctx=ctx)
             elif self.descriptor == self.Descriptor.URL:
                 try:
+                    self.ensure_url()
                     if (
                         DOWNLOAD_ALL_DRM.is_set()
                         and track_type in ("Video", "Audio")
                         and not {Widevine, PlayReady} <= {type(d) for d in self.drm or []}
+                        and all(type(d) in (Widevine, PlayReady) for d in self.drm or [])
                     ):
                         self.add_init_drm(self.get_init_segment(session=session), cdm)
                     elif not self.drm and track_type in ("Video", "Audio"):
@@ -870,7 +882,7 @@ class Track:
 
                     if self.drm:
                         drm = self.get_drm_for_cdm(cdm)
-                        track_kid = None if isinstance(drm, BlowfishStripe) else self.get_key_id(session=session)
+                        track_kid = None if isinstance(drm, WHOLE_FILE_DRM) else self.get_key_id(session=session)
                         license_drm(self, drm, ctx, track_kid)
                     else:
                         drm = None
@@ -921,7 +933,7 @@ class Track:
                         if drm:
                             progress(downloaded="Decrypting", completed=0, total=None)
                             decrypt_track(drm, save_path, prepare_drm, track_kid, track=self)
-                            if not isinstance(drm, BlowfishStripe):
+                            if not isinstance(drm, WHOLE_FILE_DRM):
                                 assert_fragments_decrypted(save_path)
                             self.drm = None
                             events.emit(events.Types.TRACK_DECRYPTED, track=self, drm=drm, segment=None)
@@ -1126,38 +1138,43 @@ class Track:
 
         return self.load_drm_from_playlist()
 
-    def load_drm_from_playlist(self) -> bool:
-        """
-        Fallback method to load DRM by fetching this track's individual playlist.
+    def load_drm_from_playlist(self, session: Any = None) -> bool:
+        """Load the Widevine and PlayReady DRM of the EXT-X-KEY and EXT-X-SESSION-KEY tags of this track's playlist.
+
+        It skips a tag that gives no DRM, and raises ValueError when the fetch fails or when every such tag fails.
         """
         if self.drm:
             self.needs_drm_loading = False
             return True
 
+        import m3u8
+
+        from unshackle.core.manifests.hls import HLS
+
+        session = self.session or session or run_proxy.fallback_session()
         try:
-            import m3u8
-
-            from unshackle.core.manifests.hls import HLS
-
-            session = getattr(self, "session", None) or run_proxy.fallback_session()
             assert isinstance(self.url, str)
-
-            response = session.get(self.url)
-            playlist = m3u8.loads(utf8_text(response), self.url)
-
-            drm_list: list[DRM_T] = [
-                HLS.get_drm_or_probe(key, playlist, self, probe_session=session)
-                for key in playlist.keys or []
-                if key_system(key)
-            ]
-            if drm_list:
-                self.drm = drm_list
-                self.needs_drm_loading = False
-                return True
-
+            playlist = m3u8.loads(utf8_text(session.get(self.url)), self.url)
         except Exception as e:
             raise ValueError(f"Failed to load DRM from playlist for track {self.id}: {e}")  # noqa: B904
 
+        drm_list: list[DRM_T] = []
+        error: Exception | None = None
+        keys = playlist.keys or []
+        for key in [*keys, *(k for k in playlist.session_keys or [] if k not in keys)]:
+            if not cenc_key(key):
+                continue
+            try:
+                drm_list.append(HLS.get_drm_or_probe(key, playlist, self, probe_session=session))
+            except Exception as e:
+                logging.getLogger("track").debug(f"Skipping HLS key {key} of track {self.id}: {e!r}")
+                error = e
+        if drm_list:
+            self.drm = drm_list
+            self.needs_drm_loading = False
+            return True
+        if error:
+            raise ValueError(f"Failed to load DRM from playlist for track {self.id}: {error}")
         return False
 
     def get_init_segment(

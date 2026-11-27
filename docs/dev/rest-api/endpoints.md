@@ -17,7 +17,7 @@ Start the server with [`unshackle serve`](../../guide/cli-reference.md). By defa
 - **CORS.** Every response carries permissive CORS headers, and the server answers `OPTIONS` preflight requests automatically.
 - **Compression.** JSON responses of 256 bytes or more are gzip-compressed when the client sends `Accept-Encoding: gzip`. A [slow response](#slow-responses) is not compressed.
 - **Service allowlist.** The effective allowlist for your API key filters the service-facing endpoints (the intersection of the global `serve.services` list and your per-key list). The server treats services you cannot use as unknown.
-- **Remote services.** A full-mode server can run a service through one of its own `remote_services` servers (see [Remote sessions](remote-sessions.md)). `GET /api/config` lists their names in `remote_services`, and `GET /api/services?remote=<name>` lists that server's services, each with `remote` set to the name. Add `"remote": "<name>"` to `POST /api/search`, `/api/list-titles`, `/api/list-tracks` or `/api/download`, and the server opens a remote session with its own key for that server: the remote logs in and resolves titles, tracks and licences, and a download still runs, decrypts and muxes here. The tag may be any case or an alias, and your allowlist applies to it. An unknown name is `400 INVALID_PARAMETERS`, a server that does not answer is `SERVICE_UNAVAILABLE`, and a tag it does not offer is `INVALID_SERVICE`. List calls from the same API key for the same title, profile, proxy, client region and service options share one remote session, which closes after 120 seconds unused. An optional `client_name` names your client on the remote server's dashboard as `serve (<client_name>)`. A relayed search opens no remote session. The server sends its own credentials, cookies and cache for the `profile` with the search. A service that searches with no login gets none of them. A `--remote-only` server does not relay. A remote login that waits on you (a pair code or URL to approve on another device) cannot answer through a list call, so poll `GET /api/remote/logins` alongside it: each entry carries the login's `notice`, and its `prompt` when it asks a question (an OTP), which you answer with `POST /api/remote/logins/{id}/input` and `{"response": "..."}`. A remote download job shows the same text as its own `notice`, and asks a question (an OTP) through `input_prompt` as a local job does.
+- **Remote services.** A full-mode server can run a service through one of its own `remote_services` servers (see [Remote sessions](remote-sessions.md)). `GET /api/config` lists their names in `remote_services`, and `GET /api/services?remote=<name>` lists that server's services, each with `remote` set to the name. Add `"remote": "<name>"` to `POST /api/search`, `/api/list-titles`, `/api/list-tracks` or `/api/download`, and the server opens a remote session with its own key for that server: the remote logs in and resolves titles, tracks and licences, and a download still runs, decrypts and muxes here. The tag may be any case or an alias, and your allowlist applies to it. An unknown name is `400 INVALID_PARAMETERS`, a server that does not answer is `SERVICE_UNAVAILABLE`, and a tag it does not offer is `INVALID_SERVICE`. List calls from the same API key for the same title, profile, proxy, client region and service options share one remote session, which closes after 120 seconds unused. An optional `client_name` names your client on the remote server's dashboard as `serve (<client_name>)`. A relayed search opens no remote session. The server sends its own credentials, cookies and cache for the `profile` with the search. A service that searches with no login gets none of them. A `--remote-only` server does not relay. A remote login that waits on you (a pair code or URL to approve on another device) cannot answer through a list call, so poll `GET /api/remote/logins` alongside it: each entry carries the login's `notice`, its `qr` (the text of a QR code to scan, or null), and its `prompt` when it asks a question (an OTP), which you answer with `POST /api/remote/logins/{id}/input` and `{"response": "..."}`. A remote download job shows the same text as its own `notice`, and asks a question (an OTP) through `input_prompt` as a local job does.
 
 !!! warning "Error responses have two shapes"
     Structured application errors (raised inside a handler) return `{"status": "error", "error_code": "...", "message": "...", "timestamp": "..."}`. The authentication middleware, however, returns a **different** shape: `{"status": 401, "message": "..."}` with an integer `status` and no `error_code`. The same middleware answers `429` in that shape when an API key goes over its rate limit. Clients must accept both shapes. The [Error responses](#error-responses) section at the bottom of this page gives the full error model.
@@ -589,7 +589,8 @@ Show download jobs, with optional filtering and sorting.
           "skipped_subtitles": [],
           "skipped_titles": [],
           "input_prompt": null,
-          "notice": null
+          "notice": null,
+          "qr": null
         }
       ]
     }
@@ -707,10 +708,10 @@ Remove every terminal (completed/failed/cancelled) job from the manager. No requ
 
 ### `POST /api/download/jobs/{job_id}/retry`
 
-Enqueue a **new** job that reuses a terminal job's service, title, and parameters. The service allowlist and parameter gates are re-checked. Returns `202` with the new job's ID.
+Enqueue a **new** job from the request that made a terminal job. The request goes through the same checks as a new submission: the service allowlist, the parameter checks and the download gates. A parameter that the request did not send takes the server default of the time of the retry. Returns `202` with the new job's ID.
 
 !!! warning "Retry reuses the original, unredacted parameters"
-    A retry replays the finished job's stored parameters exactly as the original client submitted them, including any secrets such as `credential`/`credentials`. It does not use the redacted `parameters` view that `GET /api/download/jobs` and `GET /api/history` give. This is deliberate: it lets a retried job reproduce a credentialed download that the redacted job record alone never could. The API masks those credentials everywhere else. But anyone who can retry a job can operate it again with the original credentials.
+    A retry sends again the parameters that the original client submitted, including any secrets such as `credential`/`credentials`. It does not use the redacted `parameters` view that `GET /api/download/jobs` and `GET /api/history` give. This is deliberate: it lets a retried job reproduce a credentialed download that the redacted job record alone never could. The API masks those credentials everywhere else. But anyone who can retry a job can operate it again with the original credentials.
 
 === "Response `202`"
 
@@ -728,6 +729,7 @@ Enqueue a **new** job that reuses a terminal job's service, title, and parameter
 | `404` | `JOB_NOT_FOUND` | No such job. |
 | `409` | `CONFLICT` | Job is not in a terminal state. |
 | `400` | `INVALID_SERVICE` | Service is no longer allowed. |
+| `400` | `INVALID_PARAMETERS` | A parameter no longer passes the checks, for example an `output_dir` outside a moved downloads directory. |
 | `403` | `FORBIDDEN` | A gated parameter is no longer permitted. |
 | `403` | `SERVER_CDM_CAPPED` | The job is no longer inside the `server_cdm_max_height` of the API key. |
 
@@ -756,7 +758,8 @@ answer here.
 
 A job that waits for an approval on another device, such as a pair code login, shows the
 message in its `notice` field instead. A notice needs no answer: show it to the user and keep
-polling.
+polling. When the login is a QR code to scan, the job also sets `qr` to the text of the code:
+draw it as a QR code beside the prompt or notice.
 
 === "Request"
 
@@ -951,7 +954,7 @@ POST /api/session/create        → returns session_id, status "authenticating"
 GET  /api/session/{id}/channel  → WebSocket: prompts, CDM calls, logs, login state, drain
 GET  /api/session/{id}/prompt   → without the channel: poll until authenticated (submit answers via POST)
 GET  /api/session/{id}/titles   → list titles
-POST /api/session/{id}/tracks   → tracks + chapters (with URLs) for one title
+POST /api/session/{id}/tracks   → tracks + chapters (with URLs) for one title; a track that resolves its URL on use has resolve_url true and no URL
 POST /api/session/{id}/segments → resolve segment URLs / DRM / headers per track
 POST /api/session/{id}/segment_filter → HLS segments the service drops (ads, bumpers)
 POST /api/session/{id}/samples  → decrypt cbcs samples of a track on the server
@@ -1232,9 +1235,10 @@ A slow answer arrives as a [slow response](#slow-responses).
 | `track_id` / `track_ids` | Single track, or a batch of tracks. |
 | `challenge` | Base64 CDM challenge (proxy mode). |
 | `pssh` | Base64 PSSH (server-CDM mode). |
-| `drm_type` | `widevine` (default) or `playready`. In server-CDM mode the server's `cdm` mapping for the service decides the DRM system and the response `drm_type` names the system that licensed. The client's value decides only when the server has no mapping for the service. |
+| `drm_type` | `widevine` (default) or `playready`. In server-CDM mode the server's `cdm` mapping for the service decides the DRM system and the response `drm_type` names the system that licensed. The client's value decides only when the server has no mapping for the service. A track whose DRM is a whole-file cipher takes `clearkeyctr` with no `pssh`: the service on the server licenses it. |
 | `mode` | `proxy` (default) or `server_cdm`. |
 | `clear_tracks` (response) | Requested track ids that carry no DRM, so they have no keys. Absent when every requested track is encrypted. |
+| `file_keys` (response) | Content keys of whole-file ciphers, by track id, for a single track and for a batch. Absent when no requested track holds such a cipher. |
 | `vault_keys` (response) | KIDs whose content key came from a server vault, not the CDM. The client proves such a content key with a decode before it trusts it; the field is absent when every content key came from the CDM. |
 
 | Status | Error code | Meaning |

@@ -17,7 +17,7 @@ from rich.rule import Rule
 
 from unshackle.core.cacher import Cacher
 from unshackle.core.config import config
-from unshackle.core.console import console, prompt_user, show_notice
+from unshackle.core.console import console, prompt_user, show_notice, show_qr
 from unshackle.core.credential import Credential
 from unshackle.core.launch import launch_keys
 from unshackle.core.proxies.basic import Basic
@@ -167,7 +167,8 @@ class Service(TitleSource):
     # such as an ESN); the server's own values for these keys are withheld from that session.
     CLIENT_CONFIG: tuple[str, ...] = ()
     # Every service option that makes the service call ``cdm.lend_server_device()``. A remote session with
-    # one of them set keeps the server CDM even when the remote client picked its own device.
+    # one of them set keeps the server CDM even when the remote client picked its own device, and the server
+    # loads the first-listed device of its cdm entry, whatever system the client's device is.
     SERVER_DEVICE_OPTIONS: tuple[str, ...] = ()
     # Cache key prefixes that hold state built from the device identity (a device ID, device session keys), never
     # login state. A remote session on the server's device keeps them on the server, per API key.
@@ -477,19 +478,20 @@ class Service(TitleSource):
         if self._input_bridge is not None:
             self._input_bridge.ensure_input_supported()
 
-    def request_input(self, prompt: str) -> str:
+    def request_input(self, prompt: str, qr: str | None = None) -> str:
         """Request interactive input from the user.
 
         Locally, prompts through the shared rich console so the prompt renders alongside
         Live progress. A remote-dl session relays it through its :class:`InputBridge`, and a
         REST download job relays it through ``prompt_user`` to the job's ``input_prompt``.
+        *qr* is the text of a QR code for the user to scan; the terminal that asks the user draws it.
         """
         if self._input_bridge is not None:
-            return self._input_bridge.request_input(prompt)
-        return prompt_user(prompt)
+            return self._input_bridge.request_input(prompt, qr=qr)
+        return prompt_user(prompt, qr)
 
     def wait_for_approval(
-        self, message: str, check: Callable[[], T | None], timeout: float, interval: float = 3.0
+        self, message: str, check: Callable[[], T | None], timeout: float, interval: float = 3.0, qr: str | None = None
     ) -> T:
         """Show ``message``, then call ``check`` until it returns a value.
 
@@ -497,9 +499,12 @@ class Service(TitleSource):
         ``check`` returns None while the approval is pending, and must return within a few
         seconds. Raises TimeoutError after ``timeout`` seconds, and RuntimeError when the
         remote session no longer exists. A REST download job shows ``message`` as its ``notice``.
+        *qr* is the text of a QR code for the user to scan; a remote client gets it with the log record of ``message``.
         """
-        self.log.info(message)
-        show_notice(message)
+        self.log.info(message, extra={"qr": qr})
+        if qr and self._input_bridge is None:
+            show_qr(qr)
+        show_notice(message, qr)
         deadline = time.monotonic() + timeout
         try:
             while True:

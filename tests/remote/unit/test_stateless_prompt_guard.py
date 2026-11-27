@@ -194,7 +194,7 @@ def test_cli_preflight_is_noop_and_still_prompts(monkeypatch):
     monkeypatch.setattr(service_module, "prompt_user", terminal)
     assert service.ensure_input_supported() is None
     assert service.request_input(PROMPT) == "001234"
-    terminal.assert_called_once_with(PROMPT)
+    terminal.assert_called_once_with(PROMPT, None)
 
 
 def test_remote_preflight_does_not_issue_or_answer_a_prompt():
@@ -238,4 +238,4 @@ def test_download_worker_still_relays_service_input(monkeypatch):
         console_module.set_notice_handler(previous_notice)
         os.close(write_fd)
         os.close(read_fd)
-    assert updates == [{"input_prompt": PROMPT}, {"input_prompt": None}]
+    assert updates == [{"input_prompt": PROMPT, "qr": None}, {"input_prompt": None, "qr": None}]

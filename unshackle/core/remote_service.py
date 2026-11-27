@@ -19,6 +19,7 @@ import shlex
 import sys
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from functools import partial
 from http.cookiejar import CookieJar
 from threading import Lock, local
 from typing import (
@@ -44,8 +45,9 @@ from unshackle.core.console import SyncLive, console
 from unshackle.core.constants import AnyTrack
 from unshackle.core.credential import Credential
 from unshackle.core.dl_options import remote_dl_params
-from unshackle.core.drm import cbcs, real_kids
+from unshackle.core.drm import cbcs, real_kids, whole_file_cipher
 from unshackle.core.drm.cenc import drm_stub
+from unshackle.core.drm.discovery import track_pssh
 from unshackle.core.launch import launch_keys
 from unshackle.core.manifests.snapshot import match_track, restore
 from unshackle.core.proxies.resolve import is_loopback
@@ -57,6 +59,7 @@ from unshackle.core.remote_protocol import (
     SAMPLES_ROUTE,
     SEARCH_ROUTE,
     SEGMENT_FILTER_ROUTE,
+    SEGMENTS_ROUTE,
     SERVICES_ROUTE,
     SESSION_CREATE_ROUTE,
     SESSION_ROUTE,
@@ -71,6 +74,7 @@ from unshackle.core.remote_protocol import (
     LicenseRequest,
     SegmentFilterReply,
     SegmentFilterRequest,
+    SegmentsRequest,
     SessionClosed,
     SessionCreate,
     SessionCreated,
@@ -410,17 +414,6 @@ def sample_batches(samples: list[bytes]) -> Iterator[list[bytes]]:
         size += len(sample)
     if batch:
         yield batch
-
-
-def track_pssh(track: Any, drm_type: str, drm: Any = None) -> str | None:
-    """The base64 PSSH of one DRM system's header: ``drm``'s own when it is of that system, else the track's first."""
-    for drm_obj in [drm, *(track.drm or [])]:
-        drm_class = drm_obj.__class__.__name__
-        if drm_type == "playready" and drm_class == "PlayReady":
-            return drm_obj.data["pssh_b64"]
-        if drm_type == "widevine" and drm_class == "Widevine":
-            return drm_obj.pssh.dumps()
-    return None
 
 
 def apply_service_track_data(tracks: Tracks, data: dict[str, Any]) -> None:
@@ -890,6 +883,7 @@ class RemoteService(TitleSource):
         self._input_bridge: Any = None  # a serve relaying for a REST client sets one, as it does for a Service
         # what a login waiting on the user (a pair code, an approval link) last showed; None otherwise
         self.auth_notice: str | None = None
+        self.auth_qr: str | None = None
         self._reopen_lock = Lock()
         self._current_title: Title_T | None = None
         # client title and track id -> the id a reopened session gave the same title or track
@@ -1448,6 +1442,8 @@ class RemoteService(TitleSource):
         for track in [*tracks.videos, *tracks.audio, *tracks.subtitles]:
             if track.descriptor == Track.Descriptor.HLS:
                 track.OnSegmentFilter = self.remote_segment_filter(str(track.id))
+            if not track.url:
+                track.resolve_url = partial(self.track_url, track)
 
         self._tracks_by_title[title_id] = tracks
         self._chapters_by_title[title_id] = result.get("chapters", [])
@@ -1552,6 +1548,7 @@ class RemoteService(TitleSource):
             track_ids = [self.server_track_id(t.id) for t in keyed]
             self.drain_server_logs()
             keys_by_track = resp.get("keys", {})
+            file_keys = resp.get("file_keys", {})
             clear_tracks = set(resp.get("clear_tracks", []))
             vault_kids = set(resp.get("vault_keys", []))
             for track_keys in keys_by_track.values():
@@ -1564,6 +1561,11 @@ class RemoteService(TitleSource):
 
             for track in title.tracks:
                 server_id = self.server_track_id(track.id)
+                cipher = whole_file_cipher(track)
+                if cipher is not None:
+                    if server_id in file_keys:
+                        cipher.take_key(file_keys[server_id])
+                    continue
                 track_keys = keys_by_track.get(server_id, {})
                 if not track_keys:
                     if server_id in track_ids and server_id not in clear_tracks | set(capped):
@@ -1641,7 +1643,9 @@ class RemoteService(TitleSource):
                 label = f"the {height}p track" if height else str(track)
                 hint = f"; pass -q {height} to start the session on your device" if cap and height else ""
                 have = " and ".join(sorted(systems))
-                raise click.ClickException(f"{why}, and {label} has only {have} DRM for your {drm_class} device{hint}")
+                raise click.ClickException(
+                    f"{why}, and {label} has only {have} DRM, which your local {drm_class} CDM cannot license{hint}"
+                )
             drm_class = other
         track.drm_preference = drm_class.lower()
         self.client_licensed.add(str(track.id))
@@ -1768,6 +1772,51 @@ class RemoteService(TitleSource):
         self.license_locally(track, resp.get("details") or {})
         return None
 
+    def license_file(self, track: AnyTrack) -> str:
+        """The content key the server licenses for the whole-file cipher of ``track``, or raise ClickException."""
+        if self.local_vaults_only or not self._server_cdm:
+            raise coded(
+                click.ClickException(f"Track {track.id} needs a server licence that this session does not allow"),
+                APIErrorCode.DRM_ERROR,
+            )
+        try:
+            with quiet():
+                resp = self.session_call(
+                    lambda sid: self.client.post(
+                        LICENSE_ROUTE.format(session_id=sid),
+                        LicenseRequest(
+                            mode="server_cdm", drm_type="clearkeyctr", track_id=self.server_track_id(track.id)
+                        ),
+                    )
+                )
+        except RemoteError as e:
+            raise coded(click.ClickException(e.message), APIErrorCode.DRM_ERROR) from None
+        finally:
+            self.drain_server_logs()
+        if not (key := (resp.get("file_keys") or {}).get(self.server_track_id(track.id))):
+            raise coded(
+                click.ClickException(f"The server sent no content key for track {track.id}"), APIErrorCode.DRM_ERROR
+            )
+        return str(key)
+
+    def track_url(self, track: Track) -> str:
+        """The URL that the server looks up for a track it sent with ``resolve_url``, or raise ClickException."""
+        server_id = self.server_track_id(track.id)
+        try:
+            with quiet():
+                resp = self.session_call(
+                    lambda sid: self.client.post(
+                        SEGMENTS_ROUTE.format(session_id=sid), SegmentsRequest(track_ids=[server_id])
+                    )
+                )
+        except RemoteError as e:
+            raise click.ClickException(e.message) from None
+        finally:
+            self.drain_server_logs()
+        if not (url := ((resp.get("tracks") or {}).get(server_id) or {}).get("url")):
+            raise click.ClickException(f"The server sent no URL for track {track.id}")
+        return str(url)
+
     def proxy_license(self, challenge: bytes | str, track: AnyTrack, drm_type: str) -> bytes:
         """Relay a licence challenge to the server. A failed relay raises ClickException, so dl's licence fallbacks see it."""
         if isinstance(challenge, str):
@@ -1824,8 +1873,13 @@ class RemoteService(TitleSource):
         if not cache_data:
             return
 
-        from unshackle.core.api.compression import safe_inflate
-        from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key, safe_cache_payload
+        from unshackle.core.api.compression import InflateLimitError, safe_inflate
+        from unshackle.core.api.sanitize import (
+            MAX_SESSION_CACHE_BYTES,
+            MAX_SESSION_CACHE_KEYS,
+            safe_cache_key,
+            safe_cache_payload,
+        )
 
         if len(cache_data) > MAX_SESSION_CACHE_KEYS:
             self.log.warning(f"Ignoring {len(cache_data)} cache files from server: more than {MAX_SESSION_CACHE_KEYS}")
@@ -1836,6 +1890,7 @@ class RemoteService(TitleSource):
         relevant = cache_key_filter(self.service_tag, profile)
 
         saved = 0
+        budget = MAX_SESSION_CACHE_BYTES
         for key, content in cache_data.items():
             safe_name = safe_cache_key(key)
             if not safe_name:
@@ -1845,7 +1900,8 @@ class RemoteService(TitleSource):
                 self.log.debug(f"Ignoring cache file from the remote server for another profile: {safe_name}")
                 continue
             try:
-                decompressed = safe_inflate(base64.b64decode(content))
+                decompressed = safe_inflate(base64.b64decode(content), budget)
+                budget -= len(decompressed)
                 if not safe_cache_payload(decompressed.decode("utf-8")):
                     self.log.warning(
                         f"Rejecting cache file '{safe_name}' from the server: it holds a type a peer may not send"
@@ -1856,6 +1912,11 @@ class RemoteService(TitleSource):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(decompressed)
                 saved += 1
+            except InflateLimitError:
+                self.log.warning(
+                    f"Ignoring the rest of the cache files from server: more than {MAX_SESSION_CACHE_BYTES} bytes"
+                )
+                break
             except Exception as e:
                 self.log.warning(f"Failed to save returned cache file '{safe_name}': {e}")
 
@@ -1875,7 +1936,7 @@ class RemoteService(TitleSource):
         """
         import zlib
 
-        from unshackle.core.api.sanitize import MAX_SESSION_CACHE_KEYS, safe_cache_key
+        from unshackle.core.api.sanitize import MAX_SESSION_CACHE_BYTES, MAX_SESSION_CACHE_KEYS, safe_cache_key
 
         cache_dir = config.directories.cache / self.service_tag
         if not cache_dir.is_dir():
@@ -1883,6 +1944,7 @@ class RemoteService(TitleSource):
 
         relevant = cache_key_filter(self.service_tag, profile)
         files: dict[str, str] = {}
+        size = 0
         for f in sorted(cache_dir.rglob("*.json")):
             key = f.relative_to(cache_dir).as_posix()[: -len(".json")]
             if f.stem.startswith("titles_") or not safe_cache_key(key):
@@ -1890,7 +1952,14 @@ class RemoteService(TitleSource):
             if not relevant(key):
                 self.log.debug(f"Withholding cache file from the remote server: {key}")
                 continue
-            files[key] = base64.b64encode(zlib.compress(f.read_bytes())).decode("ascii")
+            content = f.read_bytes()
+            size += len(content)
+            files[key] = base64.b64encode(zlib.compress(content)).decode("ascii")
+        if size > MAX_SESSION_CACHE_BYTES:
+            self.log.warning(
+                f"The {self.service_tag} cache has {size} bytes to send and a remote server takes "
+                f"{MAX_SESSION_CACHE_BYTES}: remove old files from {cache_dir}"
+            )
         if len(files) > MAX_SESSION_CACHE_KEYS:
             self.log.warning(
                 f"The {self.service_tag} cache has {len(files)} files to send and a remote server takes "

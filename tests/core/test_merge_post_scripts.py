@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from unshackle.commands.dl import dl, post_script_group, title_wanted
+from unshackle.core import title_metadata
 from unshackle.core.config import config
 from unshackle.core.events import Events
 from unshackle.core.title_source import CacheIdentity, KeyArrival
@@ -117,7 +118,7 @@ def offline_run(monkeypatch, tmp_path):
     monkeypatch.setattr(dl_module, "SyncLive", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(dl_module.console, "status", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(dl_module.console, "print", lambda *args, **kwargs: None)
-    monkeypatch.setattr(dl_module.providers, "resolve_by_ids", lambda *args, **kwargs: None)
+    monkeypatch.setattr(title_metadata.providers, "resolve_by_ids", lambda *args, **kwargs: None)
     monkeypatch.setattr(dl_module, "grow_session_pool", lambda *args: None)
     monkeypatch.setattr(
         dl_module.MediaInfo, "parse", lambda *args: SimpleNamespace(video_tracks=[], audio_tracks=[], general_tracks=[])

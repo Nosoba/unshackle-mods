@@ -165,6 +165,7 @@ full detail:
 | `skipped_titles` | list | Titles that the run skipped because a requested track or language is missing, each `{title, reason}`. |
 | `input_prompt` | string or `null` | The prompt the service waits on. Answer it with `POST /api/download/jobs/{job_id}/input`. |
 | `notice` | string or `null` | A message the service shows while it waits for an approval on another device, such as a pair code. It needs no answer. |
+| `qr` | string or `null` | The text of a QR code that goes with `input_prompt` or `notice`, such as a login URL to scan with a phone. Draw it as a QR code. |
 
 The full detail adds `started_time`, `completed_time`, `output_files`, the redacted
 `parameters`, and, for failed jobs, `error_message`, `error_details`, and `error_code`.
@@ -265,9 +266,13 @@ ID with `202`.
 - You can retry only terminal jobs. A retry of a `queued` or `downloading` job returns
   `409` with error code `CONFLICT`.
 - A missing job returns `404` (`JOB_NOT_FOUND`).
-- The server examines the service allowlist and any download gates again for the new
-  job, exactly as for the original submission. Thus the server can reject a retry with
-  `INVALID_SERVICE` or `FORBIDDEN` if permissions changed.
+- The server sends the original request through the same checks as a new submission:
+  the service allowlist, the parameter checks and the download gates. A retry that no
+  longer passes gets the same error as a new submission, for example
+  `INVALID_SERVICE`, `INVALID_PARAMETERS` or `FORBIDDEN` after a config change.
+- Each parameter that the original request did not send takes the server default of
+  the time of the retry, from `serve:` and `services.<TAG>.dl`. A job for a
+  `remote` server takes no local service defaults.
 
 ```json title="202 Accepted, a fresh job"
 {
@@ -371,7 +376,8 @@ The job worker has no terminal. When a service asks the user for input, the job 
 the prompt to `progress.json` as `input_prompt` and waits. The answer from
 `POST /api/download/jobs/{job_id}/input` goes to the job worker on its stdin.
 When a service waits for an approval on another device, the job worker writes the message as
-`notice` and sets it back to `null` when the wait ends.
+`notice` and sets it back to `null` when the wait ends. A QR code to scan goes out as `qr`, and
+the end of its prompt or notice sets it back to `null`.
 
 Running each download out-of-process isolates the server from crashes, memory growth,
 and blocking work inside the download engine, and makes hard cancellation (killing the
