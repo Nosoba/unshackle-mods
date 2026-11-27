@@ -474,7 +474,7 @@ Make a download job. It requires `service` and `title_id`. Every other field is 
 | `export` | boolean | `false` | Export manifest/keys/subs to JSON. |
 | `cdm_only` | boolean | `null` | Force CDM-only (`true`) or vault-only (`false`) key retrieval. With `remote`, `true` licenses every track with the CDM of this server and uses no CDM or vault of the remote server. |
 | `proxy` / `no_proxy` / `no_proxy_download` / `proxy_download` | string / bool / bool / string | `null` / `false` / `false` / `null` | Proxy controls. `proxy` and `proxy_download` must be full proxy URIs on a public host unless the API key has `server_proxy`. A Control D resolver, `controld://<resolver>@dns.controld.com`, counts as a full proxy URI: the server runs a forwarder for it. |
-| `no_folder` / `no_source` / `no_mux` | boolean | `false` | Output/mux controls. |
+| `folder` / `no_source` / `no_mux` | boolean | `false` | Output/mux controls. |
 | `sample` | boolean/string | `null` | Download a short sample and write it with a `SAMPLE` tag on the filename in a `Sample` folder inside the output folder. `true` is 60 seconds from 2 minutes in; `"0-60"` is a window in seconds. |
 | `include_sample` | boolean | `false` | Download the full title, then also cut a 60 second sample from each muxed file into a `Sample` folder next to it. |
 | `workers` | int | `null` | Threads per track. |

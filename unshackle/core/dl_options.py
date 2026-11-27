@@ -84,7 +84,7 @@ DL_OPTIONS: dict[str, ApiOption | None] = {
     "no_proxy": ApiOption(False),
     "no_proxy_download": ApiOption(False),
     "proxy_download": ApiOption(None),
-    "no_folder": ApiOption(False),
+    "folder": ApiOption(False),
     "no_source": ApiOption(False),
     "no_mux": ApiOption(False),
     "season_override": ApiOption(None),

@@ -135,6 +135,6 @@ def test_a_no_mux_run_keeps_both_same_language_aac_tracks(
     out = tmp_path / "out"
     monkeypatch.setattr(config.directories, "downloads", out)
     stub_hybrid(monkeypatch)
-    flags: dict[str, Any] = {"no_mux": True, "audio_description": True, "no_folder": True}
+    flags: dict[str, Any] = {"no_mux": True, "audio_description": True, "folder": False}
     assert run(monkeypatch, caplog, {}, service=DownloadedAudio(tmp_path), to_end=True, **flags) is None
     assert sorted(p.read_bytes() for p in out.iterdir()) == [b"a", b"ad"]

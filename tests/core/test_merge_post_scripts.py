@@ -211,7 +211,6 @@ def offline_run(monkeypatch, tmp_path):
             workers=1,
             sub_format="original",
             folder=False,
-            no_folder=True,
             no_mux=False,
             audio_only=kind == "audio_description_only",
             subs_only=kind == "forced_subs_only",
@@ -270,7 +269,7 @@ def test_season_waits_for_last_selected_title_even_when_skipped(offline_run, ove
 @pytest.mark.parametrize("folder", [False, True])
 @pytest.mark.parametrize("override", [None, 0, 7])
 def test_original_seasons_can_collapse_without_changing_folder_opt_in(offline_run, folder, override):
-    result = offline_run([(1, 1, True), (2, 2, True), (3, 3, True)], season_override=override, no_folder=not folder)
+    result = offline_run([(1, 1, True), (2, 2, True), (3, 3, True)], season_override=override, folder=folder)
     assert result.exit_code is None
     seasons = [call for call in result.calls if call[1] == "season"]
     assert len(seasons) == (3 if override is None else 1)

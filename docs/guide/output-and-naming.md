@@ -30,7 +30,7 @@ Two command-line flags change this layout for a single run:
 | Flag | Effect |
 |---|---|
 | `-o`, `--output` | Use this directory instead of `directories.downloads`. |
-| `--no-folder` | Skip the per-title subfolder; write the file directly into the output directory. |
+| `-F`, `--folder` | Put the episode in a per-title subfolder; off means write straight into the output directory. |
 | `--no-source` | Omit the service source tag from both the filename and folder (the `{source}` variable resolves to empty). |
 
 !!! info "Which tag `{source}` uses"
@@ -824,4 +824,4 @@ how the optional (`?`) variables appear and disappear.
 ## See also
 
 - [Configuration File](../getting-started/configuration-file.md): the full `unshackle.yaml` structure.
-- [Downloading](downloading.md): the `dl` command and per-run flags like `-o`, `--no-folder`, `--tag`, and `--repack`.
+- [Downloading](downloading.md): the `dl` command and per-run flags like `-o`, `--folder`, `--tag`, and `--repack`.

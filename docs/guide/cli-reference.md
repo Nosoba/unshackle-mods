@@ -153,7 +153,7 @@ Keep only certain track types, or skip certain track types.
 | `--split-audio` | Write a separate output file per audio codec instead of merging. Defaults to config `muxing.merge_audio`. |
 | `--merge-video` | Mux video tracks that share a height, range, and codec into one file, so only language varies inside a file. Defaults to config `muxing.merge_video`. |
 | `-o`, `--output` | Override the output directory for this run. |
-| `--no-folder` | Disable folder creation for TV shows. |
+| `-F`, `--folder` | Put TV show episodes in their own folder. Off by default. |
 | `--no-source` | Remove the source tag from the filename/path. |
 | `--no-mux` | Do not mux; keep individual track files. |
 | `--sample` | Download a short sample and write it with a `SAMPLE` tag on the filename in a `Sample` folder inside the output folder. Bare `--sample` = 60 seconds from 2 minutes in; `--sample 0-60` = a custom window in seconds. |

@@ -1192,9 +1192,9 @@ async def download(request: web.Request) -> web.Response:
               daily:
                 type: boolean
                 description: Treat the title as daily content and fill missing air dates from TVDB. Needs enrich (default - false)
-              no_folder:
+              folder:
                 type: boolean
-                description: Disable folder creation for TV shows (default - false)
+                description: Put TV show episodes in their own folder (default - false)
               no_source:
                 type: boolean
                 description: Disable source tag from output file name (default - false)

@@ -843,7 +843,7 @@ unshackle dl -q 1080 -v H.265 -r HDR10 --list EXAMPLE 81234567
 
 - `-o` / `--output`: override the output directory for this run (otherwise unshackle
   uses the configured downloads directory).
-- `--no-folder`: do not make a per-show folder for TV downloads.
+- `-F` / `--folder`: put a TV show's episodes in a per-show folder (off by default).
 - `--no-source`: remove the service source tag from the filename and path.
 
 ```shell title="Send this download somewhere specific"

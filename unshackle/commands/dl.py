@@ -1385,7 +1385,13 @@ class dl:
         default=None,
         help="Proxy for the downloads only, in the same form as --proxy. Manifest, license, and auth use --proxy.",
     )
-    @click.option("--no-folder", is_flag=True, default=False, help="Disable folder creation for TV Shows.")
+    @click.option(
+        "--folder",
+        "-F",
+        is_flag=True,
+        default=False,
+        help="Put TV show episodes in their own folder (off by default).",
+    )
     @click.option(
         "--no-source", is_flag=True, default=False, help="Disable the source tag from the output file name and path."
     )
@@ -1934,7 +1940,7 @@ class dl:
         no_proxy: bool,
         no_proxy_download: bool,
         proxy_download: str | None,
-        no_folder: bool,
+        folder: bool,
         no_source: bool,
         no_mux: bool,
         sample: tuple[int, int] | None,
@@ -3111,7 +3117,7 @@ class dl:
                 placement = Placement(
                     title,
                     root=self.output_dir or config.directories.downloads,
-                    no_folder=no_folder,
+                    no_folder=not folder,
                     no_source=no_source,
                     sample=bool(sample),
                 )
