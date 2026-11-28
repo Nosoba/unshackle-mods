@@ -7,6 +7,7 @@ from typing import cast
 from uuid import UUID
 
 import click
+from requests import RequestException
 from rich.console import RenderableType
 from rich.padding import Padding
 from rich.progress import (
@@ -24,7 +25,7 @@ from unshackle.core.config import config
 from unshackle.core.console import GradientPulseBarColumn, console
 from unshackle.core.constants import context_settings
 from unshackle.core.services import Services
-from unshackle.core.vault import Vault, is_null_key
+from unshackle.core.vault import Refused, Vault, brief, is_null_key
 from unshackle.core.vaults import Vaults, load_config_vaults
 
 
@@ -57,6 +58,11 @@ def without_null_keys(pairs: Iterable[tuple[str, str]], log: logging.Logger) -> 
     return kid_keys
 
 
+def is_refusal(error: Exception) -> bool:
+    """True when the vault answered and refused the write, not when it is unreachable or misconfigured."""
+    return isinstance(error, Refused) or (isinstance(error, ValueError) and not isinstance(error, RequestException))
+
+
 def process_service_keys(from_vault: Vault, service: str, log: logging.Logger) -> dict[str, str]:
     """Get and validate keys from a vault for a specific service."""
     return without_null_keys(from_vault.get_keys(service), log)
@@ -71,12 +77,12 @@ class _PaddedProgress(Progress):
 
 def add_keys_with_progress(vault: Vault, service: str, kid_keys: dict[str, str], log: logging.Logger) -> int:
     """Add content keys to a vault. Network vaults write in batches behind a progress bar."""
-    if type(vault).__name__ in ("MySQL", "SQLite"):
+    if vault.bulk_writes:
         return vault.add_keys(service, cast(dict[UUID | str, str], kid_keys))
 
     def chunk(i: int) -> int:
         # Probe with one key so a server that rejects batches costs one row, not 500.
-        return 500 if i and getattr(vault, "batch_insert", True) else 1
+        return 500 if i and vault.batch_insert else 1
 
     kids = list(kid_keys)
     added = 0
@@ -114,7 +120,7 @@ def copy_service_data(
     try:
         content_keys = process_service_keys(from_vault, service, log)
     except Exception as e:
-        log.warning(f"{service}: Could not read from {from_vault} ({e}), skipped")
+        log.warning(f"{service}: Could not read from {from_vault} ({brief(e)}), skipped")
         return 0
 
     content_keys = {kid: key for kid, key in content_keys.items() if not to_vault.is_bad_key(kid, key)}
@@ -128,6 +134,11 @@ def copy_service_data(
         added = add_keys_with_progress(to_vault, to_service or service, content_keys, log)
     except PermissionError:
         log.warning(f"{service}: No permission to create table in {to_vault}, skipped")
+        return 0
+    except Exception as e:
+        if not is_refusal(e):
+            raise click.ClickException(f"Could not write to {to_vault} ({brief(e)})") from None
+        log.warning(f"{service}: Could not write to {to_vault} ({brief(e)}), skipped")
         return 0
 
     existed = total_count - added
@@ -213,7 +224,7 @@ def copy(
             try:
                 services_to_copy = list(from_vault.get_services())
             except Exception as e:
-                log.debug(f"{from_vault.name}: cannot list services ({e}), skipped")
+                log.debug(f"{from_vault.name}: cannot list services ({brief(e)}), skipped")
                 continue
 
         if installed is not None:
@@ -313,7 +324,13 @@ def add(file: Path, service: str, vaults: list[str]) -> None:
 
     for vault in vaults_:
         log.info(f"Adding {total_count} Content Keys to {vault}")
-        added_count = add_keys_with_progress(vault, service, kid_keys, log)
+        try:
+            added_count = add_keys_with_progress(vault, service, kid_keys, log)
+        except Exception as e:
+            if not is_refusal(e):
+                raise click.ClickException(f"Could not write to {vault} ({brief(e)})") from None
+            log.warning(f"Could not write to {vault} ({brief(e)}), skipped")
+            continue
         existed_count = total_count - added_count
         log.info(f"{vault}: {added_count} newly added, {existed_count} already existed (skipped)")
 
@@ -327,7 +344,7 @@ def search_vault(vault: Vault, kid: str, services: list[str], log: logging.Logge
         try:
             key = vault.get_key(kid, svc)
         except Exception as e:
-            log.debug(f"{vault} [{svc}]: lookup error ({e})")
+            log.debug(f"{vault} [{svc}]: lookup error ({brief(e)})")
             return None
         if key and not is_null_key(key):
             return svc, key
@@ -392,7 +409,7 @@ def search(kid: str, service: str | None, vault_name: str | None) -> None:
             try:
                 services_to_check = list(vault.get_services())
             except Exception as e:
-                log.debug(f"{vault}: get_services() failed ({e})")
+                log.debug(f"{vault}: get_services() failed ({brief(e)})")
                 services_to_check = []
             if not services_to_check:
                 services_to_check = list(Services.get_tags())
@@ -425,7 +442,7 @@ def prepare(vaults: list[str]) -> None:
     vaults_ = load_vaults(vaults)
 
     for vault in vaults_:
-        if hasattr(vault, "resolve_table") and hasattr(vault, "create_table"):
+        if vault.has_tables:
             for service_tag in dict.fromkeys(Services.get_vault_tag(tag) for tag in Services.get_tags()):
                 existing = vault.resolve_table(service_tag)
                 if existing:

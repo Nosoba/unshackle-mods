@@ -23,7 +23,7 @@ A vault stores every content key as a **KID → KEY** pair, grouped by **service
 
 ## How lookups and caching work
 
-When unshackle needs a content key during a download it asks your vaults **in the order they appear in your config**. It returns the first non-null key it finds and stops searching. If a vault raises a permission error or is unreachable, unshackle skips it and continues the search with the next one.
+When unshackle needs a content key during a download it asks your vaults **in the order they appear in your config**. It returns the first non-null key it finds and stops searching. If a vault raises a permission error or is unreachable, unshackle skips it and continues the search with the next one. unshackle does not ask a remote vault again for the rest of the run when it is unreachable or answers with a body that is not a JSON object. It always asks a local SQLite vault. Each failure of a vault shows one warning with the host and the reason; the same failure again goes to the debug log.
 
 A track needs no licence when a vault holds the content key of the KID that encrypts it. The DRM header of the track can name more KIDs, for example those of other tracks. Before the decrypt, unshackle reads the downloaded file, and licenses each of those KIDs that the file uses and no vault holds. When unshackle cannot read which KIDs the file uses, it licenses all of them.
 
@@ -222,6 +222,8 @@ A flexible HTTP vault that speaks one of three wire protocols, selected with `ap
 
 You must supply either `password` or `api_key`, or the vault will fail to load.
 
+A host that answers with a body that is not a JSON object, for example a parked domain or a login page, is unreachable. unshackle logs one warning, skips the vault for the rest of the run, and the `serve` health check reports the vault as failed. In json mode, HTTP 404 to a lookup is the exception: it means that the vault has no entry. In decrypt_labs mode, an error status other than 429 is a miss.
+
 ---
 
 ## API backend
@@ -252,7 +254,7 @@ key_vaults:
 The backend talks to endpoints under `uri` (for example `GET {uri}/{service}/{kid}` to look up a single key). It interprets a numeric `code` field in each JSON response to detect errors such as an invalid token, rate limiting, or an invalid service tag.
 
 !!! warning "This is unshackle's own protocol, not a generic vault client"
-    The `API` backend expects unshackle's specific HTTP request and response shape. An API or HTTP key-vault endpoint built for a different project or service will generally *not* be compatible. You cannot point this at an arbitrary third-party vault API and expect it to work. To bridge another service, put an adapter in front of it that speaks this format, or use the `HTTP` backend if one of its wire protocols matches. When pushing many keys at once it batches requests and automatically shrinks the batch size if the server rejects an over-large request.
+    The `API` backend expects unshackle's specific HTTP request and response shape. An API or HTTP key-vault endpoint built for a different project or service will generally *not* be compatible. You cannot point this at an arbitrary third-party vault API and expect it to work. To bridge another service, put an adapter in front of it that speaks this format, or use the `HTTP` backend if one of its wire protocols matches. When pushing many keys at once it batches requests and automatically shrinks the batch size if the server rejects an over-large request. After a push that succeeds at a smaller size, later pushes to that vault start at that size.
 
 !!! tip "DecryptLabs shortcut"
     An `API` vault whose `name` contains `decrypt_labs` will have its `token` filled in automatically from a global `decrypt_labs_api_key` in your config if you leave `token` unset. This lets you keep the API key in one place.
@@ -281,6 +283,8 @@ $ unshackle kv add keys.txt EXAMPLE local shared
 ```
 
 The service argument (`EXAMPLE` above) is normalized to its canonical tag automatically. Keys that already exist in a vault are reported as skipped.
+
+If a vault answers and refuses the content keys, `kv add` shows one warning and continues with the next vault. If a vault is unreachable or still rate limited, `kv add` stops with an error.
 
 ### `kv search`: find a content key by KID
 
@@ -330,6 +334,8 @@ $ unshackle kv copy local ~/Downloads/key_store.db -s EXAMPLE
 `kv copy` only reads from a source, so the file stays unchanged. `kv sync` also accepts a path, but it writes content keys into that file.
 
 With `--service`, `kv copy` reads the table named by the service's vault tag and the table named by its plain tag. It writes both into the vault-tag table, which is the table a download reads. Without `--service`, each table keeps its name.
+
+If the destination vault answers and refuses the content keys of a service, `kv copy` shows one warning and continues with the next service. If the destination vault is unreachable or still rate limited, `kv copy` stops with an error.
 
 A pair the destination vault has flagged in `bad_keys` is left behind, so a copy does not undo a flag. `bad_keys` is never treated as a service, so its rows are never copied into a service table.
 

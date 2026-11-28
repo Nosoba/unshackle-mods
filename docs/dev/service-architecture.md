@@ -96,6 +96,8 @@ These are abstract. A service will not load unless it defines all three:
   another device, such as a pair code. A remote-dl session shows the message as a log
   line, and a REST download job shows it as the job's `notice`. Both methods take `qr`, the
   text of a QR code to scan, and the terminal or UI that shows the user the message draws it.
+  When the login API gives only a PNG, `read_qr_image(data)` in `unshackle.core.console`
+  gives the text.
 - **Event callbacks**: `on_segment_downloaded`, `on_track_downloaded`,
   `on_track_decrypted`, `on_track_repacked`, `on_track_multiplex` let a service react to
   pipeline events.
@@ -116,9 +118,8 @@ up the objects your methods rely on:
 | `self.credential` | The active `Credential`, or `None` until authenticated. |
 | `self.track_request` | A `TrackRequest` describing the requested codecs, ranges, and best-available flag (see below). |
 
-The constructor also resolves proxies: it reads `--proxy` and the `proxy_query` and
-`proxy_provider` context params that `dl` and `search` derive from it, consults the per-service
-`proxy_map`, and, if `GEOFENCE` is set and you did not give an explicit proxy, does a live
+The constructor also resolves proxies: it reads `--proxy`, which `dl` and `search` have already
+resolved through the per-service `proxy_map`, and, if `GEOFENCE` is set and you did not give an explicit proxy, does a live
 IP check and auto-fetches a proxy to `GEOFENCE[0]` when it detects a geoblock. A
 `GEOBLOCK` hit with no `GEOFENCE` stops the run with a "not available in your region"
 error, because there is no main region to fetch a proxy for; pass `--proxy` yourself.

@@ -1,21 +1,24 @@
-"""Unit tests for the shared proxy dispatch that dl, search and resolve_proxy use: the provider:query
-split, the named or bare provider lookup, and the line that reports which proxy provider answered."""
+"""Unit tests for the shared proxy dispatch that dl, search, the REST API and the remote client use: the
+provider:query split, the named or bare provider lookup, and the line that reports which proxy provider answered."""
 
 from __future__ import annotations
 
 import json
 import logging
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
 from unshackle.core.proxies import Basic
 from unshackle.core.proxies.proxy import Proxy
 from unshackle.core.proxies.resolve import (
+    ResolvedProxy,
     Unavailable,
     describe_proxy,
     pick_proxy,
     resolve_proxy,
+    resolve_proxy_value,
     split_proxy_query,
 )
 
@@ -215,3 +218,102 @@ def test_named_query_passes_a_query_error_on_unchanged() -> None:
 
     with pytest.raises(ValueError, match="^no server for us150$"):
         pick_proxy([Strict()], "us150", "strict")
+
+
+class Gluetun(Alpha):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "US",
+            ResolvedProxy(
+                "http://a:b@alpha.example:80", "us", "Using Alpha Proxy: http://xxxxx:xxxxx@alpha.example:80"
+            ),
+        ),
+        (
+            "Beta:CA",
+            ResolvedProxy("http://c:d@beta-ca.example:80", "ca", "Using Beta Proxy via Dallas (server 12)"),
+        ),
+        (
+            "alpha:beta:ca",
+            ResolvedProxy(
+                "http://a:b@alpha-beta.example:80",
+                "beta:ca",
+                "Using Alpha Proxy: http://xxxxx:xxxxx@alpha-beta.example:80",
+            ),
+        ),
+        (
+            "http://user:pass@proxy.example:8080",
+            ResolvedProxy(
+                "http://user:pass@proxy.example:8080",
+                None,
+                "Using explicit Proxy: http://xxxxx:xxxxx@proxy.example:8080",
+            ),
+        ),
+        ("localhost:8080", ResolvedProxy("localhost:8080", None, "Using a local proxy on port 8080")),
+        ("1.2.3.4:3128", ResolvedProxy("1.2.3.4:3128", None, "Using explicit Proxy: 1.2.3.4:3128")),
+        ("us:1080", ResolvedProxy("us:1080", None, "Using explicit Proxy: us:1080")),
+    ],
+)
+def test_resolve_proxy_value_reads_each_form(providers: list, value: str, expected: ResolvedProxy) -> None:
+    providers[1].answers["beta:ca"] = "http://a:b@alpha-beta.example:80"
+    assert resolve_proxy_value(value, providers) == expected
+
+
+def test_resolve_proxy_value_starts_a_forwarder_for_a_control_d_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unshackle.core.proxies import controld
+
+    monkeypatch.setattr(controld, "local_proxy", lambda uri: "http://127.0.0.1:4000")
+    resolved = resolve_proxy_value("controld://efgh456@dns.controld.com", [])
+    assert resolved == ResolvedProxy("http://127.0.0.1:4000", None, "Using a local proxy on port 4000")
+
+
+@pytest.mark.parametrize(
+    ("value", "message"), [("us", "Getting a Proxy to us..."), ("gluetun:ca", "Connecting to VPN (ca)...")]
+)
+def test_the_status_wraps_only_the_provider_lookup(providers: list, value: str, message: str) -> None:
+    shown: list[str] = []
+
+    @contextmanager
+    def status(text: str) -> Iterator[None]:
+        shown.append(text)
+        yield
+
+    resolve_proxy_value(value, [*providers, Gluetun(ca="http://g.example:8888")], status=status)
+    resolve_proxy_value("http://proxy.example:8080", providers, status=status)
+    assert shown == [message]
+
+
+@pytest.mark.parametrize("value", ["localhost:8080", "1.2.3.4:3128"])
+def test_resolve_proxy_passes_a_host_and_port_through(providers: list, value: str) -> None:
+    assert resolve_proxy(value, providers) == value
+
+
+class Recorder(Alpha):
+    def __init__(self, **answers: str) -> None:
+        super().__init__(**answers)
+        self.asked: list[str] = []
+
+    def get_proxy(self, query: str) -> str | None:
+        self.asked.append(query)
+        return super().get_proxy(query)
+
+
+@pytest.mark.parametrize(
+    ("value", "asked", "uri"),
+    [
+        ("us", ["ca"], "http://ca.example:8080"),
+        ("recorder:us", ["uk"], "http://uk.example:8080"),
+        ("US", ["ca"], "http://ca.example:8080"),
+        ("Recorder:US", ["uk"], "http://uk.example:8080"),
+        ("fr", ["zz", "fr"], "http://fr.example:8080"),
+        ("de", ["de"], "http://de.example:8080"),
+    ],
+)
+def test_a_proxy_map_swaps_the_query_and_falls_back_to_it(value: str, asked: list, uri: str) -> None:
+    recorder = Recorder(**{x: f"http://{x}.example:8080" for x in ("ca", "uk", "fr", "de")})
+    resolved = resolve_proxy_value(value, [recorder], proxy_map={"US": "ca", "recorder:us": "uk", "fr": "zz"})
+    assert (recorder.asked, resolved.uri) == (asked, uri)

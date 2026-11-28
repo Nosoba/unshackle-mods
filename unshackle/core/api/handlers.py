@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from http.cookiejar import CookieJar
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import click
@@ -53,7 +53,7 @@ from unshackle.core.drm import WHOLE_FILE_DRM, cbcs, is_null_key, real_kids, who
 from unshackle.core.drm.discovery import drm_from_init_segment, ensure_track_drm, fetch_init_segment, track_pssh
 from unshackle.core.launch import served_context
 from unshackle.core.manifests.snapshot import capture
-from unshackle.core.proxies.resolve import initialize_proxy_providers, is_loopback, resolve_proxy
+from unshackle.core.proxies.resolve import REGION_QUERY, initialize_proxy_providers, is_loopback, resolve_proxy
 from unshackle.core.remote_protocol import (
     HEALTH_ROUTE,
     APIErrorCode,
@@ -101,6 +101,9 @@ from unshackle.core.wire import (
     serialize_tracks,
     served_url,
 )
+
+if TYPE_CHECKING:
+    from unshackle.core.vaults import Vaults
 
 log = logging.getLogger("api")
 
@@ -2146,20 +2149,16 @@ def run_health_checks(checks: list[dict[str, Any]] | None = None) -> list[dict[s
             vaults, failed = load_config_vaults(probe_service, [vault_config])
             if failed:
                 raise next(iter(failed.values()))
-            vault = vaults.vaults[0]
-            try:
-                vault.get_key(HEALTH_PROBE_KID, probe_service)
-            except Exception as e:
-                if type(e).__name__ not in ("KeyIdInvalid", "ServiceTagInvalid"):
-                    raise
-            return "ok", str(vault)
+            return "ok", vaults.probe(HEALTH_PROBE_KID)
 
         checks.append(health_check(f"vault:{name}", f"vault {name}", vault_probe, config_secrets(vault_config)))
 
     def bad_keys_probe() -> tuple[str, str]:
+        from unshackle.core.vaults import flag_stores
+
         if not config.key_vaults:
             return "ok", "no vaults configured"
-        local = [v.get("name") or v["type"] for v in config.key_vaults if v.get("type") == "SQLite"]
+        local = flag_stores(config.key_vaults)
         if local:
             return "ok", f"flags stored in {', '.join(local)}"
         return "warn", "no SQLite vault, so a content key a client proves wrong cannot be flagged"
@@ -3475,13 +3474,16 @@ async def get_validated_session(session_id: str, request: web.Request | None) ->
     return session
 
 
+PROXY_URI = re.compile(r"^(https?://|socks)")
+
+
 def local_proxy_refusal(proxy: str) -> str | None:
     """Why an http(s) or socks proxy URI may reach the server's own machine or network, or None when it cannot.
 
     The host must be a plain DNS name or an IP literal: an HTTP client that follows the WHATWG URL standard
     reads a backslash or a percent-escape in the authority differently from ``urlsplit``.
     """
-    if not re.match(r"^(https?://|socks)", proxy):
+    if not PROXY_URI.match(proxy):
         return None
     try:
         host = urlsplit(proxy).hostname or ""
@@ -3525,7 +3527,7 @@ def resolve_handler_proxy(
 
     if (
         proxy_param
-        and re.match(r"^(https?://|socks|controld://|tunnel:)", str(proxy_param))
+        and (PROXY_URI.match(str(proxy_param)) or str(proxy_param).startswith(("controld://", "tunnel:")))
         and server_account_for(policy, normalized_service)
     ):
         raise APIError(
@@ -3568,6 +3570,12 @@ def resolve_handler_proxy(
                 "This server does not resolve country codes into proxies, pass a full proxy URI",
                 details={"service": normalized_service},
             ) from None
+        if not PROXY_URI.match(proxy_param or ""):
+            raise APIError(
+                APIErrorCode.INVALID_PROXY,
+                "Proxy URI has no http, https or socks scheme",
+                details={"service": normalized_service},
+            )
 
     client_region = data.get("client_region")
     if client_region is not None and not isinstance(client_region, str):
@@ -3607,7 +3615,7 @@ def resolve_handler_proxy(
                 )
         elif in_client_region:
             log.info(f"Server already in client region '{sanitize_log(client_region)}', no proxy needed")
-        else:
+        elif REGION_QUERY.fullmatch(client_region):
             try:
                 proxy_param = resolve_proxy(client_region, proxy_providers)
                 log.info(f"Using server proxy for client region '{sanitize_log(client_region)}'")
@@ -3713,7 +3721,7 @@ def pick_server_pssh(track: Any, candidates: list[str]) -> tuple[str, str] | Non
     return None
 
 
-def load_server_vaults(service_name: str) -> Any:
+def load_server_vaults(service_name: str) -> "Vaults":
     """Load server vaults from config.key_vaults; a vault that fails to load is left out."""
     from unshackle.core.services import Services
     from unshackle.core.vaults import load_config_vaults
@@ -3739,7 +3747,7 @@ def check_vaults(
     """
     try:
         vaults = once({} if shared is None else shared, "vaults", lambda: load_server_vaults(service_name))
-        if not vaults.vaults:
+        if not vaults:
             return None
         keys: dict[str, str] = {}
         sources: dict[str, str] = {}
@@ -3780,14 +3788,14 @@ def cache_to_vaults(keys: dict[str, str], service_name: str, shared: dict[str, A
         if not new:
             return
         vaults = once({} if shared is None else shared, "vaults", lambda: load_server_vaults(service_name))
-        if not vaults.vaults:
+        if not vaults:
             return
 
         key_map = {UUID(hex=kid): key for kid, key in new.items()}
         for kid in vaults.clear_licensed_flags(key_map):
             log.info(f"Unflagged {kid.hex}:{key_map[kid]}, the CDM returned it")
         cached = vaults.add_keys(key_map)
-        if cached == len([vault for vault in vaults.vaults if not vault.no_push]):
+        if vaults.stored_everywhere(cached):
             CACHED_PAIRS.update((service_name, kid, key) for kid, key in new.items())
         if cached:
             log.info(f"Cached {len(key_map)} key(s) to {cached}/{len(vaults)} server vault(s)")
@@ -4525,16 +4533,7 @@ async def session_bad_key_handler(
     service_name = session.service_instance.__class__.__name__
     vaults = load_server_vaults(service_name)
 
-    def flag() -> None:
-        for vault in vaults.vaults:
-            if not vault.local and vault.name != source:
-                continue
-            try:
-                vault.flag_bad_key(vaults.service, UUID(hex=kid), served_key, source)
-            except Exception as e:
-                log.debug(f"Could not flag {kid} as bad in vault {sanitize_log(vault.name)}: {e!r}")
-
-    await asyncio.to_thread(flag)
+    await asyncio.to_thread(vaults.flag_served, UUID(hex=kid), served_key, source)
     session.served_keys.pop(kid, None)
     CACHED_PAIRS.discard((service_name, kid, served_key))
     log.warning(
@@ -4572,25 +4571,14 @@ async def session_keys_handler(data: TrackKeys, session_id: str, request: web.Re
 
     def store(named: set[str]) -> tuple[Any, dict[Any, str]]:
         vaults = load_server_vaults(service.__class__.__name__)
-        local = [vault for vault in vaults.vaults if vault.local]
-
-        def held(vault: Any, kid: uuid.UUID) -> bool:
-            """Whether ``vault`` holds a content key for ``kid``. A failed lookup counts as held, a vault with no read access as empty."""
-            try:
-                return bool(vault.get_key(kid, vaults.service))
-            except (PermissionError, NotImplementedError):
-                return False
-            except Exception:
-                return True
-
         new: dict[Any, str] = {}
         for kid_hex, key in pairs.items():
             if kid_hex not in named or session.served_keys.get(kid_hex, ("",))[0].lower() == key:
                 continue
             kid = uuid.UUID(hex=kid_hex)
-            if not vaults.is_flagged(kid, key) and not any(held(vault, kid) for vault in local):
+            if not vaults.is_flagged(kid, key) and not vaults.holds(kid):
                 new[kid] = key
-        if new and sum(vaults.push_keys(vault, new) for vault in local if not vault.no_push):
+        if new and vaults.add_keys(new, local=True):
             log.info(
                 f"Session {sanitize_log(session_id[:12])} sent {len(new)} client content key(s) to the server vaults"
             )
@@ -4600,9 +4588,8 @@ async def session_keys_handler(data: TrackKeys, session_id: str, request: web.Re
         async with session.lock:
             named = await asyncio.to_thread(named_kids)
         vaults, new = await asyncio.to_thread(store, named)
-        remote = [vault for vault in vaults.vaults if not vault.local and not vault.no_push]
-        if new and remote:
-            asyncio.get_running_loop().run_in_executor(None, lambda: [vaults.push_keys(vault, new) for vault in remote])
+        if new:
+            asyncio.get_running_loop().run_in_executor(None, partial(vaults.add_keys, new, local=False))
     except (Exception, SystemExit) as e:
         log.debug(f"Session {sanitize_log(session_id[:12])} content keys not stored: {e!r}")
     return web.json_response({})

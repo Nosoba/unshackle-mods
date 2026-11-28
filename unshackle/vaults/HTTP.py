@@ -2,7 +2,14 @@ import json
 from collections.abc import Iterator
 from uuid import UUID
 
-from unshackle.core.vault import RateLimited, Vault, is_null_key, vault_session
+from requests import RequestException
+
+from unshackle.core.vault import RateLimited, Vault, is_null_key, json_body, vault_session
+
+
+def refusal(answer: dict) -> ValueError:
+    """The error answer of a vault that refused the call."""
+    return ValueError(f"API returned an error: {answer.get('status_code')} - {answer.get('message')}")
 
 
 class HTTP(Vault):
@@ -47,7 +54,6 @@ class HTTP(Vault):
 
         self.username = username
         self.api_mode = api_mode.lower()
-        self.batch_insert = True
         self.current_title: str | None = None
         self.session = vault_session(timeout)
         self.api_session_id = None
@@ -85,26 +91,27 @@ class HTTP(Vault):
             raise RateLimited()
 
         if not r.ok:
-            try:
-                detail = r.json().get("message") or r.reason.title()
-            except (json.JSONDecodeError, AttributeError):
-                detail = r.reason.title()
+            detail = json_body(r).get("message") or r.reason.title()
             raise ValueError(f"API returned HTTP Error {r.status_code}: {detail}")
 
-        try:
-            res = r.json()
-        except json.JSONDecodeError:
-            if r.status_code == 404:
-                return {"status": "not_found"}
-            raise ValueError(f"API returned an invalid response: {r.text}") from None
+        res = json_body(r)
 
         if res.get("status_code") != 200:
-            raise ValueError(f"API returned an error: {res['status_code']} - {res['message']}")
+            raise refusal(res)
 
         if session_id := res.get("message", {}).get("session_id"):
             self.api_session_id = session_id
 
         return res.get("message", res)
+
+    def _query(self, params: dict) -> dict:
+        """A query-mode GET with the credentials. A 429 that remains after the retries raises RateLimited."""
+        response = self.session.get(
+            self.url, params={**params, "username": self.username, "password": self.password}, timeout=self.timeout
+        )
+        if response.status_code == 429:
+            raise RateLimited()
+        return json_body(response)
 
     def get_key(self, kid: UUID | str, service: str) -> str | None:
         if isinstance(kid, UUID):
@@ -112,76 +119,63 @@ class HTTP(Vault):
 
         if self.api_mode == "decrypt_labs":
             response = self.session.post(self.url, json={"service": service.lower(), "kid": kid}, timeout=self.timeout)
-            try:
-                if not response.ok:
-                    return None
-
-                data = response.json()
-
-                if data.get("message") != "success":
-                    return None
-
-                cached_keys = data.get("cached_keys")
-                if not cached_keys:
-                    return None
-
-                if isinstance(cached_keys, str):
-                    try:
-                        cached_keys = json.loads(cached_keys)
-                    except json.JSONDecodeError:
-                        return cached_keys
-
-                if isinstance(cached_keys, dict):
-                    if cached_keys.get("kid") == kid:
-                        return cached_keys.get("key")
-                    if kid in cached_keys:
-                        return cached_keys[kid]
-                elif isinstance(cached_keys, list):
-                    for entry in cached_keys:
-                        if isinstance(entry, dict):
-                            if entry.get("kid") == kid:
-                                return entry.get("key")
-                        elif isinstance(entry, str) and ":" in entry:
-                            entry_kid, entry_key = entry.split(":", 1)
-                            if entry_kid == kid:
-                                return entry_key
-
-            except Exception as e:
-                print(f"Failed to get key from DecryptLabs ({e.__class__.__name__}: {e})")
+            if response.status_code == 429:
+                raise RateLimited()
+            if not response.ok:
                 return None
+
+            data = json_body(response)
+
+            if data.get("message") != "success":
+                return None
+
+            cached_keys = data.get("cached_keys")
+            if not cached_keys:
+                return None
+
+            if isinstance(cached_keys, str):
+                try:
+                    cached_keys = json.loads(cached_keys)
+                except json.JSONDecodeError:
+                    return cached_keys
+
+            if isinstance(cached_keys, dict):
+                if cached_keys.get("kid") == kid:
+                    return cached_keys.get("key")
+                if kid in cached_keys:
+                    return cached_keys[kid]
+            elif isinstance(cached_keys, list):
+                for entry in cached_keys:
+                    if isinstance(entry, dict):
+                        if entry.get("kid") == kid:
+                            return entry.get("key")
+                    elif isinstance(entry, str) and ":" in entry:
+                        entry_kid, entry_key = entry.split(":", 1)
+                        if entry_kid == kid:
+                            return entry_key
             return None
 
         elif self.api_mode == "json":
-            try:
-                params = {
-                    "kid": kid,
-                    "service": service.lower(),
-                }
+            params = {
+                "kid": kid,
+                "service": service.lower(),
+            }
 
-                res = self.request("GetKey", params)
-                if res.get("status") == "not_found":
-                    return None
-                keys = res.get("keys", [])
-                for key_entry in keys:
-                    if isinstance(key_entry, str) and ":" in key_entry:
-                        entry_kid, entry_key = key_entry.split(":", 1)
-                        if entry_kid == kid:
-                            return entry_key
-                    elif isinstance(key_entry, dict):
-                        if key_entry.get("kid") == kid:
-                            return key_entry.get("key")
-            except ValueError as e:
-                print(f"Failed to get key ({e.__class__.__name__}: {e})")
+            res = self.request("GetKey", params)
+            if res.get("status") == "not_found":
                 return None
+            keys = res.get("keys", [])
+            for key_entry in keys:
+                if isinstance(key_entry, str) and ":" in key_entry:
+                    entry_kid, entry_key = key_entry.split(":", 1)
+                    if entry_kid == kid:
+                        return entry_key
+                elif isinstance(key_entry, dict):
+                    if key_entry.get("kid") == kid:
+                        return key_entry.get("key")
             return None
         else:  # query mode
-            response = self.session.get(
-                self.url,
-                params={"service": service.lower(), "username": self.username, "password": self.password, "kid": kid},
-                timeout=self.timeout,
-            )
-
-            data = response.json()
+            data = self._query({"service": service.lower(), "kid": kid})
 
             if not data.get("keys"):
                 return None
@@ -196,13 +190,7 @@ class HTTP(Vault):
             # This will cause the copy command to rely on the API's internal duplicate handling
             return
         else:
-            response = self.session.get(
-                self.url,
-                params={"service": service.lower(), "username": self.username, "password": self.password},
-                timeout=self.timeout,
-            )
-
-            data = response.json()
+            data = self._query({"service": service.lower()})
 
             if data.get("status_code") != 200 or not data.get("keys"):
                 return
@@ -236,24 +224,12 @@ class HTTP(Vault):
                 if res.get("status") == "not_found":
                     return False
                 return res.get("inserted", False)
-            except Exception:
+            except RequestException:  # MissingSchema and InvalidURL are ValueErrors too
+                raise
+            except ValueError:  # an error answer from the vault
                 return False
         else:
-            response = self.session.get(
-                self.url,
-                params={
-                    "service": service.lower(),
-                    "username": self.username,
-                    "password": self.password,
-                    "kid": kid,
-                    "key": key,
-                    "title": title,
-                },
-                timeout=self.timeout,
-            )
-
-            data = response.json()
-
+            data = self._query({"service": service.lower(), "kid": kid, "key": key, "title": title})
             return data.get("status_code") == 200
 
     def add_keys(self, service: str, kid_keys: dict[UUID | str, str]) -> int:
@@ -296,61 +272,35 @@ class HTTP(Vault):
                         },
                     )
                     if res.get("status") == "not_found":
-                        continue
-                    if res.get("inserted", False):
+                        failures.append(ValueError("API returned HTTP Error 404: Not Found"))
+                    elif res.get("inserted", False):
                         inserted_count += 1
                 except ValueError as e:
                     failures.append(e)
-            if failures and len(failures) == len(processed_kid_keys):
-                raise failures[-1]
         else:
             for kid, key in processed_kid_keys.items():
-                response = self.session.get(
-                    self.url,
-                    params={
-                        "service": service.lower(),
-                        "username": self.username,
-                        "password": self.password,
-                        "kid": kid,
-                        "key": key,
-                        "title": title,
-                    },
-                    timeout=self.timeout,
-                )
-
-                data = response.json()
-
-                if data.get("status_code") == 200 and data.get("inserted", True):
+                data = self._query({"service": service.lower(), "kid": kid, "key": key, "title": title})
+                if data.get("status_code") != 200:
+                    failures.append(refusal(data))
+                elif data.get("inserted", True):
                     inserted_count += 1
 
+        if failures and len(failures) == len(processed_kid_keys):
+            raise failures[-1]
         return inserted_count
 
     def get_services(self) -> Iterator[str]:
         if self.api_mode == "decrypt_labs":
             return
         elif self.api_mode == "json":
-            try:
-                res = self.request("GetServices")
-                services = res.get("services", [])
-                for service in services:
-                    yield service
-            except Exception:
-                return
+            yield from self.request("GetServices").get("services", [])
         else:
-            response = self.session.get(
-                self.url,
-                params={"username": self.username, "password": self.password, "list_services": True},
-                timeout=self.timeout,
-            )
-
-            data = response.json()
+            data = self._query({"list_services": True})
 
             if data.get("status_code") != 200:
                 return
 
-            services = data.get("services", [])
-            for service in services:
-                yield service
+            yield from data.get("services", [])
 
     def set_title(self, title: str) -> None:
         """

@@ -139,7 +139,8 @@ def decrypt(
         server_vault=SimpleNamespace(add_keys=lambda service, keys, track: pushed.append((keys, track))),
     )
     keys = resolver(vaults, tag="EXAMPLE", source=source)
-    vaults.flagged.update((flagged or {}).items())
+    for kid, key in (flagged or {}).items():
+        vaults.flag_bad_key(kid, key)
     path = tmp_path / "video.mp4"
     path.write_bytes(b"cipher")
     content_keys = {LICENSED: KEY, VAULTED: OTHER_KEY, NULL: "0" * 32, **(flagged or {})}
@@ -254,19 +255,12 @@ async def test_the_server_answers_before_the_remote_vaults_take_the_keys(server,
     assert server.remote.get_key(LICENSED, "EXAMPLE") == KEY
 
 
-async def test_a_local_vault_that_cannot_answer_counts_as_holding_the_kid(server, monkeypatch) -> None:
-    real = server.local.get_key
-
-    def down(kid: Any, service: str) -> Any:
-        if kid == LICENSED:
-            raise OSError("EXAMPLE vault file locked")
-        return real(kid, service)
-
-    monkeypatch.setattr(server.local, "get_key", down)
-    await handlers.session_keys_handler({"track_id": "v2", "keys": {LICENSED.hex: KEY, LATE.hex: KEY}}, "sess")
+async def test_a_client_cannot_replace_a_content_key_a_local_vault_holds(server) -> None:
+    server.local.add_key("EXAMPLE", LICENSED, OTHER_KEY)
+    await handlers.session_keys_handler({"track_id": "v2", "keys": {LICENSED.hex: KEY}}, "sess")
     await settled()
+    assert server.local.get_key(LICENSED, "EXAMPLE") == OTHER_KEY
     assert server.remote.get_key(LICENSED, "EXAMPLE") is None
-    assert server.remote.get_key(LATE, "EXAMPLE") == KEY
 
 
 async def test_the_server_answers_empty_when_it_stores_nothing(server, caplog) -> None:
